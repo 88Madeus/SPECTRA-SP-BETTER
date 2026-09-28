@@ -1,0 +1,279 @@
+<?xml version="1.0"?>
+<SpectraSP>  <General>
+    <NumVisibleConfigs>1</NumVisibleConfigs>
+    <CurrentConfig>0</CurrentConfig>
+    <Language>Russian</Language>
+  </General>
+  <Config_0 Name="MS7504i #020126" Caption="MS7504i">
+    <SysParams>
+      <MainForm>
+        <MainFormLeft>-8</MainFormLeft>
+        <MainFormTop>-8</MainFormTop>
+        <MainFormWidth>1936</MainFormWidth>
+        <MainFormHeight>1056</MainFormHeight>
+        <MainFormAlign>5</MainFormAlign>
+        <MainFormBorderStyle>0</MainFormBorderStyle>
+        <MainFormSuperMasterMode>false</MainFormSuperMasterMode>
+      </MainForm>
+      <General>
+        <ActSensorInd>0</ActSensorInd>
+        <LastSpcDir>C:\Users\A-119\Desktop\06072026\</LastSpcDir>
+        <CtrlDllName>SSPL_IM.dll</CtrlDllName>
+      </General>
+      <Buffer>
+        <BufferLen>30</BufferLen>
+      </Buffer>
+      <Sensor>
+        <FirstWL>577.000305175781</FirstWL>
+        <LastWL>581.00537109375</LastWL>
+        <StepWL>0.0483995899558067</StepWL>
+        <TimeScanWL>120</TimeScanWL>
+        <nScanType>1</nScanType>
+      </Sensor>
+      <Scanning>
+        <MaxBuffLenScan>0</MaxBuffLenScan>
+        <DataArrLen>2048</DataArrLen>
+        <NumDataArr>506</NumDataArr>
+        <MaxNumFrames>100</MaxNumFrames>
+        <ShowBuffOnScan>true</ShowBuffOnScan>
+        <ShowSpcOnScan>true</ShowSpcOnScan>
+      </Scanning>
+      <Panoraming>
+        <BegWL>325</BegWL>
+        <EndWL>700</EndWL>
+        <ResetGrating>false</ResetGrating>
+        <DoEqualization>true</DoEqualization>
+        <PnrmFPxl>-1</PnrmFPxl>
+        <PnrmLPxl>-1</PnrmLPxl>
+      </Panoraming>
+      <SpcViewer>
+        <ViewWnd.bPrmPanel>true</ViewWnd.bPrmPanel>
+        <ViewWnd.bPrmStatusBar>false</ViewWnd.bPrmStatusBar>
+        <ViewWnd.bGraphList>true</ViewWnd.bGraphList>
+        <ViewWnd.bOprSpcLabel>false</ViewWnd.bOprSpcLabel>
+        <ViewWnd.bModeMoveStripeBorder>false</ViewWnd.bModeMoveStripeBorder>
+        <ViewWnd.bHideEmptySpcList>true</ViewWnd.bHideEmptySpcList>
+        <ViewWnd.bPeakPanel>true</ViewWnd.bPeakPanel>
+        <ViewWnd.bAutoRangeTop>false</ViewWnd.bAutoRangeTop>
+        <ViewWnd.bAutoRangeBottom>true</ViewWnd.bAutoRangeBottom>
+      </SpcViewer>
+      <Color>
+        <BackgroundColor>-16777201</BackgroundColor>
+        <GridColor>8421504</GridColor>
+        <ActiveBorderColor>16711680</ActiveBorderColor>
+        <Cursor1Color>255</Cursor1Color>
+        <Cursor2Color>16711680</Cursor2Color>
+        <ScaleColor>0</ScaleColor>
+        <RgnTitleColor>0</RgnTitleColor>
+        <TriangleColor>255</TriangleColor>
+        <TriangleRevColor>16711680</TriangleRevColor>
+        <CircleColor>16711680</CircleColor>
+        <InscriptionColor>65280</InscriptionColor>
+        <ActiveGraphColor>0</ActiveGraphColor>
+        <PassiveGraphColor>8421504</PassiveGraphColor>
+        <StrpActiveColor>
+          <BackgrColor>12632256</BackgrColor>
+          <BorderColor>0</BorderColor>
+          <HotZoneColor>8421504</HotZoneColor>
+          <CaptTextColor>0</CaptTextColor>
+          <CaptBkgrColor>65535</CaptBkgrColor>
+        </StrpActiveColor>
+        <StrpPassiveColor>
+          <BackgrColor>12632256</BackgrColor>
+          <BorderColor>8421504</BorderColor>
+          <HotZoneColor>8421504</HotZoneColor>
+          <CaptTextColor>0</CaptTextColor>
+          <CaptBkgrColor>16777215</CaptBkgrColor>
+        </StrpPassiveColor>
+        <GraphColors>
+          <Graph_1>0</Graph_1>
+          <Graph_2>65535</Graph_2>
+          <Graph_3>32768</Graph_3>
+          <Graph_4>32896</Graph_4>
+          <Graph_5>8388608</Graph_5>
+          <Graph_6>8388736</Graph_6>
+          <Graph_7>8421376</Graph_7>
+          <Graph_8>8421504</Graph_8>
+        </GraphColors>
+      </Color>
+      <Stripe_Integation>
+        <DoStripeIntegration>false</DoStripeIntegration>
+        <NumStripes>0</NumStripes>
+        <StripeList></StripeList>
+      </Stripe_Integation>
+      <Peak_Picker>
+        <MaxIterationCount>50</MaxIterationCount>
+        <NumIteration>0</NumIteration>
+        <MinLevelFind>100</MinLevelFind>
+        <AutoPeakCalc>true</AutoPeakCalc>
+      </Peak_Picker>
+      <Peak_Tracer>
+        <Level>0</Level>
+        <NumSmooth>0</NumSmooth>
+        <Smooth_aperture>3</Smooth_aperture>
+        <Max_Shift>20</Max_Shift>
+        <Tracing>false</Tracing>
+        <WL_Prec>3</WL_Prec>
+        <Int_Prec>3</Int_Prec>
+        <FilteringSpecctra>0</FilteringSpecctra>
+      </Peak_Tracer>
+      <WLList>
+        <WLItem0>290</WLItem0>
+        <WLItem1>320</WLItem1>
+        <WLItem2>460</WLItem2>
+        <WLItem3>468</WLItem3>
+        <WLItem4>470</WLItem4>
+        <WLItem5>485</WLItem5>
+        <WLItem6>486</WLItem6>
+        <WLItem7>500</WLItem7>
+        <WLItem8>655</WLItem8>
+        <WLItem9>656</WLItem9>
+        <WLItem10>667</WLItem10>
+        <WLItem11>695</WLItem11>
+        <WLItem12>700</WLItem12>
+        <WLItem13>1064</WLItem13>
+      </WLList>
+      <ProscanIPList>
+        <ProscanIP0>192.168.240.181</ProscanIP0>
+      </ProscanIPList>
+      <ProscanVer5IPList>
+        <ProscanVer5IP0>192.168.242.181</ProscanVer5IP0>
+      </ProscanVer5IPList>
+      <ClbrShiftList>
+        <ClbrShiftActive>-1</ClbrShiftActive>
+      </ClbrShiftList>
+      <DeviceControl>
+        <Grating>
+          <Name>Wavelength, nm</Name>
+          <Enable>true</Enable>
+        </Grating>
+        <Grating2>
+          <Name>Grating 2</Name>
+          <Enable>false</Enable>
+        </Grating2>
+        <Turret>
+          <Name>Grating</Name>
+          <Enable>true</Enable>
+        </Turret>
+        <Turret2>
+          <Name>Turret 2</Name>
+          <Enable>false</Enable>
+        </Turret2>
+        <Mirror1>
+          <Name>Exit port</Name>
+          <Enable>true</Enable>
+          <StateName_0>Axial</StateName_0>
+          <StateName_1>Lateral</StateName_1>
+        </Mirror1>
+        <Mirror2>
+          <Name>Зеркало 2</Name>
+          <Enable>false</Enable>
+          <StateName_0>Положение 1</StateName_0>
+          <StateName_1>Положение 2</StateName_1>
+        </Mirror2>
+        <Mirror3>
+          <Name>Mirror 3</Name>
+          <Enable>false</Enable>
+          <StateName_0>Position 1</StateName_0>
+          <StateName_1>Position 2</StateName_1>
+        </Mirror3>
+        <Mirror4>
+          <Name>Mirror 4</Name>
+          <Enable>false</Enable>
+          <StateName_0>Position 1</StateName_0>
+          <StateName_1>Position 2</StateName_1>
+        </Mirror4>
+        <Slit1>
+          <Name>Entrance Slit S1, mkm</Name>
+          <Enable>true</Enable>
+        </Slit1>
+        <Slit2>
+          <Name>Exit Slit S2, mkm</Name>
+          <Enable>false</Enable>
+        </Slit2>
+        <Slit3>
+          <Name>Exit Slit S3 Lateral, mkm</Name>
+          <Enable>false</Enable>
+        </Slit3>
+        <Slit4>
+          <Name>Щель 4</Name>
+          <Enable>false</Enable>
+        </Slit4>
+        <Filter1>
+          <Name>Фильтровое колесо</Name>
+          <Enable>false</Enable>
+          <StateName_0>0-390 нм КУ-1</StateName_0>
+          <StateName_1>390-640 нм БС-7</StateName_1>
+          <StateName_2>640-1160 нм КС-10</StateName_2>
+          <StateName_3>1160-1800 нм ИКС-7</StateName_3>
+          <StateName_4>0</StateName_4>
+          <StateName_5>0</StateName_5>
+          <StateName_6>0</StateName_6>
+          <StateName_7>0</StateName_7>
+        </Filter1>
+        <Filter2>
+          <Name>Фильтр 2</Name>
+          <Enable>false</Enable>
+          <StateName_0>11</StateName_0>
+          <StateName_1>2</StateName_1>
+          <StateName_2>3</StateName_2>
+          <StateName_3>4</StateName_3>
+          <StateName_4>5</StateName_4>
+          <StateName_5>6</StateName_5>
+          <StateName_6>7</StateName_6>
+          <StateName_7>8</StateName_7>
+        </Filter2>
+        <Shutter1>
+          <Name>Shutter</Name>
+          <Enable>true</Enable>
+          <StateName_0>Open</StateName_0>
+          <StateName_1>Close</StateName_1>
+        </Shutter1>
+        <Shutter2>
+          <Name>Вх. шторка</Name>
+          <Enable>false</Enable>
+          <StateName_0>Открыто</StateName_0>
+          <StateName_1>Закрыто</StateName_1>
+        </Shutter2>
+        <Shutter3>
+          <Name>Шторка 3</Name>
+          <Enable>false</Enable>
+          <StateName_0>Положение 1</StateName_0>
+          <StateName_1>Положение 2</StateName_1>
+        </Shutter3>
+        <Shutter4>
+          <Name>Shutter 4</Name>
+          <Enable>false</Enable>
+          <StateName_0>Position 1</StateName_0>
+          <StateName_1>Position 2</StateName_1>
+        </Shutter4>
+        <Shutter5>
+          <Name>Shutter 5</Name>
+          <Enable>false</Enable>
+          <StateName_0>Position 1</StateName_0>
+          <StateName_1>Position 2</StateName_1>
+        </Shutter5>
+        <NDFilter1>
+          <Name>ND фильтр 1</Name>
+          <Enable>false</Enable>
+        </NDFilter1>
+        <NDFilter2>
+          <Name>ND фильтр 2</Name>
+          <Enable>false</Enable>
+        </NDFilter2>
+        <PMT>
+          <Name>PMT</Name>
+          <Enable>false</Enable>
+        </PMT>
+      </DeviceControl>
+      <UsedSensors>
+        <Sensor_BK Used="false"/>
+        <Sensor_PSI_CCD_VER3 Used="true"/>
+        <Sensor_PSI_CCD_VER5_IR Used="true"/>
+        <Sensor_ANDOR Used="true"/>
+        <Sensor_CCD_CNT Used="false"/>
+      </UsedSensors>
+      <SpectraDAS_COM_Port>COM1</SpectraDAS_COM_Port>
+    </SysParams>
+  </Config_0>
+</SpectraSP>
