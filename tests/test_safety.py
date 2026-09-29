@@ -202,3 +202,60 @@ def test_laser_off_interrupts_long_exposure(inst):
     assert time.monotonic() - t0 < 5                       # не ждали конца кадра
     assert inst.camera.sync_out[1] == SYNC_LOGICAL_0
     t.join(10)
+
+
+# ------------------------------------------------------------------ съёмка при смене температуры ПЗС
+def _freeze(inst, temp):
+    """Остановить «тепловую модель» имитатора и поставить температуру ПЗС вручную."""
+    inst.camera._update_temp = lambda: None
+    inst.settings.warm_up_on_close = False     # «замороженная» ПЗС не отогреется — не ждать при выходе
+    inst.camera._temp = float(temp)
+    inst.camera_state()
+
+
+def test_no_acquisition_while_temperature_changes(inst):
+    _freeze(inst, 22)
+    inst.set_cooling(True, -10)
+    inst.camera_state()
+    assert "−10" in inst.temperature_changing() or "-10" in inst.temperature_changing()
+    with pytest.raises(DeviceError, match="изменение температуры"):
+        inst.acquire()
+    with pytest.raises(DeviceError, match="изменение температуры"):
+        inst.acquire(background=True)
+    inst.camera._temp = -9.5                                # в пределах 1 °C от уставки
+    inst.camera_state()
+    assert inst.temperature_changing() == ""
+    inst.acquire()
+
+
+def test_unreachable_setpoint_does_not_block_forever(inst):
+    _freeze(inst, -38)
+    inst.set_cooling(True, -50)
+    inst.camera_state()
+    assert inst.temperature_changing()
+    now = time.monotonic()
+    inst._temp_hist.clear()
+    for k in range(80):                                     # 2 минуты температура стоит на −38 °C
+        inst._temp_hist.append((now - 120 + k * 1.5, -38.0))
+    assert inst.temperature_changing() == "" and inst.temperature_stalled()
+    inst.acquire()
+
+
+def test_background_from_other_temperature_not_subtracted(inst):
+    _freeze(inst, -20)
+    inst.set_cooling(True, -20)
+    inst.camera_state()
+    inst.acquire(background=True)
+    assert inst.has_background() and inst.acquire().background_used
+    inst.set_cooling(True, -10)
+    inst.camera._temp = -10.0
+    inst.camera_state()
+    assert "фон снят при -20" in inst.background_problem() and not inst.has_background()
+    assert not inst.acquire().background_used              # тёмный ток при −10 °C другой — не вычитаем
+
+
+def test_disconnect_forgets_setpoint(inst):
+    _freeze(inst, 5)
+    inst.set_cooling(True, 5)
+    inst.disconnect(warm_up=False)
+    assert inst.cooling_target is None

@@ -12,6 +12,7 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -32,6 +33,14 @@ from .spectrasp_config import InstalledSetup, find_spectrasp_dir, read_installat
 log = logging.getLogger(__name__)
 
 ProgressFn = Callable[[int, int, str], None]
+
+# Съёмка запрещена, пока ПЗС выходит на новую уставку (как в SpectraSP: «Идет процесс изменения
+# температуры камеры»). Температура считается установившейся в пределах TEMP_TOLERANCE_C от уставки
+# или если она не меняется TEMP_STALL_S секунд (уставка недостижима — не блокировать навсегда).
+TEMP_TOLERANCE_C = 1.0
+TEMP_STALL_S = 120.0
+# фон, снятый при другой температуре, не вычитается (темновой ток ~×2 на каждые 6–7 °C)
+BG_TEMP_TOLERANCE_C = 2.0
 
 
 @dataclass
@@ -105,6 +114,10 @@ class Instrument:
         self.camera_stuck = False
         self.last_state: Optional[CameraState] = None
         self._mono_exclusive: Optional[Tuple[str, int]] = None     # (кто, поток) — см. mono_exclusive()
+        self.cooling_target: Optional[int] = None    # уставка, заданная в этом сеансе (None — выкл./неизвестна)
+        self._temp_hist: deque = deque(maxlen=400)   # (время, температура ПЗС) — для «уставка недостижима»
+        self._state_time = 0.0
+        self._bg_temps: Dict[tuple, float] = {}      # температура ПЗС при съёмке фона
         self.axis = WavelengthAxis(settings.calibration, {})
         self.load_installation()
 
@@ -223,7 +236,7 @@ class Instrument:
         except (DeviceError, FutureTimeout, ValueError) as e:
             log.warning("Параметры камеры (выходы синхронизации) не переданы: %s", e)
         try:
-            self.last_state = self.cam_thread.call(self.camera.get_state)
+            self._note_state(self.cam_thread.call(self.camera.get_state))
         except DeviceError:
             pass
         if not self.settings.readout_speed and getattr(self.camera, "current_readout_speed", 0):
@@ -312,6 +325,7 @@ class Instrument:
                 self.cam_thread.call(self.camera.close, False, timeout=60)
             except Exception as e:  # noqa: BLE001
                 errors.append(f"камера: {e}")
+            self.cooling_target = None     # после отогрева уставка в камере уже другая
         if mono_fut is not None:
             if not mono_fut.done():
                 say("Ожидание окончания движения монохроматора…")
@@ -350,14 +364,43 @@ class Instrument:
         if self.cam_thread.busy_for > 0:
             return self.last_state
         try:
-            self.last_state = self.cam_thread.call(self.camera.get_state, timeout=10)
+            self._note_state(self.cam_thread.call(self.camera.get_state, timeout=10))
         except FutureTimeout:
             pass
         return self.last_state
 
+    def _note_state(self, st: Optional[CameraState]) -> None:
+        self.last_state = st
+        self._state_time = time.monotonic()
+        if st is not None and st.temperature is not None:
+            self._temp_hist.append((self._state_time, float(st.temperature)))
+
     def set_cooling(self, enabled: bool, target_c: int) -> None:
         self._require_camera()
         self.cam_thread.call(self.camera.set_cooling, enabled, int(target_c))
+        self.cooling_target = int(target_c) if enabled else None
+        self._temp_hist.clear()                    # отсчёт «температура не меняется» — с новой уставки
+
+    def temperature_changing(self) -> str:
+        """Почему сейчас нельзя снимать из-за температуры ПЗС ("" — можно)."""
+        st, target = self.last_state, self.cooling_target
+        if not self.camera_connected or target is None or st is None or st.temperature is None:
+            return ""
+        t = float(st.temperature)
+        if abs(t - target) <= TEMP_TOLERANCE_C:
+            return ""
+        now = time.monotonic()
+        recent = [T for ts, T in self._temp_hist if now - ts <= TEMP_STALL_S]
+        oldest = next((ts for ts, _ in self._temp_hist if now - ts <= TEMP_STALL_S), now)
+        if recent and now - oldest >= TEMP_STALL_S * 0.9 and max(recent) - min(recent) <= TEMP_TOLERANCE_C:
+            return ""                              # стоит на месте 2 мин — уставка недостижима, не блокируем
+        return f"ПЗС выходит на уставку: {t:+.0f} °C → {target:+d} °C"
+
+    def temperature_stalled(self) -> bool:
+        """Уставка задана, но недостижима (температура стоит, а до уставки далеко)."""
+        st, target = self.last_state, self.cooling_target
+        return (self.camera_connected and target is not None and st is not None and st.temperature is not None
+                and abs(float(st.temperature) - target) > TEMP_TOLERANCE_C and not self.temperature_changing())
 
     def _require_camera(self) -> None:
         if not self.camera_connected:
@@ -456,12 +499,24 @@ class Instrument:
         return acq.exposure_us, acq.readout_speed, acq.regions, self.settings.flip_x
 
     def has_background(self) -> bool:
+        return self.camera_connected and not self.background_problem() and \
+            self._bg_key(self.acq_settings()) in self._backgrounds
+
+    def background_problem(self) -> str:
+        """Почему снятый фон сейчас не подходит ("" — подходит или фона нет)."""
         if not self.camera_connected:
-            return False
-        return self._bg_key(self.acq_settings()) in self._backgrounds
+            return ""
+        t_bg = self._bg_temps.get(self._bg_key(self.acq_settings()))
+        st = self.last_state
+        if t_bg is None or st is None or st.temperature is None:
+            return ""
+        if abs(float(st.temperature) - t_bg) > BG_TEMP_TOLERANCE_C:
+            return f"фон снят при {t_bg:+.0f} °C, сейчас {st.temperature:+.0f} °C — переснимите"
+        return ""
 
     def clear_background(self) -> None:
         with self._lock:
+            self._bg_temps.clear()
             self._backgrounds.clear()
             self._bg_images.clear()
 
@@ -479,6 +534,15 @@ class Instrument:
         self._require_camera()
         s = self.settings
         n = max(1, int(n or s.accumulations))
+        if time.monotonic() - self._state_time > 3.0:      # свежая температура перед съёмкой
+            try:
+                self._note_state(self.cam_thread.call(self.camera.get_state, timeout=15))
+            except (DeviceError, FutureTimeout) as e:
+                log.debug("Состояние камеры перед съёмкой: %s", e)
+        why = self.temperature_changing()
+        if why:
+            raise DeviceError(f"Идёт изменение температуры камеры ({why}). Съёмка будет доступна, "
+                              "когда температура установится.")
         self._abort.clear()
         acq = self.acq_settings()
         t0 = time.monotonic()
@@ -520,14 +584,21 @@ class Instrument:
         key = self._bg_key(acq)
         y = raw
         bg_used = False
+        t_now = self.last_state.temperature if self.last_state else None
         if background:
             with self._lock:
                 self._backgrounds[key] = raw.copy()
+                if t_now is not None:
+                    self._bg_temps[key] = float(t_now)
                 if frame is not None and s.acq_mode == ACQ_IMAGE:
                     self._bg_images[key] = frame.astype(np.float64)
         elif s.subtract_background:
             with self._lock:
                 bg = self._backgrounds.get(key)
+            problem = self.background_problem()
+            if bg is not None and problem:
+                log.warning("Фон не вычтен: %s", problem)
+                bg = None
             if bg is not None and bg.shape == raw.shape:
                 y = raw - bg * (n if mode == "sum" else 1)
                 bg_used = True
