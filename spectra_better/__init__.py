@@ -8,7 +8,7 @@
 
 import os as _os
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 APP_NAME = "SpectraSP Better"
 
 # Драйверы требуют, чтобы текущим каталогом был каталог SpectraSP; чтобы

@@ -15,15 +15,16 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import List, Optional
 
 from .calibration import CalibrationSettings
+from .units import X_NM
 
 log = logging.getLogger(__name__)
 
 ACQ_SPECTRUM = "spectrum"
 ACQ_IMAGE = "image"
 
-X_NM, X_PX, X_WAVENUMBER, X_RAMAN = "nm", "px", "cm-1", "raman"
-X_UNITS = {X_NM: "Длина волны, нм", X_PX: "Пиксель", X_WAVENUMBER: "Волновое число, см⁻¹",
-           X_RAMAN: "Рамановский сдвиг, см⁻¹"}
+# Уставка в поле при каждом запуске. Выше комнатной почти не охлаждает, поэтому
+# случайное нажатие «Задать» не заморозит ПЗС. Прошлая уставка не запоминается.
+COOLING_TARGET_DEFAULT_C = 20
 
 
 def settings_dir() -> str:
@@ -51,16 +52,23 @@ class AppSettings:
     flip_x: bool = False
     frame_timeout_s: float = 30.0             # запас сверх ожидаемого времени кадра
 
-    # охлаждение
-    cooling_target_c: int = -20
+    # охлаждение (уставка не хранится — см. COOLING_TARGET_DEFAULT_C)
     warm_up_on_close: bool = True
 
     # обработка
     subtract_background: bool = True
     close_shutter_for_background: bool = True
     remove_cosmics: bool = False
-    x_unit: str = X_NM
     laser_nm: float = 532.0
+
+    # отображение спектра: единицы и диапазон по осям
+    x_unit: str = X_NM                        # основная шкала (снизу)
+    x_top_unit: str = ""                      # дополнительная шкала сверху ("" — нет)
+    x_auto: bool = True                       # по X показывать весь спектр
+    x_range: List[float] = field(default_factory=list)   # [от, до] в единицах x_range_unit
+    x_range_unit: str = X_NM
+    y_auto: bool = True                       # по Y — по данным в видимой области
+    y_range: List[float] = field(default_factory=list)
 
     # монохроматор
     wl_presets: List[float] = field(default_factory=list)

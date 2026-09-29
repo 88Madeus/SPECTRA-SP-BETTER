@@ -62,3 +62,13 @@ def test_settings_corrupted(tmp_path):
     p.write_text(json.dumps({"exposure_ms": "abc", "accumulations": 5}), encoding="utf-8")
     s = AppSettings.load(str(p))
     assert s.accumulations == 5 and s.exposure_ms == AppSettings().exposure_ms
+
+
+def test_cooling_setpoint_not_remembered(tmp_path):
+    # при запуске в поле уставки всегда безопасные +20 °C; старое значение из файла не подхватывается
+    from spectra_better.config import COOLING_TARGET_DEFAULT_C
+    assert COOLING_TARGET_DEFAULT_C == 20
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"cooling_target_c": -20, "exposure_ms": 50}), encoding="utf-8")
+    s = AppSettings.load(str(p))
+    assert s.exposure_ms == 50 and not hasattr(s, "cooling_target_c")

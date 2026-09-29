@@ -12,13 +12,15 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .. import APP_NAME, __version__
 from .. import processing as P
-from ..calibration import WavelengthAxis, raman_shift, wavenumber
-from ..config import X_NM, X_PX, X_RAMAN, X_UNITS, X_WAVENUMBER, AppSettings
+from ..calibration import WavelengthAxis
+from ..config import COOLING_TARGET_DEFAULT_C, AppSettings
 from ..hw.base import DeviceError
 from ..hw.winutil import spectrasp_is_running
 from ..instrument import Instrument, Measurement
 from ..reference_lines import nearest_line
 from ..storage import load_spectrum, save_image, save_spectrum, unique_path
+from ..units import (X_DECIMALS, X_EV, X_NM, X_PX, X_RAMAN, X_SHORT, X_UNITS, X_WAVENUMBER, AxisMap, from_nm,
+                     is_spectral)
 from .dialogs import CalibrationDialog, PanoramaDialog, SeriesDialog, SettingsDialog
 from .icons import gear_icon
 from .log_widget import LogView, QtLogHandler
@@ -50,6 +52,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mono_moving = False
         self._closing = False
         self._service_dlg = None
+        self._image_meas: Optional[Measurement] = None   # измерение, из которого показан кадр ПЗС
 
         title = f"{APP_NAME} {__version__}" + ("  [ИМИТАЦИЯ]" if simulate else "")
         self.setWindowTitle(title)
@@ -105,7 +108,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_open = act("Открыть спектр…", SP.SP_DialogOpenButton, "Ctrl+O", "Загрузить спектр для наложения")
         self.act_pin = act("Закрепить", SP.SP_DialogYesButton, "Ctrl+D", "Оставить текущий спектр на графике для сравнения")
         self.act_clear = act("Очистить наложения", SP.SP_TrashIcon, None, "Убрать все наложенные спектры")
-        self.act_autorange = act("Автомасштаб", SP.SP_TitleBarMaxButton, "Ctrl+A", "Показать весь спектр")
+        self.act_autorange = act("Весь спектр", SP.SP_TitleBarMaxButton, "Ctrl+A",
+                                 "Показать весь спектр по X и подобрать масштаб по Y")
         self.act_calib = act("Калибровка шкалы…", None, None, "Центральный пиксель, модель, поправка по реперным линиям")
         self.act_settings = act("Настройки…", SP.SP_FileDialogDetailedView, None, "Каталог SpectraSP, таймауты")
         self.act_about = act("О программе", SP.SP_MessageBoxInformation)
@@ -141,7 +145,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # центр
         self.tabs = QtWidgets.QTabWidget()
-        self.plot = SpectrumPlot()
+        self.plot = SpectrumPlot(self.s)
         self.image = ImagePanel()
         self.tabs.addTab(self.plot, "Спектр")
         self.tabs.addTab(self.image, "Изображение ПЗС")
@@ -149,7 +153,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # слева — управление
         self.cam_panel = CameraPanel()
-        self.cam_panel.target.setValue(self.s.cooling_target_c)
+        self.cam_panel.target.setValue(COOLING_TARGET_DEFAULT_C)
         self.acq_panel = AcquisitionPanel(self.s)
         self.mono_panel = MonoPanel(self.s)
         self.proc_panel = ProcessingPanel(self.s)
@@ -231,7 +235,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_open.triggered.connect(self.open_spectrum)
         self.act_pin.triggered.connect(self.pin_current)
         self.act_clear.triggered.connect(self.clear_overlays)
-        self.act_autorange.triggered.connect(self.plot.auto_range)
+        self.act_autorange.triggered.connect(self.plot.show_all)
+        self.plot.units_changed.connect(self._display_settings_changed)
         self.act_calib.triggered.connect(self.calibration)
         self.act_settings.triggered.connect(self.settings_dialog)
         self.act_about.triggered.connect(self.about)
@@ -454,7 +459,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ================================================================ камера
     def cooling_on(self, target: int) -> None:
-        self.s.cooling_target_c = target
         log.info("Охлаждение: уставка %+d °C", target)
         self.tasks.run(lambda: self.inst.set_cooling(True, target), None,
                        lambda e: self._error("Охлаждение", e))
@@ -642,15 +646,57 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_mono_view()
 
     # ================================================================ отображение
-    def _display_x(self, m: Measurement):
-        unit = self.s.x_unit
-        if m.x_unit != "nm" or unit == X_PX:
-            return np.arange(m.y.size, dtype=float), X_UNITS[X_PX]
-        if unit == X_WAVENUMBER:
-            return wavenumber(m.x), X_UNITS[X_WAVENUMBER]
-        if unit == X_RAMAN:
-            return raman_shift(m.x, self.s.laser_nm), X_UNITS[X_RAMAN] + f" (лазер {self.s.laser_nm:g} нм)"
-        return m.x, X_UNITS[X_NM]
+    @staticmethod
+    def _x_in(m: Measurement, unit: str, laser_nm: float) -> Optional[np.ndarray]:
+        """Ось X измерения в заданных единицах (None — без шкалы длин волн нельзя)."""
+        if unit == X_PX:
+            if m.x_unit == X_PX and m.x.size == m.y.size:
+                return np.asarray(m.x, dtype=float)
+            return np.arange(m.y.size, dtype=float)
+        if m.x_unit != "nm":
+            return None
+        return from_nm(m.x, unit, laser_nm)
+
+    def _scale_for(self, m: Optional[Measurement]):
+        """(пересчёт единиц, единицы, в которых реально можно показать m)."""
+        amap = AxisMap(m.x if m is not None and m.x_unit == "nm" else None, self.s.laser_nm)
+        unit = self.s.x_unit if self.s.x_unit in X_UNITS else X_NM
+        if m is not None and not amap.available(unit):
+            unit = X_PX
+        return amap, unit
+
+    def _coverage_text(self, m: Measurement, amap: AxisMap, unit: str):
+        """Строка над графиком: что охватывает кадр (или почему шкала в пикселях)."""
+        n = m.y.size
+        if not amap.calibrated:
+            if m.center_wl is None and m.x_unit != "nm":
+                why = "длина волны неизвестна (монохроматор не подключён)"
+            else:
+                why = "в «Калибровке шкалы» выбран режим «пиксели»"
+            warn = self.s.x_unit != X_PX
+            return (f"Шкала только в пикселях: {why}. Кадр: {n} пикс.", warn)
+        wl = amap.wl
+        lo, hi = float(min(wl[0], wl[-1])), float(max(wl[0], wl[-1]))
+        text = f"Кадр ПЗС охватывает {lo:.3f} … {hi:.3f} нм"
+        if is_spectral(unit) and unit != X_NM:
+            a, b = sorted(from_nm([lo, hi], unit, self.s.laser_nm))
+            d = 4 if unit == X_EV else 1
+            text += f" = {a:.{d}f} … {b:.{d}f} {X_SHORT[unit]}"
+        parts = [text, f"{n} пикс., ≈{(hi - lo) / max(1, n - 1):.4f} нм/пикс."]
+        if m.center_wl is not None:
+            parts.append(f"центр {m.center_wl:.3f} нм")
+        if m.grating_title:
+            parts.append(f"решётка {m.grating_title}")
+        if m.calibration_source:
+            parts.append(f"шкала: {m.calibration_source}")
+        return " · ".join(parts), False
+
+    def _update_image_scale(self) -> None:
+        im = self._image_meas
+        if im is None or im.image is None:
+            return
+        amap, unit = self._scale_for(im)
+        self.image.set_x_scale(amap, unit, im.image.shape[1])
 
     def _on_measurement(self, m: Measurement) -> None:
         if m.is_background:
@@ -661,9 +707,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._redraw()
             return
         self.current = m
-        self._redraw()
         if m.image is not None:
+            self._image_meas = m
             self.image.set_image(m.image)
+        self._redraw()
         if m.saturated:
             self.lbl_meas.setText("<b style='color:#b00020'>НАСЫЩЕНИЕ!</b> уменьшите экспозицию")
         else:
@@ -674,42 +721,63 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _redraw(self) -> None:
         m = self.current
+        ref = m if m is not None else next(iter(self.overlays.values()), None)
+        amap, unit = self._scale_for(ref)
+        laser = self.s.laser_nm
+        self.plot.set_scale(amap, unit)
         if m is not None:
-            x, label = self._display_x(m)
-            self.plot.set_x_label(label)
+            x = self._x_in(m, unit, laser)
             self.plot.set_data(x, m.y, m.label or "Текущий")
-            self._update_peaks(x, m.y, m)
+            self._update_peaks(x, m.y, amap, unit)
         bg = self.background
         if bg is not None and m is not None and bg.y.size == m.y.size:
-            bx, _ = self._display_x(m)
-            self.plot.set_background(bx, bg.raw * (m.accumulations if m.accumulate_mode == "sum" else 1),
+            self.plot.set_background(self._x_in(m, unit, laser),
+                                     bg.raw * (m.accumulations if m.accumulate_mode == "sum" else 1),
                                      self.proc_panel.show_bg.isChecked())
         else:
             self.plot.set_background(None, None, False)
+        hidden = set()
         for key, om in self.overlays.items():
-            ox, _ = self._display_x(om)
+            ox = self._x_in(om, unit, laser)
             self.plot.update_overlay(key, ox, om.y)
+            if ox is None:
+                hidden.add(key)
+        for i in range(self.overlay_list.count()):
+            item = self.overlay_list.item(i)
+            off = item.data(QtCore.Qt.UserRole) in hidden
+            item.setForeground(QtGui.QColor("#999" if off else "#000"))
+            item.setToolTip(f"Спектр только в пикселях — в единицах «{X_UNITS.get(unit, unit)}» не показывается"
+                            if off else "")
+        if ref is not None:
+            self.plot.set_info(*self._coverage_text(ref, amap, unit))
+        self.plot.refresh_view()
+        self._update_image_scale()
 
-    def _update_peaks(self, x: np.ndarray, y: np.ndarray, m: Measurement) -> None:
+    def _update_peaks(self, x: np.ndarray, y: np.ndarray, amap: AxisMap, unit: str) -> None:
         self.peaks_table.setRowCount(0)
+        self.peaks_table.setHorizontalHeaderLabels([f"Положение, {X_SHORT.get(unit, unit)}", "Высота",
+                                                    "Ширина", "Линия"])
         if not self.proc_panel.peaks.isChecked() or y.size < 5:
             self.plot.show_peaks([], [], [])
             return
         peaks = P.find_peaks(x, y, max_peaks=25)
         xs, ys, labels = [], [], []
+        dec = X_DECIMALS.get(unit, 3)
         for pk in peaks:
             r = self.peaks_table.rowCount()
             self.peaks_table.insertRow(r)
             line = ""
-            if m.x_unit == "nm" and self.s.x_unit == X_NM:
-                wl, src = nearest_line(pk.x, tolerance=max(0.3, 3 * pk.fwhm / 2))
+            if amap.calibrated:
+                # справочную линию ищем по длине волны в любых единицах оси
+                c_nm, e_nm = amap.convert([pk.x, pk.x + pk.fwhm / 2], unit, X_NM)
+                wl, src = nearest_line(float(c_nm), tolerance=max(0.3, 3 * abs(e_nm - c_nm)))
                 if wl == wl:
-                    line = f"{wl:.3f} {src.split()[0]}"
-            for col, val in enumerate((f"{pk.x:.3f}", f"{pk.height:.0f}", f"{pk.fwhm:.3f}", line)):
+                    line = f"{wl:.3f} нм {src.split()[0]}"
+            for col, val in enumerate((f"{pk.x:.{dec}f}", f"{pk.height:.0f}", f"{pk.fwhm:.{dec}f}", line)):
                 self.peaks_table.setItem(r, col, QtWidgets.QTableWidgetItem(val))
             xs.append(pk.x)
             ys.append(pk.height + float(np.median(y)))
-            labels.append(f"{pk.x:.2f}")
+            labels.append(f"{pk.x:.{min(dec, 2)}f}")
         self.plot.show_peaks(xs, ys, labels)
 
     def _display_settings_changed(self) -> None:
@@ -726,11 +794,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overlay_seq += 1
         key = f"ov{self._overlay_seq}"
         self.overlays[key] = m
-        x, _ = self._display_x(m)
-        self.plot.add_overlay(key, x, m.y, name)
+        self.plot.add_overlay(key, None, m.y, name)
         item = QtWidgets.QListWidgetItem(name)
         item.setData(QtCore.Qt.UserRole, key)
         self.overlay_list.addItem(item)
+        self._redraw()
 
     def remove_selected_overlays(self) -> None:
         for item in self.overlay_list.selectedItems():
@@ -738,11 +806,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plot.remove_overlay(key)
             self.overlays.pop(key, None)
             self.overlay_list.takeItem(self.overlay_list.row(item))
+        self._redraw()
 
     def clear_overlays(self) -> None:
         self.plot.clear_overlays()
         self.overlays.clear()
         self.overlay_list.clear()
+        self._redraw()
 
     def open_spectrum(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -755,23 +825,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             first = header[0].lower() if header else ""
             is_px = "pixel" in first or "пиксел" in first or not (100 < float(np.median(x)) < 5000)
-            m = Measurement(x=x, x_unit="px" if is_px else "nm", y=y, raw=y, label=os.path.basename(path))
+            m = Measurement(x=x, x_unit=X_PX if is_px else X_NM, y=y, raw=y, label=os.path.basename(path))
             self._add_overlay(m, os.path.basename(path))
             log.info("Загружен спектр %s (%d точек)", path, x.size)
 
     # ================================================================ сохранение
     def _save_measurement(self, path: str, m: Measurement) -> None:
         extra = {}
+        meta = m.meta()
         if m.x_unit == "nm":
             x_name = "wavelength_nm"
             extra["pixel"] = np.arange(m.y.size)
-            if self.s.x_unit == X_RAMAN:
-                extra["raman_shift_cm-1"] = raman_shift(m.x, self.s.laser_nm)
+            # дополнительно — столбцы в единицах, выбранных для осей графика
+            names = {X_WAVENUMBER: "wavenumber_cm-1", X_RAMAN: "raman_shift_cm-1", X_EV: "photon_energy_eV"}
+            for u in (self.s.x_unit, self.s.x_top_unit):
+                if u in names:
+                    extra[names[u]] = from_nm(m.x, u, self.s.laser_nm)
+            if "raman_shift_cm-1" in extra:
+                meta["laser_nm"] = self.s.laser_nm
         else:
             x_name = "pixel"
         if m.background_used:
             extra["raw_without_background_subtraction"] = m.raw
-        save_spectrum(path, m.x if m.x_unit == "nm" else np.arange(m.y.size), m.y, m.meta(),
+        save_spectrum(path, m.x if m.x_unit == "nm" else np.arange(m.y.size), m.y, meta,
                       x_name=x_name, extra=extra)
 
     def save_current(self) -> None:
