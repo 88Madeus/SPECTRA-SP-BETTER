@@ -13,7 +13,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from .. import APP_NAME, __version__
 from .. import processing as P
 from ..calibration import WavelengthAxis
-from ..config import AppSettings
+from ..config import COOLING_TARGET_DEFAULT_C, AppSettings
 from ..hw.base import DeviceError
 from ..hw.winutil import spectrasp_is_running
 from ..instrument import Instrument, Measurement
@@ -153,7 +153,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # слева — управление
         self.cam_panel = CameraPanel()
-        self.cam_panel.target.setValue(self.s.cooling_target_c)
+        self.cam_panel.target.setValue(COOLING_TARGET_DEFAULT_C)
         self.acq_panel = AcquisitionPanel(self.s)
         self.mono_panel = MonoPanel(self.s)
         self.proc_panel = ProcessingPanel(self.s)
@@ -459,7 +459,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ================================================================ камера
     def cooling_on(self, target: int) -> None:
-        self.s.cooling_target_c = target
         log.info("Охлаждение: уставка %+d °C", target)
         self.tasks.run(lambda: self.inst.set_cooling(True, target), None,
                        lambda e: self._error("Охлаждение", e))

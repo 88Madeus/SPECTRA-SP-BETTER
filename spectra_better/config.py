@@ -22,6 +22,10 @@ log = logging.getLogger(__name__)
 ACQ_SPECTRUM = "spectrum"
 ACQ_IMAGE = "image"
 
+# Уставка в поле при каждом запуске. Выше комнатной почти не охлаждает, поэтому
+# случайное нажатие «Задать» не заморозит ПЗС. Прошлая уставка не запоминается.
+COOLING_TARGET_DEFAULT_C = 20
+
 
 def settings_dir() -> str:
     if sys.platform == "win32":
@@ -48,8 +52,7 @@ class AppSettings:
     flip_x: bool = False
     frame_timeout_s: float = 30.0             # запас сверх ожидаемого времени кадра
 
-    # охлаждение
-    cooling_target_c: int = -20
+    # охлаждение (уставка не хранится — см. COOLING_TARGET_DEFAULT_C)
     warm_up_on_close: bool = True
 
     # обработка
