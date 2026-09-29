@@ -770,7 +770,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     mm = Measurement(x=x, x_unit="nm", y=y, raw=y, exposure_ms=m.exposure_ms,
                                      accumulations=m.accumulations, center_wl=None, grating=m.grating,
                                      grating_title=m.grating_title, label=f"Панорама {p.start:g}–{p.end:g} нм",
-                                     calibration_source=m.calibration_source, background_used=m.background_used)
+                                     calibration_source=m.calibration_source, background_used=m.background_used,
+                                     stitched=True)
                     self.emitter.measurement.emit(mm)
             finally:
                 if p.return_back and wl0 is not None:
@@ -832,12 +833,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return (f"Шкала только в пикселях: {why}. Кадр: {n} пикс.", warn)
         wl = amap.wl
         lo, hi = float(min(wl[0], wl[-1])), float(max(wl[0], wl[-1]))
-        text = f"Кадр ПЗС охватывает {lo:.3f} … {hi:.3f} нм"
+        single = m.center_wl is not None          # один кадр, а не сшитая панорама
+        text = f"{'Кадр ПЗС' if single else 'Спектр'} охватывает {lo:.3f} … {hi:.3f} нм"
         if is_spectral(unit) and unit != X_NM:
             a, b = sorted(from_nm([lo, hi], unit, self.s.laser_nm))
             d = 4 if unit == X_EV else 1
             text += f" = {a:.{d}f} … {b:.{d}f} {X_SHORT[unit]}"
-        parts = [text, f"{n} пикс., ≈{(hi - lo) / max(1, n - 1):.4f} нм/пикс."]
+        parts = [text, f"{n} пикс., ≈{(hi - lo) / max(1, n - 1):.4f} нм/пикс." if single
+                 else f"{n} точек" + (", сшит из нескольких кадров" if m.stitched else "")]
         if m.center_wl is not None:
             parts.append(f"центр {m.center_wl:.3f} нм")
         if m.grating_title:
@@ -879,7 +882,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ref = m if m is not None else next(iter(self.overlays.values()), None)
         amap, unit = self._scale_for(ref)
         laser = self.s.laser_nm
-        self.plot.set_scale(amap, unit)
+        # у сшитой панорамы «пиксель» — это номер точки, а не пиксель ПЗС
+        self.plot.set_scale(amap, unit, pixels_ok=not (ref is not None and ref.stitched))
         if m is not None:
             x = self._x_in(m, unit, laser)
             self.plot.set_data(x, m.y, m.label or "Текущий")

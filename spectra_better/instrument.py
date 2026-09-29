@@ -58,6 +58,7 @@ class Measurement:
     calibration_source: str = ""
     is_background: bool = False
     label: str = ""
+    stitched: bool = False                # сшит из нескольких кадров (панорама): «пиксель» не имеет смысла
 
     def meta(self) -> Dict[str, object]:
         m: Dict[str, object] = {
