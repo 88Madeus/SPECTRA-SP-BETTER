@@ -5,7 +5,7 @@ from typing import Optional, Sequence
 
 from PyQt5 import QtCore, QtWidgets
 
-from ..config import ACQ_IMAGE, ACQ_SPECTRUM, X_UNITS, X_RAMAN, AppSettings
+from ..config import ACQ_IMAGE, ACQ_SPECTRUM, AppSettings
 from ..hw.base import CameraInfo, CameraState, MonoInfo
 
 
@@ -342,7 +342,7 @@ class ProcessingPanel(QtWidgets.QGroupBox):
     reset_background = QtCore.pyqtSignal()
 
     def __init__(self, settings: AppSettings, parent=None):
-        super().__init__("Обработка и отображение", parent)
+        super().__init__("Обработка", parent)
         self.s = settings
         form = QtWidgets.QFormLayout(self)
         self.subtract = QtWidgets.QCheckBox("вычитать темновой фон")
@@ -361,40 +361,24 @@ class ProcessingPanel(QtWidgets.QGroupBox):
         form.addRow(self.cosmics)
         self.peaks = QtWidgets.QCheckBox("искать пики")
         form.addRow(self.peaks)
-        self.x_unit = QtWidgets.QComboBox()
-        for k, v in X_UNITS.items():
-            self.x_unit.addItem(v, k)
-        form.addRow("Ось X:", self.x_unit)
-        self.laser = QtWidgets.QDoubleSpinBox()
-        self.laser.setRange(100, 3000)
-        self.laser.setDecimals(3)
-        self.laser.setSuffix(" нм")
-        form.addRow("Лазер:", self.laser)
+        note = QtWidgets.QLabel("Единицы и диапазон осей — на панели над графиком.")
+        note.setStyleSheet("color: #666;")
+        note.setWordWrap(True)
+        form.addRow(note)
         self.subtract.setChecked(settings.subtract_background)
         self.close_shutter.setChecked(settings.close_shutter_for_background)
         self.cosmics.setChecked(settings.remove_cosmics)
-        self.x_unit.setCurrentIndex(max(0, self.x_unit.findData(settings.x_unit)))
-        self.laser.setValue(settings.laser_nm)
         self.peaks.setChecked(True)
-        self._update()
         for w in (self.subtract, self.close_shutter, self.cosmics, self.show_bg, self.peaks):
             w.toggled.connect(self._store)
-        self.x_unit.currentIndexChanged.connect(self._store)
-        self.laser.valueChanged.connect(self._store)
         self.btn_bg.clicked.connect(self.take_background.emit)
         self.btn_bg_reset.clicked.connect(self.reset_background.emit)
-
-    def _update(self) -> None:
-        self.laser.setEnabled(self.x_unit.currentData() == X_RAMAN)
 
     def _store(self) -> None:
         s = self.s
         s.subtract_background = self.subtract.isChecked()
         s.close_shutter_for_background = self.close_shutter.isChecked()
         s.remove_cosmics = self.cosmics.isChecked()
-        s.x_unit = self.x_unit.currentData()
-        s.laser_nm = self.laser.value()
-        self._update()
         self.changed.emit()
 
     def set_background_status(self, has: bool, text: str = "") -> None:
