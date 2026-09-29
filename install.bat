@@ -23,4 +23,5 @@ if exist wheels (
 if errorlevel 1 (echo Ошибка установки пакетов & pause & exit /b 1)
 echo.
 echo Готово. Запуск: run.bat   Проверка приборов: probe.bat   Без приборов: run_simulation.bat
+echo При первом запуске run.bat на рабочем столе появятся ярлыки «SpectraSP Better».
 pause

@@ -72,6 +72,11 @@ SOL instruments **MS7504i** № 20126 + ПЗС-камера **PSI (ProScan)** 20
    Отчёт сохраняется в `probe_ДАТА.txt`. С ключом `probe.bat --expose 100`
    дополнительно снимается пробный спектр 100 мс.
 5. Запуск программы — `run.bat`. Без приборов — `run_simulation.bat`.
+   При первом запуске на рабочем столе появятся ярлыки **«SpectraSP Better»** и
+   **«SpectraSP Better (имитация)»** со значком программы — дальше можно
+   запускать ими (без окна консоли). Если папку программы перенести, ярлыки
+   обновятся при следующем запуске `run.bat`. Удалённый ярлык сам не
+   возвращается — для этого есть `create_shortcuts.bat`.
 
 Каталог SpectraSP ищется автоматически (`C:\ProgramData\SpectraSP for MS7504i N020126`
 и другие `C:\ProgramData\SpectraSP*`); при необходимости укажите его в
@@ -179,6 +184,7 @@ SOL instruments **MS7504i** № 20126 + ПЗС-камера **PSI (ProScan)** 20
 | Команда | Назначение |
 |---|---|
 | `probe.bat [--expose МС] [--full-frame] [--goto НМ]` | диагностика приборов, отчёт в файл |
+| `create_shortcuts.bat` | создать (заново) ярлыки программы на рабочем столе |
 | `.venv32\Scripts\python -m spectra_better.logsp Logs\*.zip` | расшифровать журналы SpectraSP в текст |
 | `.venv32\Scripts\python -m spectra_better.tools.tune_spectrasp [--apply / --restore]` | ускорить запуск оригинальной SpectraSP (выключить опрос отсутствующих камер; с резервной копией; адреса не меняются) |
 
