@@ -20,8 +20,9 @@ import numpy as np
 from . import processing as P
 from .calibration import WavelengthAxis, geometries_from_config
 from .config import ACQ_IMAGE, ACQ_SPECTRUM, AppSettings
-from .hw.base import (AcqSettings, Camera, CameraInfo, CameraState, DeviceError, GratingInfo,
-                      Monochromator, MonoInfo, full_frame_region, spectrum_region)
+from .hw.base import (MECH_GRATING, MECH_MIRROR, MECH_SLIT, MECH_TURRET, AcqSettings, Camera, CameraInfo,
+                      CameraState, DeviceError, GratingInfo, Monochromator, MonoInfo, full_frame_region,
+                      spectrum_region)
 from .hw.worker import DeviceThread
 from .spectrasp_config import InstalledSetup, find_spectrasp_dir, read_installation
 
@@ -192,6 +193,7 @@ class Instrument:
             info.slits = list(mc.slits)
             info.mirror_positions = list(mc.mirror_positions)
             info.has_shutter = mc.has_shutter
+            info.step_limits = dict(mc.step_limits)
         return info
 
     def connect_camera(self) -> CameraInfo:
@@ -511,6 +513,78 @@ class Instrument:
     def get_shutter(self) -> Optional[bool]:
         self._require_mono()
         return self.mono_thread.call(self.mono.get_shutter, 0, timeout=60)
+
+    # ---------------------------------------------------------------- сервис
+    def service_mechanisms(self) -> List[Tuple[str, int, str]]:
+        """Механизмы для сервисного окна: (механизм, номер, название)."""
+        if self.mono is None:
+            return []
+        info = self.mono.info
+        out = [(MECH_GRATING, 0, "Решётка (длина волны)"), (MECH_TURRET, 0, "Турель решёток")]
+        out += [(MECH_SLIT, i, name) for i, name in enumerate(info.slits or ["Входная щель"])]
+        if info.mirror_positions:
+            out.append((MECH_MIRROR, 0, "Выходное зеркало"))
+        return out
+
+    def service_snapshot(self) -> Dict[str, object]:
+        """Всё состояние монохроматора одним вызовом (для сервисного окна)."""
+        self._require_mono()
+        mechs = self.service_mechanisms()
+
+        def read():
+            m = self.mono
+            snap: Dict[str, object] = {"busy": m.is_busy()}
+
+            def safe(key, fn):
+                try:
+                    snap[key] = fn()
+                except DeviceError as e:
+                    snap[key] = None
+                    log.debug("service %s: %s", key, e)
+            safe("wl", m.get_wavelength)
+            safe("grating", m.get_grating)
+            safe("shutter", lambda: m.get_shutter(0))
+            safe("mirror", lambda: m.get_mirror(0))
+            for i in range(len(m.info.slits) or 1):
+                safe(f"slit{i}", lambda i=i: m.get_slit(i))
+            steps = {}
+            for mech, idx, _name in mechs:
+                try:
+                    steps[(mech, idx)] = m.get_steps(mech, idx)
+                except DeviceError:
+                    steps[(mech, idx)] = None
+            snap["steps"] = steps
+            return snap
+        snap = self.mono_thread.call(read, timeout=self.settings.mono_timeout_s + 30)
+        with self._lock:
+            if snap.get("wl") is not None:
+                self.mono_wl = snap["wl"]
+            if snap.get("grating") is not None:
+                self.mono_grating = snap["grating"]
+            if snap.get("slit0") is not None:
+                self.mono_slit = snap["slit0"]
+            self.axis.invalidate()
+        return snap
+
+    def service_set_steps(self, mech: str, index: int, position: int) -> None:
+        self._require_mono()
+        t = self.settings.mono_timeout_s
+        self.mono_thread.call(self.mono.set_steps, mech, int(index), int(position), t, timeout=t + 30)
+
+    def service_move_steps(self, mech: str, index: int, delta: int) -> None:
+        self._require_mono()
+        t = self.settings.mono_timeout_s
+        self.mono_thread.call(self.mono.move_steps, mech, int(index), int(delta), t, timeout=t + 30)
+
+    def service_reset(self, mech: str, index: int) -> None:
+        self._require_mono()
+        t = self.settings.mono_timeout_s
+        self.mono_thread.call(self.mono.reset, mech, int(index), t, timeout=t + 30)
+
+    def show_native_window(self) -> None:
+        """Штатное окно DevCtrl (выполняется в потоке монохроматора — там живут окна драйвера)."""
+        self._require_mono()
+        self.mono_thread.call(self.mono.show_native_window, timeout=60)
 
     def mono_busy(self) -> bool:
         """Идёт ли движение (не блокирует, если поток занят долгой командой)."""

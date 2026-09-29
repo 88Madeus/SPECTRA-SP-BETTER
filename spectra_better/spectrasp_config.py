@@ -236,6 +236,7 @@ class MonoConfig:
     mirror_positions: List[str] = field(default_factory=list)
     has_shutter: bool = False
     current_grating: int = -1
+    step_limits: Dict[Tuple[str, int], int] = field(default_factory=dict)
 
 
 def find_mono_cfg(directory: str) -> Optional[str]:
@@ -276,6 +277,21 @@ def read_mono_cfg(directory: str) -> MonoConfig:
         # SSPL: положение 0 = DevCtrl-позиция 2, положение 1 = DevCtrl-позиция 1
         mc.mirror_positions = [m.get("PosCaption2", "Положение 2").strip(), m.get("PosCaption1", "Положение 1").strip()]
     mc.has_shutter = int(_num(dev.get("ShutterCount"), 0)) > 0
+    # пределы шаговых двигателей для сервисного окна
+    if cp.has_section("Grating1"):
+        mc.step_limits[("grating", 0)] = int(_num(cp["Grating1"].get("MaxMayStepCount"), 0))
+    for i in range(len(mc.slits)):
+        sec = f"Slit{i + 1}"
+        if cp.has_section(sec):
+            mc.step_limits[("slit", i)] = int(_num(cp[sec].get("MaxMayStepCount"), 0))
+    if cp.has_section("Mirror1"):
+        mc.step_limits[("mirror", 0)] = int(_num(cp["Mirror1"].get("MaxMayStepCount"), 0))
+    if cp.has_section("Turret1"):
+        t = cp["Turret1"]
+        pos = [int(_num(t.get(f"TurretPosition{k}"), 0)) for k in range(1, int(_num(t.get("PositionCount"), 0)) + 1)]
+        if pos:
+            mc.step_limits[("turret", 0)] = max(pos) + max(1000, (max(pos) - min(pos)) // max(1, len(pos) - 1))
+    mc.step_limits = {k: v for k, v in mc.step_limits.items() if v > 0}
     if cp.has_section("Turret1"):
         mc.current_grating = int(_num(cp["Turret1"].get("CurGrating"), 0)) - 1
     return mc

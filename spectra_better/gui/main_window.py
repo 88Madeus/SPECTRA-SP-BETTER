@@ -20,6 +20,7 @@ from ..instrument import Instrument, Measurement
 from ..reference_lines import nearest_line
 from ..storage import load_spectrum, save_image, save_spectrum, unique_path
 from .dialogs import CalibrationDialog, PanoramaDialog, SeriesDialog, SettingsDialog
+from .icons import gear_icon
 from .log_widget import LogView, QtLogHandler
 from .panels import AcquisitionPanel, CameraPanel, MonoPanel, ProcessingPanel
 from .plots import ImagePanel, SpectrumPlot
@@ -48,6 +49,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mono_was_busy = False
         self._mono_moving = False
         self._closing = False
+        self._service_dlg = None
 
         title = f"{APP_NAME} {__version__}" + ("  [ИМИТАЦИЯ]" if simulate else "")
         self.setWindowTitle(title)
@@ -88,6 +90,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_connect = act("Подключить", SP.SP_DialogApplyButton, "Ctrl+K", "Подключить камеру и монохроматор")
         self.act_disconnect = act("Отключить", SP.SP_DialogCancelButton, None, "Отключить приборы")
         self.act_reconnect_cam = act("Переподключить камеру", None, None, "Закрыть и заново открыть камеру")
+        self.act_service = act("Сервис прибора", None, "Ctrl+Shift+D",
+                               "Сервис монохроматора: шторка, зеркало, щели, решётки, шаговые двигатели, "
+                               "сброс механизмов, штатное окно DevCtrl")
+        self.act_service.setIcon(gear_icon())
         self.act_snap = act("Снимок", SP.SP_MediaPlay, "F5", "Снять один спектр (с накоплением)")
         self.act_live = act("Непрерывно", SP.SP_BrowserReload, "F6", "Непрерывная съёмка")
         self.act_stop = act("Стоп", SP.SP_MediaStop, "Esc", "Остановить съёмку / прервать экспозицию")
@@ -108,7 +114,8 @@ class MainWindow(QtWidgets.QMainWindow):
         tb = self.addToolBar("Основные")
         tb.setObjectName("main_toolbar")
         tb.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        for a in (self.act_connect, self.act_disconnect, None, self.act_snap, self.act_live, self.act_stop,
+        for a in (self.act_connect, self.act_disconnect, self.act_service, None, self.act_snap, self.act_live,
+                  self.act_stop,
                   self.act_bg, None, self.act_series, self.act_pano, None, self.act_save, self.act_open,
                   self.act_pin, self.act_clear, self.act_autorange):
             tb.addSeparator() if a is None else tb.addAction(a)
@@ -118,8 +125,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for a in (self.act_open, self.act_save, self.act_save_img, None, self.act_exit):
             m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("&Прибор")
-        for a in (self.act_connect, self.act_disconnect, self.act_reconnect_cam):
-            m.addAction(a)
+        for a in (self.act_connect, self.act_disconnect, self.act_reconnect_cam, None, self.act_service):
+            m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("&Измерение")
         for a in (self.act_snap, self.act_live, self.act_stop, None, self.act_bg, self.act_series, self.act_pano):
             m.addSeparator() if a is None else m.addAction(a)
@@ -211,6 +218,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_connect.triggered.connect(self.connect_devices)
         self.act_disconnect.triggered.connect(self.disconnect_devices)
         self.act_reconnect_cam.triggered.connect(self.reconnect_camera)
+        self.act_service.triggered.connect(self.mono_service)
+        self.mono_panel.service.connect(self.mono_service)
         self.act_snap.triggered.connect(self.snap)
         self.act_live.triggered.connect(self.live)
         self.act_stop.triggered.connect(self.stop)
@@ -273,6 +282,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_pin.setEnabled(self.current is not None)
         self.cam_panel.set_connected(cam)
         self.mono_panel.set_connected(mono and not self._mono_moving)
+        self.act_service.setEnabled(mono)
+        self.mono_panel.set_service_enabled(mono)
         self.proc_panel.btn_bg.setEnabled(cam and not acq)
         self.lbl_cam.setText("Камера: подключена" if cam else "Камера: —")
         self._update_bg_status()
@@ -334,7 +345,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mono_panel.set_info(info, self.inst.mono_address())
         self._update_mono_view()
         self._update_actions()
+        self._refresh_mono_misc()
 
+    def _refresh_mono_misc(self) -> None:
+        """Прочитать положение зеркала, шторки и ширину щели для панели монохроматора."""
         def read_misc():
             out = {}
             for key, fn in (("mirror", self.inst.get_mirror), ("shutter", self.inst.get_shutter),
@@ -350,6 +364,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mono_panel.set_shutter_value(d.get("shutter"))
             self.mono_panel.set_slit_value(d.get("slit"))
         self.tasks.run(read_misc, show, lambda e: None, "mono-misc")
+
+    def mono_service(self) -> None:
+        """Сервисное окно монохроматора (значок шестерёнки)."""
+        if not self.inst.mono_connected:
+            QtWidgets.QMessageBox.information(self, "Сервис прибора", "Сначала подключите монохроматор.")
+            return
+        if self._service_dlg is not None and self._service_dlg.isVisible():
+            self._service_dlg.raise_()
+            self._service_dlg.activateWindow()
+            return
+        from .service_dialog import MonoServiceDialog
+
+        def changed():
+            self._update_mono_view()
+            self._refresh_mono_misc()
+        self._service_dlg = MonoServiceDialog(self.inst, self.tasks, changed, self)
+        self._service_dlg.show()
 
     def _update_mono_view(self) -> None:
         self.mono_panel.set_wavelength(self.inst.mono_wl, self.inst.mono_grating)

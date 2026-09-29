@@ -88,3 +88,35 @@ def test_grating_change_and_panorama(inst):
 def test_out_of_range_wavelength(inst):
     with pytest.raises(DeviceError):
         inst.goto_wavelength(5000)
+
+
+def test_service_steps(inst):
+    from spectra_better.hw.base import MECH_GRATING, MECH_MIRROR, MECH_SLIT, MECH_TURRET
+    mechs = [(m, i) for m, i, _ in inst.service_mechanisms()]
+    assert mechs == [(MECH_GRATING, 0), (MECH_TURRET, 0), (MECH_SLIT, 0), (MECH_SLIT, 1), (MECH_MIRROR, 0)]
+    # пределы берутся из cfg-файла SpectraSP
+    assert inst.mono.info.step_limits[(MECH_MIRROR, 0)] == 48700
+
+    snap = inst.service_snapshot()
+    assert set(snap["steps"]) == set(mechs)
+    assert all(v is not None for v in snap["steps"].values())
+    assert snap["wl"] == pytest.approx(inst.mono_wl)
+
+    inst.service_set_steps(MECH_SLIT, 0, 300)
+    assert inst.service_snapshot()["steps"][(MECH_SLIT, 0)] == 300
+    with pytest.raises(DeviceError):
+        inst.service_set_steps(MECH_SLIT, 0, 5000)      # больше MaxMayStepCount
+    with pytest.raises(DeviceError):
+        inst.service_move_steps(MECH_SLIT, 0, -1000)    # ниже нуля
+
+    wl0 = inst.service_snapshot()["wl"]
+    inst.service_move_steps(MECH_GRATING, 0, 5000)
+    snap = inst.service_snapshot()
+    assert snap["wl"] == pytest.approx(wl0 + 5.0)       # в имитаторе 1000 шагов = 1 нм
+    assert inst.mono_wl == pytest.approx(wl0 + 5.0)     # кэш прибора тоже обновлён
+
+    inst.service_reset(MECH_MIRROR, 0)
+    assert inst.service_snapshot()["steps"][(MECH_MIRROR, 0)] == 0
+
+    with pytest.raises(DeviceError):
+        inst.show_native_window()                       # в имитации окна DevCtrl нет

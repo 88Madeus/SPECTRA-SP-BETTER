@@ -29,6 +29,11 @@ def test_mono_cfg(spectrasp_dir):
     assert mc.has_shutter
     assert mc.current_grating == 3
     assert mc.path.endswith("MS7504_20126.cfg")       # а не *_old.cfg
+    # пределы шаговых двигателей для сервисного окна
+    assert mc.step_limits[("grating", 0)] == 960000
+    assert mc.step_limits[("slit", 0)] == mc.step_limits[("slit", 1)] == 4262
+    assert mc.step_limits[("mirror", 0)] == 48700
+    assert mc.step_limits[("turret", 0)] > 69538       # за последней позицией турели
 
 
 def test_find_dir(spectrasp_dir, tmp_path):

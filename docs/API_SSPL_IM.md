@@ -29,6 +29,38 @@
 | `SetSignalSourceState` | `int shutter, int state` | 8 | ≠0 — успех |
 | `GetCalibrationByTurret` | `int turret, double centerWL, int centerPx, double pxWidth, int n, double* out` | 32 | ≠0 — успех; длины волн n пикселей по модели DevCtrl |
 
+### Сервисные функции (шаговые двигатели и окно DevCtrl)
+
+Используются окном «Сервис монохроматора». Сигнатуры проверены по телам
+функций в `SSPL_IM.dll`; положения — в шагах двигателя.
+
+| Функция | Аргументы | Байт | Результат |
+|---|---|---|---|
+| `GetGratingStepByTurret` | `int turret, int (не используется), int* steps` | 12 | Boolean |
+| `SetGratingStepByTurret` | `int turret, int steps` | 8 | Boolean, абсолютное положение |
+| `MoveWLByStepsByTurret` | `int turret, int delta` | 8 | Boolean, относительный сдвиг решётки |
+| `ResetGratingByTurret` | `int turret` | 4 | ≠0 — успех; поиск нуля по датчику |
+| `GetTurretStep` / `SetTurretStepByTurret` | `int turret, int* steps` / `int turret, int steps` | 8 / 8 | Boolean |
+| `ResetTurret` | — | 0 | Boolean |
+| `GetSlitStep` / `SetSlitStep` | `int slit, int* steps` / `int slit, int steps` | 8 / 8 | Boolean |
+| `MoveSlitsBySteps` | `int slit, int delta` | 8 | Boolean |
+| `ResetSlit` | `int slit` | 4 | Boolean |
+| `GetMirrorStep` / `SetMirrorStep` | `int mirror, int* steps` / `int mirror, int steps` | 8 / 8 | Boolean |
+| `ResetMirror` | `int mirror` | 4 | Boolean |
+| `ShowWnd` | `int x, int y` | 8 | — ; вызывает `DevCtrl.ShowDeviceWindowEx(0)` |
+
+Предел положения каждого механизма — `MaxMayStepCount` в соответствующей
+секции cfg-файла прибора (`[Grating1]`, `[Slit1]`, `[Slit2]`, `[Mirror1]`);
+для турели предел оценивается по `TurretPositionN`.
+
+**Скрытое окно SpectraSP.** На главной форме SpectraSP есть невидимая кнопка
+`btnSpcInstrument` (TSpeedButton) → действие `ViewSpcDevExecute` →
+`ctrl_ShowWnd` → `SSPL_IM.ShowWnd(-1, -1)` → `DevCtrl.ShowDeviceWindowEx`.
+Это и есть окно DevCtrl со шторкой, щелями, зеркалом, режимом «Test» и
+разделом Configuration, которое в SpectraSP открывалось только сочетанием
+клавиш. Окно создаётся в потоке, загрузившем DLL, поэтому `ShowWnd`
+вызывается из потока монохроматора, который обрабатывает сообщения Windows.
+
 Особенности:
 
 * Большинство функций (включая `GetWaveLength…`) **внутри ждут** окончания

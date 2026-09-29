@@ -209,6 +209,7 @@ class MonoPanel(QtWidgets.QGroupBox):
     slit = QtCore.pyqtSignal(int, float)
     mirror = QtCore.pyqtSignal(int)
     shutter = QtCore.pyqtSignal(bool)
+    service = QtCore.pyqtSignal()
 
     def __init__(self, settings: AppSettings, parent=None):
         super().__init__("Монохроматор", parent)
@@ -216,7 +217,18 @@ class MonoPanel(QtWidgets.QGroupBox):
         form = QtWidgets.QFormLayout(self)
         self.status = QtWidgets.QLabel("не подключён")
         self.status.setWordWrap(True)
-        form.addRow(self.status)
+        from .icons import gear_icon
+        self.btn_service = QtWidgets.QToolButton()
+        self.btn_service.setIcon(gear_icon())
+        self.btn_service.setIconSize(QtCore.QSize(22, 22))
+        self.btn_service.setAutoRaise(True)
+        self.btn_service.setToolTip("Сервис монохроматора: шторка, зеркало, щели, решётки, "
+                                    "шаговые двигатели, сброс механизмов, штатное окно DevCtrl")
+        self.btn_service.clicked.connect(self.service.emit)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(self.status, 1)
+        top.addWidget(self.btn_service, 0, QtCore.Qt.AlignTop)
+        form.addRow(top)
         self.wl = _big(QtWidgets.QLabel("— нм"), 16)
         self.busy = QtWidgets.QLabel("")
         self.busy.setStyleSheet("color: #a15c00;")
@@ -289,6 +301,9 @@ class MonoPanel(QtWidgets.QGroupBox):
         for w in (self.target, self.btn_go, self.presets, self.gratings, self.btn_grating, self.slit_idx,
                   self.slit_w, self.btn_slit, self.mirror_box, self.btn_shutter):
             w.setEnabled(on)
+
+    def set_service_enabled(self, on: bool) -> None:
+        self.btn_service.setEnabled(on)
 
     def set_wavelength(self, wl: Optional[float], grating: Optional[int]) -> None:
         self.wl.setText("— нм" if wl is None else f"{wl:.3f} нм")

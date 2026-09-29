@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -171,6 +171,17 @@ class MonoInfo:
     mirror_positions: List[str] = field(default_factory=list)
     has_shutter: bool = True
     wl_range: Tuple[float, float] = (0.0, 0.0)
+    # предельные положения шаговых двигателей (MaxMayStepCount из MSxxxx.cfg): (механизм, номер) -> шаги
+    step_limits: Dict[Tuple[str, int], int] = field(default_factory=dict)
+
+
+# Механизмы монохроматора для сервисных операций (режим «Тест» окна DevCtrl)
+MECH_GRATING = "grating"     # привод решётки (длина волны)
+MECH_TURRET = "turret"       # турель (смена решётки)
+MECH_SLIT = "slit"
+MECH_MIRROR = "mirror"
+MECH_TITLES = {MECH_GRATING: "Решётка (длина волны)", MECH_TURRET: "Турель решёток",
+               MECH_SLIT: "Щель", MECH_MIRROR: "Выходное зеркало"}
 
 
 class Monochromator(abc.ABC):
@@ -229,6 +240,27 @@ class Monochromator(abc.ABC):
 
         Возвращает None, если модель недоступна.
         """
+
+    # --- сервисные операции (режим «Тест» штатного окна DevCtrl) --------------
+    def get_steps(self, mech: str, index: int = 0) -> int:
+        """Текущее положение шагового двигателя механизма, шаги."""
+        raise DeviceError("Операция не поддерживается")
+
+    def set_steps(self, mech: str, index: int, position: int, timeout_s: float = 300.0) -> None:
+        """Переместить механизм в абсолютное положение (шаги) и дождаться окончания."""
+        raise DeviceError("Операция не поддерживается")
+
+    def move_steps(self, mech: str, index: int, delta: int, timeout_s: float = 300.0) -> None:
+        """Сдвинуть механизм на delta шагов (решётка и щели)."""
+        raise DeviceError("Операция не поддерживается")
+
+    def reset(self, mech: str, index: int = 0, timeout_s: float = 300.0) -> None:
+        """Сброс механизма: поиск нулевого положения по датчику."""
+        raise DeviceError("Операция не поддерживается")
+
+    def show_native_window(self) -> None:
+        """Открыть штатное окно драйвера DevCtrl (как скрытая кнопка SpectraSP)."""
+        raise DeviceError("Штатное окно недоступно")
 
 
 def exposure_to_unit_value(exposure_us: float) -> Tuple[int, int]:

@@ -21,7 +21,8 @@ from typing import Optional
 
 import numpy as np
 
-from .base import DeviceError, Monochromator, MonoInfo
+from .base import (MECH_GRATING, MECH_MIRROR, MECH_SLIT, MECH_TURRET, MECH_TITLES, DeviceError,
+                   Monochromator, MonoInfo)
 from .winutil import DllDirectory, load_dll, pump_messages, stdcall_function
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,22 @@ PROTOTYPES = {
     "GetSignalSourceState": (c_int32, [c_int32], 4),
     "SetSignalSourceState": (c_int32, [c_int32, c_int32], 8),
     "GetCalibrationByTurret": (c_int32, [c_int32, c_double, c_int32, c_double, c_int32, POINTER(c_double)], 32),
+    # сервисные функции (режим «Тест» окна DevCtrl); положения — в шагах двигателей
+    "GetGratingStepByTurret": (c_bool, [c_int32, c_int32, POINTER(c_int32)], 12),   # 2-й аргумент не используется
+    "SetGratingStepByTurret": (c_bool, [c_int32, c_int32], 8),
+    "MoveWLByStepsByTurret": (c_bool, [c_int32, c_int32], 8),
+    "ResetGratingByTurret": (c_int32, [c_int32], 4),
+    "GetTurretStep": (c_bool, [c_int32, POINTER(c_int32)], 8),
+    "SetTurretStepByTurret": (c_bool, [c_int32, c_int32], 8),
+    "ResetTurret": (c_bool, [], 0),
+    "GetSlitStep": (c_bool, [c_int32, POINTER(c_int32)], 8),
+    "SetSlitStep": (c_bool, [c_int32, c_int32], 8),
+    "MoveSlitsBySteps": (c_bool, [c_int32, c_int32], 8),
+    "ResetSlit": (c_bool, [c_int32], 4),
+    "GetMirrorStep": (c_bool, [c_int32, POINTER(c_int32)], 8),
+    "SetMirrorStep": (c_bool, [c_int32, c_int32], 8),
+    "ResetMirror": (c_bool, [c_int32], 4),
+    "ShowWnd": (None, [c_int32, c_int32], 8),       # → DevCtrl.ShowDeviceWindowEx(0)
 }
 
 STATUS_IDLE, STATUS_BUSY, STATUS_NOT_INIT = 0, 1, 2
@@ -238,3 +255,90 @@ class SsplMonochromator(Monochromator):
         if not np.all(np.isfinite(wl)) or np.ptp(wl) <= 0:
             return None
         return wl
+
+    # ------------------------------------------------------------ сервис (шаги, сброс)
+    def _mech_name(self, mech: str, index: int) -> str:
+        if mech == MECH_SLIT and index < len(self.info.slits):
+            return self.info.slits[index]
+        return MECH_TITLES.get(mech, mech) + (f" {index + 1}" if mech in (MECH_SLIT, MECH_MIRROR) else "")
+
+    def get_steps(self, mech: str, index: int = 0) -> int:
+        self._require_open()
+        pos = c_int32(0)
+        if mech == MECH_GRATING:
+            ok = self._fn("GetGratingStepByTurret")(TURRET, 0, ctypes.byref(pos))
+        elif mech == MECH_TURRET:
+            ok = self._fn("GetTurretStep")(TURRET, ctypes.byref(pos))
+        elif mech == MECH_SLIT:
+            ok = self._fn("GetSlitStep")(int(index), ctypes.byref(pos))
+        elif mech == MECH_MIRROR:
+            ok = self._fn("GetMirrorStep")(int(index), ctypes.byref(pos))
+        else:
+            raise DeviceError(f"Неизвестный механизм: {mech}")
+        if not ok:
+            raise DeviceError(f"Не удалось прочитать положение: {self._mech_name(mech, index)}")
+        return int(pos.value)
+
+    def _check_limit(self, mech: str, index: int, position: int) -> None:
+        limit = self.info.step_limits.get((mech, index))
+        if position < 0 or (limit and position > limit):
+            raise DeviceError(f"Положение {position} вне допустимого диапазона 0…{limit or '?'} шагов")
+
+    def set_steps(self, mech: str, index: int, position: int, timeout_s: float = 300.0) -> None:
+        self._require_open()
+        self._check_limit(mech, index, position)
+        log.info("Сервис: %s → %d шагов", self._mech_name(mech, index), position)
+        fn = {MECH_GRATING: lambda: self._fn("SetGratingStepByTurret")(TURRET, int(position)),
+              MECH_TURRET: lambda: self._fn("SetTurretStepByTurret")(TURRET, int(position)),
+              MECH_SLIT: lambda: self._fn("SetSlitStep")(int(index), int(position)),
+              MECH_MIRROR: lambda: self._fn("SetMirrorStep")(int(index), int(position))}.get(mech)
+        if fn is None:
+            raise DeviceError(f"Неизвестный механизм: {mech}")
+        if not fn():
+            raise DeviceError(f"Не удалось переместить: {self._mech_name(mech, index)}")
+        self.wait_idle(timeout_s)
+
+    def move_steps(self, mech: str, index: int, delta: int, timeout_s: float = 300.0) -> None:
+        self._require_open()
+        log.info("Сервис: %s сдвиг на %+d шагов", self._mech_name(mech, index), delta)
+        if mech in (MECH_GRATING, MECH_SLIT):
+            self._check_limit(mech, index, self.get_steps(mech, index) + int(delta))
+        if mech == MECH_GRATING:
+            ok = self._fn("MoveWLByStepsByTurret")(TURRET, int(delta))
+        elif mech == MECH_SLIT:
+            ok = self._fn("MoveSlitsBySteps")(int(index), int(delta))
+        else:
+            self.set_steps(mech, index, self.get_steps(mech, index) + int(delta), timeout_s)
+            return
+        if not ok:
+            raise DeviceError(f"Не удалось сдвинуть: {self._mech_name(mech, index)}")
+        self.wait_idle(timeout_s)
+
+    def reset(self, mech: str, index: int = 0, timeout_s: float = 300.0) -> None:
+        self._require_open()
+        log.info("Сервис: сброс (поиск нуля) — %s", self._mech_name(mech, index))
+        if mech == MECH_GRATING:
+            ok = self._fn("ResetGratingByTurret")(TURRET) != 0
+        elif mech == MECH_TURRET:
+            ok = self._fn("ResetTurret")()
+        elif mech == MECH_SLIT:
+            ok = self._fn("ResetSlit")(int(index))
+        elif mech == MECH_MIRROR:
+            ok = self._fn("ResetMirror")(int(index))
+        else:
+            raise DeviceError(f"Неизвестный механизм: {mech}")
+        if not ok:
+            raise DeviceError(f"Сброс не выполнен: {self._mech_name(mech, index)}")
+        self.wait_idle(timeout_s)
+        if mech in (MECH_GRATING, MECH_TURRET):
+            try:
+                self.info.wl_range = self.wavelength_range()
+            except DeviceError:
+                pass
+
+    def show_native_window(self) -> None:
+        """Штатное окно DevCtrl — то, что в SpectraSP открывает скрытая кнопка
+        «Show spectra instrument window» (ctrl_ShowWnd → SSPL.ShowWnd(-1, -1))."""
+        self._require_open()
+        self._fn("ShowWnd")(-1, -1)
+        pump_messages()

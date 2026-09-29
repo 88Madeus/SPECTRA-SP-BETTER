@@ -16,8 +16,8 @@ import numpy as np
 
 from ..calibration import GratingGeometry
 from ..reference_lines import LINES
-from .base import (AcqSettings, Camera, CameraInfo, CameraState, DeviceError,
-                   GratingInfo, Monochromator, MonoInfo)
+from .base import (MECH_GRATING, MECH_MIRROR, MECH_SLIT, MECH_TURRET, AcqSettings, Camera, CameraInfo,
+                   CameraState, DeviceError, GratingInfo, Monochromator, MonoInfo)
 
 DEFAULT_GEOMETRIES = {
     0: GratingGeometry(1800, 754.4, 0.0683971, 0.04),
@@ -51,6 +51,12 @@ class SimMonochromator(Monochromator):
         self.slits = [50.0, 50.0]
         self.mirror = 0
         self.shutter_open = True
+        # положения шаговых двигателей (для сервисного окна)
+        self.steps = {(MECH_TURRET, 0): 9528, (MECH_SLIT, 0): 20, (MECH_SLIT, 1): 600,
+                      (MECH_MIRROR, 0): 2124}
+        if not self.info.step_limits:
+            self.info.step_limits = {(MECH_GRATING, 0): 960000, (MECH_SLIT, 0): 4262, (MECH_SLIT, 1): 4262,
+                                     (MECH_MIRROR, 0): 48700, (MECH_TURRET, 0): 100000}
 
     @property
     def is_open(self) -> bool:
@@ -149,6 +155,49 @@ class SimMonochromator(Monochromator):
         if g is None:
             return None
         return g.wavelengths(center_wl, center_pixel, pixel_width_um, n_pixels)
+
+
+    # --- сервисные операции
+    def _grating_steps(self) -> int:
+        return int(round(self._wl * 1000))           # условная связь шагов с длиной волны
+
+    def get_steps(self, mech: str, index: int = 0) -> int:
+        self._req()
+        if mech == MECH_GRATING:
+            self.wait_idle(600)
+            return self._grating_steps()
+        if (mech, index) not in self.steps:
+            raise DeviceError("Нет такого механизма")
+        return self.steps[(mech, index)]
+
+    def set_steps(self, mech: str, index: int, position: int, timeout_s: float = 300.0) -> None:
+        self._req()
+        limit = self.info.step_limits.get((mech, index))
+        if position < 0 or (limit and position > limit):
+            raise DeviceError(f"Положение {position} вне диапазона 0…{limit}")
+        if mech == MECH_GRATING:
+            self.set_wavelength(position / 1000.0, True, timeout_s)
+            return
+        if (mech, index) not in self.steps:
+            raise DeviceError("Нет такого механизма")
+        time.sleep(0.2 * self.time_scale)
+        self.steps[(mech, index)] = int(position)
+
+    def move_steps(self, mech: str, index: int, delta: int, timeout_s: float = 300.0) -> None:
+        self.set_steps(mech, index, self.get_steps(mech, index) + int(delta), timeout_s)
+
+    def reset(self, mech: str, index: int = 0, timeout_s: float = 300.0) -> None:
+        self._req()
+        time.sleep(0.5 * self.time_scale)
+        if mech == MECH_GRATING:
+            self._wl = self._target = 0.0
+        elif (mech, index) in self.steps:
+            self.steps[(mech, index)] = 0
+        else:
+            raise DeviceError("Нет такого механизма")
+
+    def show_native_window(self) -> None:
+        raise DeviceError("В режиме имитации штатного окна DevCtrl нет")
 
 
 class SimCamera(Camera):
