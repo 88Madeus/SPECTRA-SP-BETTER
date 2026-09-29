@@ -33,7 +33,9 @@ def test_mono_cfg(spectrasp_dir):
     assert mc.step_limits[("grating", 0)] == 960000
     assert mc.step_limits[("slit", 0)] == mc.step_limits[("slit", 1)] == 4262
     assert mc.step_limits[("mirror", 0)] == 48700
-    assert mc.step_limits[("turret", 0)] > 69538       # за последней позицией турели
+    assert 69538 < mc.step_limits[("turret", 0)] < 69538 + 20000   # чуть дальше последней позиции турели
+    # (4262 − 299 нулевое положение) × 0,5 мкм/шаг
+    assert mc.slit_max_um == [1981.0, 2010.0]
 
 
 def test_find_dir(spectrasp_dir, tmp_path):

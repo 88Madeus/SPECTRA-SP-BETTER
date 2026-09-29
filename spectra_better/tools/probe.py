@@ -70,7 +70,8 @@ def main(argv=None) -> int:
     ap.add_argument("--dll", default="auto", help="библиотека камеры (psi_ccd2_ver0.dll …)")
     ap.add_argument("--goto", type=float, metavar="НМ", help="установить длину волны монохроматора")
     ap.add_argument("--cooling", type=int, metavar="°C", help="включить охлаждение с уставкой")
-    ap.add_argument("--warm-up", action="store_true", help="отогреть ПЗС при отключении (как SpectraSP)")
+    ap.add_argument("--warm-up", action="store_true",
+                    help="не требуется: охлаждённая ниже 0 °C ПЗС отогревается до +2 °C при отключении всегда")
     ap.add_argument("--out", help="папка для отчёта и данных (по умолчанию текущая)")
     args = ap.parse_args(argv)
 
@@ -94,7 +95,10 @@ def main(argv=None) -> int:
       f"({inst.devctrl.interface_text})")
     R("  решётки: " + ", ".join(f"№{g.index + 1} {g.lines_per_mm:g}/мм" for g in inst.mono.gratings))
     if spectrasp_is_running():
-        R("ВНИМАНИЕ: запущена SpectraSP/DevCtrl — закройте её перед проверкой!")
+        # две программы не должны одновременно обращаться к приборам — ничего не трогаем
+        R("ОСТАНОВЛЕНО: запущена SpectraSP/DevCtrl. Закройте её и запустите проверку снова.")
+        R.save()
+        return 3
     if PYTHON_BITS != 32:
         R("ВНИМАНИЕ: нужен 32-битный Python (драйверы 32-битные).")
 
@@ -181,7 +185,8 @@ def main(argv=None) -> int:
                             save_image(path, img)
                             R(f"    кадр сохранён: {path}")
                         R.step("Полный кадр", full)
-                R.step("Камера: отключение", lambda: cam.close(warm_up=args.warm_up))
+                # холодную ПЗС (например, после --cooling) не оставляем: плавный отогрев до +2 °C
+                R.step("Камера: отключение", lambda: cam.close(warm_up=True))
     if mono is not None and mono.is_open:
         R.step("Монохроматор: отключение", mono.close)
     R.save()

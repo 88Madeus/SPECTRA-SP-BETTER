@@ -56,7 +56,9 @@ class SimMonochromator(Monochromator):
                       (MECH_MIRROR, 0): 2124}
         if not self.info.step_limits:
             self.info.step_limits = {(MECH_GRATING, 0): 960000, (MECH_SLIT, 0): 4262, (MECH_SLIT, 1): 4262,
-                                     (MECH_MIRROR, 0): 48700, (MECH_TURRET, 0): 100000}
+                                     (MECH_MIRROR, 0): 48700, (MECH_TURRET, 0): 79540}
+        if not self.info.slit_max_um:
+            self.info.slit_max_um = [2000.0] * len(self.info.slits)
 
     @property
     def is_open(self) -> bool:
@@ -215,6 +217,8 @@ class SimCamera(Camera):
         self._abort = threading.Event()
         self._temp = 22.0
         self._target: Optional[float] = None
+        self.fan_on = True             # для проверки защит можно «сломать» вентилятор
+        self.overheat = False          # и «перегреть» камеру
         self._t_last = time.monotonic()
         self.stripe_center, self.stripe_sigma = 297.0, 9.0
         self.lamp = {**{wl: i * 30000 for wl, i in LINES["Hg (ртуть)"]},
@@ -236,7 +240,7 @@ class SimCamera(Camera):
                                firmware="имитация", dll_name="simulated")
         return self.info
 
-    def close(self, warm_up: bool = True) -> None:
+    def close(self, warm_up: bool = False) -> None:
         self._open = False
 
     def _req(self):
@@ -256,7 +260,7 @@ class SimCamera(Camera):
         stable = self._target is not None and abs(self._temp - self._target) < 0.5
         return CameraState(temperature=round(self._temp), temperature2=None,
                            cooling_state=2 if stable else (1 if self._target is not None else 0),
-                           fan_on=True)
+                           fan_on=self.fan_on, overheat=self.overheat)
 
     def set_cooling(self, enabled: bool, target_c: int) -> None:
         self._req()

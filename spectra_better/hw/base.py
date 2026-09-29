@@ -6,10 +6,15 @@
 from __future__ import annotations
 
 import abc
+import logging
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 class DeviceError(RuntimeError):
@@ -100,6 +105,49 @@ class CameraState:
         return self.COOLING_TEXT.get(self.cooling_state, f"код {self.cooling_state}")
 
 
+# До этой температуры ПЗС плавно отогревается перед выключением охлаждения и отключением
+# (как в SpectraSP): резкий переход от глубокого холода грозит конденсатом и термоударом.
+WARM_UP_TARGET_C = 2
+
+
+def warm_up_camera(get_state: Callable[[], CameraState], set_cooling: Callable[[bool, int], None],
+                   target_c: int = WARM_UP_TARGET_C, timeout_s: float = 180.0,
+                   say: Optional[Callable[[str], None]] = None, cancel: Optional[threading.Event] = None,
+                   poll_s: float = 2.0) -> bool:
+    """Отогреть ПЗС: уставка target_c и ожидание, пока датчик не покажет не ниже target_c − 1 °C.
+
+    Ждём именно температуру, а не признак «стабилизировано»: сразу после смены
+    уставки камера ещё сообщает о стабилизации на старой. Возвращает True, если
+    отогрев завершён или не требовался; False — прерван (cancel) или истёк срок.
+    Уставка target_c при этом остаётся, камера продолжит отогреваться сама.
+    """
+    st = get_state()
+    if st.temperature is None or st.temperature >= 0:
+        return True
+    log.info("Отогрев ПЗС: %+.0f °C → %+d °C", st.temperature, target_c)
+    set_cooling(True, target_c)
+    t0 = time.monotonic()
+    shown = None
+    while time.monotonic() - t0 < timeout_s:
+        if cancel is not None:
+            if cancel.wait(poll_s):
+                log.warning("Отогрев ПЗС прерван пользователем (уставка %+d °C оставлена)", target_c)
+                return False
+        else:
+            time.sleep(poll_s)
+        st = get_state()
+        if st.temperature is None:
+            continue
+        if say and round(st.temperature) != shown:
+            shown = round(st.temperature)
+            say(f"Отогрев ПЗС: {st.temperature:+.0f} °C → {target_c:+d} °C")
+        if st.temperature >= target_c - 1:
+            log.info("ПЗС отогрета до %+.0f °C", st.temperature)
+            return True
+    log.warning("ПЗС не отогрелась до %+d °C за %.0f с (уставка оставлена)", target_c, timeout_s)
+    return False
+
+
 @dataclass(frozen=True)
 class AcqSettings:
     """Параметры экспозиции, которые реально уходят в камеру."""
@@ -126,7 +174,8 @@ class Camera(abc.ABC):
     def open(self) -> CameraInfo: ...
 
     @abc.abstractmethod
-    def close(self, warm_up: bool = True) -> None: ...
+    def close(self, warm_up: bool = False) -> None:
+        """Отключиться; warm_up=True — сначала отогреть ПЗС (warm_up_camera)."""
 
     @abc.abstractmethod
     def get_state(self) -> CameraState: ...
@@ -173,6 +222,8 @@ class MonoInfo:
     wl_range: Tuple[float, float] = (0.0, 0.0)
     # предельные положения шаговых двигателей (MaxMayStepCount из MSxxxx.cfg): (механизм, номер) -> шаги
     step_limits: Dict[Tuple[str, int], int] = field(default_factory=dict)
+    # наибольшая допустимая ширина каждой щели, мкм (0 — неизвестна)
+    slit_max_um: List[float] = field(default_factory=list)
 
 
 # Механизмы монохроматора для сервисных операций (режим «Тест» окна DevCtrl)

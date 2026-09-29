@@ -14,14 +14,14 @@ from .. import APP_NAME, __version__
 from .. import processing as P
 from ..calibration import WavelengthAxis
 from ..config import COOLING_TARGET_DEFAULT_C, AppSettings
-from ..hw.base import DeviceError
+from ..hw.base import WARM_UP_TARGET_C, DeviceError
 from ..hw.winutil import spectrasp_is_running
 from ..instrument import Instrument, Measurement
 from ..reference_lines import nearest_line
 from ..storage import load_spectrum, save_image, save_spectrum, unique_path
 from ..units import (X_DECIMALS, X_EV, X_NM, X_PX, X_RAMAN, X_SHORT, X_UNITS, X_WAVENUMBER, AxisMap, from_nm,
                      is_spectral)
-from .dialogs import CalibrationDialog, PanoramaDialog, SeriesDialog, SettingsDialog
+from .dialogs import BusyDialog, CalibrationDialog, PanoramaDialog, SeriesDialog, SettingsDialog
 from .icons import gear_icon
 from .log_widget import LogView, QtLogHandler
 from .panels import AcquisitionPanel, CameraPanel, MonoPanel, ProcessingPanel
@@ -52,6 +52,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mono_moving = False
         self._closing = False
         self._service_dlg = None
+        # защита ПЗС
+        self._warm_then_off = False       # идёт плавный отогрев перед выключением охлаждения
+        self._overheat_count = 0          # сколько опросов подряд камера сообщает о перегреве
+        self._overheat_handled = False
+        self._fan_warned = False
+        self._foreign = False             # запущена SpectraSP/DevCtrl (две программы на одних приборах)
+        self._poll_ticks = 0
         self._image_meas: Optional[Measurement] = None   # измерение, из которого показан кадр ПЗС
 
         title = f"{APP_NAME} {__version__}" + ("  [ИМИТАЦИЯ]" if simulate else "")
@@ -271,6 +278,29 @@ class MainWindow(QtWidgets.QMainWindow):
     def _acquiring(self) -> bool:
         return self._acq_thread is not None and self._acq_thread.is_alive()
 
+    def _mono_lock_reason(self) -> str:
+        """Почему ручное управление монохроматором сейчас недоступно ("" — доступно)."""
+        if self._foreign:
+            return "запущена SpectraSP или DevCtrl — закройте её"
+        if self._acquiring() and self._acq_kind == "panorama":
+            return "идёт съёмка панорамы"
+        if self._acquiring() and self._acq_kind == "background":
+            return "снимается темновой фон (шторка закрыта программой)"
+        return ""
+
+    def _mono_ready(self) -> bool:
+        """Можно ли сейчас отправить ручную команду монохроматору (иначе — объяснить почему)."""
+        if not self.inst.mono_connected:
+            return False
+        reason = self._mono_lock_reason()
+        if reason:
+            self.statusBar().showMessage(f"Монохроматор недоступен: {reason}", 5000)
+            return False
+        if self._mono_moving:
+            self.statusBar().showMessage("Монохроматор ещё выполняет предыдущую команду", 5000)
+            return False
+        return True
+
     def _update_actions(self) -> None:
         cam = self.inst.camera_connected
         mono = self.inst.mono_connected
@@ -278,18 +308,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_connect.setEnabled(not (cam and mono) and not acq)
         self.act_disconnect.setEnabled((cam or mono) and not acq)
         self.act_reconnect_cam.setEnabled(not acq)
+        free = not acq and not self._foreign
         for a in (self.act_snap, self.act_live, self.act_bg, self.act_series):
-            a.setEnabled(cam and not acq)
-        self.act_pano.setEnabled(cam and mono and not acq)
+            a.setEnabled(cam and free)
+        self.act_pano.setEnabled(cam and mono and free)
         self.act_stop.setEnabled(acq)
         self.act_save.setEnabled(self.current is not None)
         self.act_save_img.setEnabled(self.current is not None and self.current.image is not None)
         self.act_pin.setEnabled(self.current is not None)
         self.cam_panel.set_connected(cam)
-        self.mono_panel.set_connected(mono and not self._mono_moving)
+        lock = self._mono_lock_reason()
+        self.mono_panel.set_connected(mono and not self._mono_moving and not lock)
         self.act_service.setEnabled(mono)
         self.mono_panel.set_service_enabled(mono)
-        self.proc_panel.btn_bg.setEnabled(cam and not acq)
+        if self._service_dlg is not None:
+            self._service_dlg.set_locked(lock)
+        self.proc_panel.btn_bg.setEnabled(cam and free)
         self.lbl_cam.setText("Камера: подключена" if cam else "Камера: —")
         self._update_bg_status()
 
@@ -315,13 +349,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings_dialog()
 
     def connect_devices(self) -> None:
-        if not self.simulate and spectrasp_is_running():
-            r = QtWidgets.QMessageBox.question(
+        # две программы, одновременно командующие монохроматором и камерой, могут столкнуть
+        # механизмы или сбить положение — подключаемся только когда SpectraSP/DevCtrl закрыты
+        while not self.simulate and spectrasp_is_running():
+            r = QtWidgets.QMessageBox.warning(
                 self, "SpectraSP запущена",
-                "Похоже, запущена оригинальная SpectraSP (или DevCtrl). Два приложения не могут одновременно "
-                "работать с приборами.\nЗакройте SpectraSP и нажмите «Да», чтобы продолжить.")
-            if r != QtWidgets.QMessageBox.Yes:
+                "Запущена оригинальная SpectraSP (или DevCtrl). Две программы не должны одновременно "
+                "управлять приборами.\n\nЗакройте SpectraSP/DevCtrl и нажмите «Повторить».",
+                QtWidgets.QMessageBox.Retry | QtWidgets.QMessageBox.Cancel)
+            if r != QtWidgets.QMessageBox.Retry:
                 return
+        self._foreign = False
         if not self.inst.camera_connected:
             self.lbl_cam.setText("Камера: подключение…")
             log.info("Подключение камеры (%s)…", self.inst.camera_ip() or "?")
@@ -385,6 +423,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_mono_view()
             self._refresh_mono_misc()
         self._service_dlg = MonoServiceDialog(self.inst, self.tasks, changed, self)
+        self._service_dlg.set_locked(self._mono_lock_reason())
         self._service_dlg.show()
 
     def _update_mono_view(self) -> None:
@@ -396,15 +435,28 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.lbl_mono.setText("Монохроматор: —")
 
+    def _shutdown_dialog(self):
+        """Окно ожидания отключения и событие «не ждать отогрева»."""
+        cancel = threading.Event()
+        warm = self.s.warm_up_on_close and self.inst.camera_connected
+        dlg = BusyDialog(self, "Отключение приборов…",
+                         "Не ждать отогрева" if warm else "", cancel.set,
+                         "Уставка +2 °C останется в камере, ПЗС отогреется сама. "
+                         "Не выключайте питание камеры, пока она холодная.")
+        dlg.show()
+        return dlg, cancel
+
     def disconnect_devices(self) -> None:
         if self._acquiring():
             return
-        dlg = self._busy_dialog("Отключение приборов…")
-        self.tasks.run(self.inst.disconnect, lambda _: self._disconnected(dlg),
+        self._stop_warm_up()
+        dlg, cancel = self._shutdown_dialog()
+        self.tasks.run(lambda: self.inst.disconnect(say=dlg.text_changed.emit, cancel_warm_up=cancel),
+                       lambda _: self._disconnected(dlg),
                        lambda e: (self._disconnected(dlg), self._error("Отключение", e)), "disconnect")
 
     def _disconnected(self, dlg) -> None:
-        dlg.close()
+        dlg.finish()
         log.info("Приборы отключены")
         self._refresh_static_info()
         self.cam_panel.set_state(None)
@@ -425,15 +477,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tasks.run(work, self._camera_connected, lambda e: (self._error("Камера", e), self._update_actions()),
                        "reconnect-camera")
 
-    def _busy_dialog(self, text: str) -> QtWidgets.QProgressDialog:
-        dlg = QtWidgets.QProgressDialog(text, None, 0, 0, self)
-        dlg.setWindowModality(QtCore.Qt.WindowModal)
-        dlg.setMinimumDuration(300)
-        dlg.setWindowTitle(APP_NAME)
-        return dlg
-
     # ================================================================ опрос
+    def _check_foreign(self) -> None:
+        """Если при подключённых приборах запустили SpectraSP/DevCtrl — остановить съёмку и заблокировать команды."""
+        running = spectrasp_is_running()
+        if running and not self._foreign:
+            self._foreign = True
+            log.error("Запущена SpectraSP/DevCtrl при подключённых приборах — съёмка остановлена, "
+                      "управление монохроматором заблокировано")
+            self.stop()
+            self._update_actions()
+            QtWidgets.QMessageBox.warning(
+                self, "SpectraSP запущена",
+                "Запущена оригинальная SpectraSP (или DevCtrl), а приборы подключены к этой программе. "
+                "Две программы не должны управлять приборами одновременно.\n\n"
+                "Съёмка остановлена, команды монохроматору заблокированы. Закройте SpectraSP/DevCtrl — "
+                "управление вернётся само. Если нужна именно SpectraSP — сначала нажмите «Отключить» здесь.")
+        elif not running and self._foreign:
+            self._foreign = False
+            log.info("SpectraSP/DevCtrl закрыта — управление приборами снова доступно")
+            self.statusBar().showMessage("SpectraSP закрыта — управление приборами снова доступно", 8000)
+            self._update_actions()
+
     def _poll(self) -> None:
+        self._poll_ticks += 1
+        if not self.simulate and self._poll_ticks % 4 == 0 and \
+                (self.inst.camera_connected or self.inst.mono_connected):
+            self._check_foreign()
         if self.inst.camera_connected and not self._poll_cam:
             self._poll_cam = True
 
@@ -441,7 +511,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._poll_cam = False
                 self.cam_panel.set_state(st)
                 if st is not None and st.temperature is not None:
-                    self.lbl_cam.setText(f"Камера: {st.temperature:+.0f} °C, {st.cooling_text}")
+                    self.lbl_cam.setText(f"Камера: {st.temperature:+.0f} °C, {st.cooling_text}"
+                                         + (" — отогрев перед выключением" if self._warm_then_off else ""))
+                self._camera_safety(st)
             self.tasks.run(self.inst.camera_state, done, lambda e: setattr(self, "_poll_cam", False), "poll-cam")
         if self.inst.mono_connected and not self._poll_mono and not self._mono_moving:
             self._poll_mono = True
@@ -459,22 +531,101 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ================================================================ камера
     def cooling_on(self, target: int) -> None:
+        st = self.inst.last_state
+        if target < 0:
+            now = f"Сейчас ПЗС: {st.temperature:+.0f} °C.\n" if st and st.temperature is not None else ""
+            r = QtWidgets.QMessageBox.question(
+                self, "Охлаждение ПЗС",
+                f"Охладить ПЗС до {target:+d} °C?\n{now}\n"
+                "Охлаждённую ниже 0 °C матрицу нельзя резко отогревать: не выключайте охлаждение кнопкой "
+                "в обход программы и не отключайте питание камеры, пока она холодная. При выключении "
+                "охлаждения и при выходе программа сама плавно отогреет ПЗС до +2 °C.")
+            if r != QtWidgets.QMessageBox.Yes:
+                return
+        if self._warm_then_off:
+            log.info("Отогрев перед выключением отменён: задана новая уставка")
+        self._stop_warm_up()
         log.info("Охлаждение: уставка %+d °C", target)
         self.tasks.run(lambda: self.inst.set_cooling(True, target), None,
                        lambda e: self._error("Охлаждение", e))
 
+    def _ask_cooling_off(self, temperature: float) -> str:
+        """Как выключать охлаждение холодной ПЗС: "warm" (отогреть и выключить), "now" или ""."""
+        box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Warning, "Выключение охлаждения",
+                                    f"ПЗС охлаждена до {temperature:+.0f} °C. Резкое выключение "
+                                    "охлаждения грозит конденсацией влаги на холодной матрице.\n\n"
+                                    f"Рекомендуется: плавно отогреть до {WARM_UP_TARGET_C:+d} °C и "
+                                    "выключить охлаждение после этого (программа сделает это сама).",
+                                    parent=self)
+        b_warm = box.addButton("Отогреть и выключить", QtWidgets.QMessageBox.AcceptRole)
+        b_now = box.addButton("Выключить сразу", QtWidgets.QMessageBox.DestructiveRole)
+        box.addButton("Отмена", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(b_warm)
+        box.exec_()
+        return {b_warm: "warm", b_now: "now"}.get(box.clickedButton(), "")
+
     def cooling_off(self) -> None:
         st = self.inst.last_state
-        if st and st.temperature is not None and st.temperature < 0:
-            r = QtWidgets.QMessageBox.question(
-                self, "Охлаждение",
-                f"ПЗС охлаждена до {st.temperature:+.0f} °C. Резкое выключение охлаждения может привести к "
-                "конденсации влаги. Рекомендуется сначала установить +2…+5 °C и дождаться стабилизации.\n\n"
-                "Всё равно выключить?")
-            if r != QtWidgets.QMessageBox.Yes:
+        if st and st.temperature is not None and st.temperature < 0 and not self._warm_then_off:
+            answer = self._ask_cooling_off(st.temperature)
+            if answer == "warm":
+                self._start_warm_up()
                 return
+            if answer != "now":
+                return
+        self._stop_warm_up()
         log.info("Охлаждение: выключение")
         self.tasks.run(lambda: self.inst.set_cooling(False, 0), None, lambda e: self._error("Охлаждение", e))
+
+    def _start_warm_up(self) -> None:
+        """Плавный отогрев: уставка +2 °C, охлаждение выключится, когда ПЗС отогреется (см. _camera_safety)."""
+        log.info("Охлаждение: отогрев до %+d °C, затем выключение", WARM_UP_TARGET_C)
+        self._warm_then_off = True
+        self.statusBar().showMessage(f"Отогрев ПЗС до {WARM_UP_TARGET_C:+d} °C, затем охлаждение выключится", 8000)
+        self.tasks.run(lambda: self.inst.set_cooling(True, WARM_UP_TARGET_C), None,
+                       lambda e: (self._stop_warm_up(), self._error("Охлаждение", e)))
+
+    def _stop_warm_up(self) -> None:
+        self._warm_then_off = False
+
+    def _camera_safety(self, st) -> None:
+        """Защита камеры по данным опроса: завершение отогрева, перегрев, остановка вентилятора."""
+        if st is None:
+            return
+        cooling = st.cooling_state != 0
+        if self._warm_then_off and st.temperature is not None and st.temperature >= WARM_UP_TARGET_C - 1:
+            self._stop_warm_up()
+            log.info("ПЗС отогрета до %+.0f °C — охлаждение выключается", st.temperature)
+            self.tasks.run(lambda: self.inst.set_cooling(False, 0), None, lambda e: self._error("Охлаждение", e))
+        # перегрев: два опроса подряд, чтобы не сработать от единичного сбоя
+        self._overheat_count = self._overheat_count + 1 if st.overheat else 0
+        if self._overheat_count >= 2 and not self._overheat_handled:
+            self._overheat_handled = True
+            self._stop_warm_up()
+            log.error("Камера сообщает о ПЕРЕГРЕВЕ — охлаждение выключается, съёмка останавливается")
+            self.stop()
+            self.tasks.run(lambda: self.inst.set_cooling(False, 0), None, lambda e: self._error("Охлаждение", e))
+            if not self._closing:
+                QtWidgets.QMessageBox.critical(
+                    self, "Перегрев камеры",
+                    "Камера сообщает о перегреве! Охлаждение ПЗС выключено, съёмка остановлена.\n\n"
+                    "Проверьте, что вентилятор камеры работает, вентиляционные отверстия не закрыты "
+                    "(и, если есть, подключено водяное охлаждение). Включайте охлаждение снова только "
+                    "после устранения причины.")
+        elif not st.overheat and self._overheat_handled:
+            self._overheat_handled = False
+            log.info("Камера больше не сообщает о перегреве")
+        # вентилятор остановился при включённом охлаждении
+        if cooling and not st.fan_on and not self._fan_warned:
+            self._fan_warned = True
+            log.warning("Вентилятор камеры не работает при включённом охлаждении")
+            if not self._closing:
+                QtWidgets.QMessageBox.warning(
+                    self, "Вентилятор камеры",
+                    "Камера сообщает, что вентилятор не работает, а охлаждение включено. Это может привести "
+                    "к перегреву. Проверьте вентилятор; при сомнениях выключите охлаждение (с отогревом).")
+        elif st.fan_on:
+            self._fan_warned = False
 
     def _acq_settings_changed(self) -> None:
         self.image.set_rows(self.s.rows_top, self.s.rows_bottom)
@@ -490,7 +641,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ================================================================ съёмка
     def _start(self, kind: str, fn: Callable[[], None]) -> None:
-        if self._acquiring():
+        if self._acquiring() or self._foreign:
             return
         self._acq_stop.clear()
         self._acq_kind = kind
@@ -598,6 +749,10 @@ class MainWindow(QtWidgets.QMainWindow):
         wl0 = self.inst.mono_wl
 
         def run():
+            with self.inst.mono_exclusive("панорама"):
+                run_locked()
+
+        def run_locked():
             segments = []
             try:
                 for i, c in enumerate(plan):
@@ -908,14 +1063,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tasks.run(fn, done, fail, "mono")
 
     def goto_wavelength(self, wl: float) -> None:
-        if not self.inst.mono_connected or self._mono_moving:
+        if not self._mono_ready():
             return
         log.info("Переход на %.3f нм", wl)
         self._mono_task("движение…", lambda: self.inst.goto_wavelength(wl),
                         lambda res: log.info("Установлено %.3f нм", res))
 
     def change_grating(self, index) -> None:
-        if index is None or not self.inst.mono_connected or self._mono_moving:
+        if index is None or not self._mono_ready():
             return
         if index == self.inst.mono_grating:
             return
@@ -927,19 +1082,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mono_task("смена решётки…", lambda: self.inst.set_grating(index))
 
     def set_slit(self, index: int, width: float) -> None:
-        if not self.inst.mono_connected:
+        if not self._mono_ready():
             return
         self._mono_task("щель…", lambda: self.inst.set_slit(index, width),
                         lambda w: (self.mono_panel.set_slit_value(w), log.info("Щель %d: %.1f мкм", index + 1, w)))
 
     def set_mirror(self, pos) -> None:
-        if pos is None or not self.inst.mono_connected:
+        if pos is None:
+            return
+        if not self._mono_ready():
+            self._refresh_mono_misc()          # вернуть списку фактическое положение зеркала
             return
         self._mono_task("зеркало…", lambda: self.inst.set_mirror(pos),
                         lambda _: log.info("Выходное зеркало: положение %d", pos))
 
     def set_shutter(self, is_open: bool) -> None:
-        if not self.inst.mono_connected:
+        if not self._mono_ready():
+            self._refresh_mono_misc()          # вернуть кнопке шторки фактическое состояние
             return
 
         def work():
@@ -1033,10 +1192,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self._closing = True
             self.poll_timer.stop()
-            dlg = self._busy_dialog("Отключение приборов" + (" (отогрев ПЗС до +2 °C может занять до минуты)…"
-                                                             if self.s.warm_up_on_close else "…"))
-            self.tasks.run(self.inst.shutdown, lambda _: (dlg.close(), self.close()),
-                           lambda e: (dlg.close(), self.close()), "shutdown")
+            self._stop_warm_up()
+            dlg, cancel = self._shutdown_dialog()
+            self.tasks.run(lambda: self.inst.shutdown(say=dlg.text_changed.emit, cancel_warm_up=cancel),
+                           lambda _: (dlg.finish(), self.close()),
+                           lambda e: (dlg.finish(), self.close()), "shutdown")
             event.ignore()
             return
         self._closing = True
