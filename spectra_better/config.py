@@ -1,0 +1,124 @@
+"""Собственные настройки программы (JSON в профиле пользователя).
+
+Адреса устройств здесь НЕ хранятся: они каждый раз читаются из файлов
+установленной SpectraSP, поэтому обе программы всегда используют одни и те же
+порты. Поле camera_ip_override нужно только для особых случаев и по умолчанию
+пустое.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+from dataclasses import asdict, dataclass, field, fields
+from typing import List, Optional
+
+from .calibration import CalibrationSettings
+
+log = logging.getLogger(__name__)
+
+ACQ_SPECTRUM = "spectrum"
+ACQ_IMAGE = "image"
+
+X_NM, X_PX, X_WAVENUMBER, X_RAMAN = "nm", "px", "cm-1", "raman"
+X_UNITS = {X_NM: "Длина волны, нм", X_PX: "Пиксель", X_WAVENUMBER: "Волновое число, см⁻¹",
+           X_RAMAN: "Рамановский сдвиг, см⁻¹"}
+
+
+def settings_dir() -> str:
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "SpectraSP-Better")
+    return os.path.join(os.path.expanduser("~"), ".config", "spectrasp-better")
+
+
+@dataclass
+class AppSettings:
+    spectrasp_dir: str = ""
+    camera_dll: str = "auto"
+    camera_ip_override: str = ""
+
+    # экспозиция
+    exposure_ms: float = 1000.0
+    accumulations: int = 1
+    accumulate_mode: str = "average"          # average | sum
+    readout_speed: int = 0                    # 0 — как в SpectraSP / текущая в камере
+    acq_mode: str = ACQ_SPECTRUM
+    rows_top: int = -1                        # -1 — взять полосу из SpectraSP
+    rows_bottom: int = -1
+    hardware_binning: bool = True
+    flip_x: bool = False
+    frame_timeout_s: float = 30.0             # запас сверх ожидаемого времени кадра
+
+    # охлаждение
+    cooling_target_c: int = -20
+    warm_up_on_close: bool = True
+
+    # обработка
+    subtract_background: bool = True
+    close_shutter_for_background: bool = True
+    remove_cosmics: bool = False
+    x_unit: str = X_NM
+    laser_nm: float = 532.0
+
+    # монохроматор
+    wl_presets: List[float] = field(default_factory=list)
+    mono_timeout_s: float = 300.0
+
+    # файлы
+    save_dir: str = ""
+    save_format: str = ".txt"
+    autosave_series: bool = True
+
+    calibration: CalibrationSettings = field(default_factory=CalibrationSettings)
+    calibration_imported: bool = False
+    window_state: str = ""
+
+    # -------------------------------------------------------------- файлы
+    @staticmethod
+    def default_path() -> str:
+        return os.path.join(settings_dir(), "settings.json")
+
+    @classmethod
+    def load(cls, path: Optional[str] = None) -> "AppSettings":
+        path = path or cls.default_path()
+        s = cls()
+        s._path = path          # не поле dataclass: в файл не пишется
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return s
+        except (OSError, ValueError) as e:
+            log.warning("Настройки %s повреждены (%s), используются значения по умолчанию", path, e)
+            return s
+        names = {f.name: f for f in fields(cls)}
+        for k, v in data.items():
+            if k == "calibration" and isinstance(v, dict):
+                s.calibration = CalibrationSettings.from_dict(v)
+            elif k in names:
+                try:
+                    default = getattr(s, k)
+                    if isinstance(default, bool):
+                        v = bool(v)
+                    elif isinstance(default, int):
+                        v = int(v)
+                    elif isinstance(default, float):
+                        v = float(v)
+                    elif isinstance(default, list):
+                        v = [float(x) for x in v]
+                    setattr(s, k, v)
+                except (TypeError, ValueError):
+                    log.warning("Пропущено неверное значение настройки %s=%r", k, v)
+        return s
+
+    def save(self, path: Optional[str] = None) -> None:
+        path = path or getattr(self, "_path", None) or self.default_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = asdict(self)
+        data["calibration"] = self.calibration.to_dict()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
