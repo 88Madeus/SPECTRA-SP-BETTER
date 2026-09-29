@@ -98,3 +98,11 @@ def test_top_axis_in_pixels(plot):
     labels = plot.top_axis.tickStrings(levels[0][1], 1, levels[0][0])
     assert labels[:3] == ["0", "500", "1000"]
     assert "пиксель" in plot.cursor_text(500.0, 1.0)
+
+
+def test_stitched_spectrum_has_no_pixel_scale(plot):
+    plot.top_box.setCurrentIndex(plot.top_box.findData(X_PX))
+    amap = AxisMap(np.linspace(530, 675, 5540), plot.s.laser_nm)
+    plot.set_scale(amap, X_NM, pixels_ok=False)        # панорама: номер точки — не пиксель ПЗС
+    assert not plot.plot.getPlotItem().getAxis("top").isVisible()
+    assert "пиксель" not in plot.cursor_text(600.0, 1.0)

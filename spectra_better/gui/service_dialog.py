@@ -27,6 +27,7 @@ class MonoServiceDialog(QtWidgets.QDialog):
         self.tasks = tasks
         self.on_changed = on_changed
         self._busy = False
+        self._lock_reason = ""
         self.setWindowTitle("Сервис монохроматора")
         self.setWindowFlag(QtCore.Qt.WindowContextHelpButtonHint, False)
         self.resize(720, 640)
@@ -78,9 +79,12 @@ class MonoServiceDialog(QtWidgets.QDialog):
         for i, name in enumerate(mono_info.slits or ["Входная щель"]):
             g.addWidget(QtWidgets.QLabel(f"{name}:"), row, 0)
             sp = QtWidgets.QDoubleSpinBox()
-            sp.setRange(0, 3000)
+            mx = inst.slit_max(i)
+            sp.setRange(0, mx or 3000)
             sp.setDecimals(1)
             sp.setSuffix(" мкм")
+            if mx:
+                sp.setToolTip(f"0…{mx:g} мкм (предел из файла прибора)")
             b = QtWidgets.QPushButton("Установить")
             lbl = QtWidgets.QLabel("")
             g.addWidget(sp, row, 1)
@@ -134,26 +138,34 @@ class MonoServiceDialog(QtWidgets.QDialog):
             lb = QtWidgets.QLabel(f"<b>{text}</b>")
             grid.addWidget(lb, 0, col)
         self.step_rows: Dict[Tuple[str, int], Tuple[QtWidgets.QLabel, QtWidgets.QSpinBox]] = {}
+        self._locked_controls: List[QtWidgets.QWidget] = []    # всегда выключены (предел неизвестен)
         for r, (mech, idx, name) in enumerate(inst.service_mechanisms(), start=1):
-            limit = mono_info.step_limits.get((mech, idx), 0) or 2_000_000
+            limit = mono_info.step_limits.get((mech, idx), 0)
             pos_lbl = QtWidgets.QLabel("—")
             abs_sp = QtWidgets.QSpinBox()
-            abs_sp.setRange(0, limit)
-            abs_sp.setToolTip(f"0…{limit} шагов")
+            abs_sp.setRange(0, limit or 0)
+            abs_sp.setToolTip(f"0…{limit} шагов (предел из файла прибора)" if limit else "")
             b_abs = QtWidgets.QPushButton("Перейти")
             rel_sp = QtWidgets.QSpinBox()
             rel_sp.setRange(-limit, limit)
-            rel_sp.setValue(100 if mech != MECH_GRATING else 1000)
+            rel_sp.setValue(min(limit, 100 if mech != MECH_GRATING else 1000))
             b_rel = QtWidgets.QPushButton("Сдвинуть")
             b_reset = QtWidgets.QPushButton("Сброс")
             b_reset.setToolTip("Поиск нулевого положения механизма по датчику")
             for col, w in enumerate((QtWidgets.QLabel(name), pos_lbl, abs_sp, b_abs, rel_sp, b_rel, b_reset)):
                 grid.addWidget(w, r, col)
+            if not limit:
+                # без известного предела хода двигать по шагам нельзя: можно упереть механизм в край
+                for w in (abs_sp, b_abs, rel_sp, b_rel):
+                    w.setEnabled(False)
+                    w.setToolTip("Предел хода неизвестен (нет MaxMayStepCount в файле прибора) — "
+                                 "перемещение по шагам заблокировано")
+                self._locked_controls += [abs_sp, b_abs, rel_sp, b_rel]
             b_abs.clicked.connect(lambda _=False, m=mech, i=idx, sp=abs_sp, n=name: self._confirm_run(
                 f"Переместить «{n}» в положение {sp.value()} шагов?", f"{n}: перемещение…",
                 lambda: self.inst.service_set_steps(m, i, sp.value())))
-            b_rel.clicked.connect(lambda _=False, m=mech, i=idx, sp=rel_sp, n=name: self._run(
-                f"{n}: сдвиг…", lambda: self.inst.service_move_steps(m, i, sp.value())))
+            b_rel.clicked.connect(lambda _=False, m=mech, i=idx, sp=rel_sp, n=name, lim=limit:
+                                  self._relative(m, i, n, sp.value(), lim))
             b_reset.clicked.connect(lambda _=False, m=mech, i=idx, n=name: self._confirm_run(
                 f"Выполнить сброс (поиск нуля) механизма «{n}»?"
                 + ("\nПосле сброса длину волны нужно будет установить заново." if m in (MECH_GRATING, MECH_TURRET) else ""),
@@ -189,12 +201,37 @@ class MonoServiceDialog(QtWidgets.QDialog):
 
     def _set_busy(self, busy: bool, text: str = "") -> None:
         self._busy = busy
+        self._apply_enabled()
+        self.status.setText(text if busy else (self._lock_reason and f"Управление заблокировано: {self._lock_reason}"))
+
+    def _apply_enabled(self) -> None:
+        on = not self._busy and not self._lock_reason
         for w in self._controls:
-            w.setEnabled(not busy)
-        self.status.setText(text if busy else "")
+            w.setEnabled(on and w not in self._locked_controls)
+        self.btn_refresh.setEnabled(not self._busy)
+
+    def set_locked(self, reason: str) -> None:
+        """Пока монохроматором управляет панорама и т. п., команды из этого окна недоступны."""
+        if reason == self._lock_reason:
+            return
+        self._lock_reason = reason
+        self._apply_enabled()
+        if not self._busy:
+            self.status.setText(f"Управление заблокировано: {reason}" if reason else "")
+
+    def _relative(self, mech: str, index: int, name: str, delta: int, limit: int) -> None:
+        if delta == 0:
+            return
+        text = f"{name}: сдвиг…"
+        fn = lambda: self.inst.service_move_steps(mech, index, delta)   # noqa: E731
+        if limit and abs(delta) > limit * 0.05:            # большой сдвиг — только с подтверждением
+            self._confirm_run(f"Сдвинуть «{name}» на {delta:+d} шагов? Это больше 5 % всего хода механизма.",
+                              text, fn)
+        else:
+            self._run(text, fn)
 
     def _run(self, text: str, fn, refresh: bool = True) -> None:
-        if self._busy:
+        if self._busy or self._lock_reason:
             return
         self._set_busy(True, "Выполняется: " + text)
 

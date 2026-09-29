@@ -49,7 +49,8 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.btn_on = QtWidgets.QPushButton("Задать")
         self.btn_off = QtWidgets.QPushButton("Выкл.")
         self.btn_on.setToolTip("Установить температуру ПЗС")
-        self.btn_off.setToolTip("Выключить охлаждение (лучше сначала отогреть до +2…+5 °C)")
+        self.btn_off.setToolTip("Выключить охлаждение. Охлаждённую ниже 0 °C матрицу программа предложит "
+                                "сначала плавно отогреть до +2 °C")
         form.addRow("Уставка:", _row(self.target, self.btn_on, self.btn_off))
         self.btn_on.clicked.connect(lambda: self.cooling_on.emit(self.target.value()))
         self.btn_off.clicked.connect(self.cooling_off.emit)
@@ -264,6 +265,8 @@ class MonoPanel(QtWidgets.QGroupBox):
         self.presets.activated.connect(self._preset_chosen)
         self.btn_grating.clicked.connect(lambda: self.grating.emit(self.gratings.currentData()))
         self.btn_slit.clicked.connect(lambda: self.slit.emit(self.slit_idx.currentData(), self.slit_w.value()))
+        self._slit_max: list = []
+        self.slit_idx.currentIndexChanged.connect(self._slit_range)
         self.mirror_box.activated.connect(lambda i: self.mirror.emit(self.mirror_box.itemData(i)))
         self.btn_shutter.clicked.connect(lambda checked: self.shutter.emit(checked))
         self.set_connected(False)
@@ -287,15 +290,24 @@ class MonoPanel(QtWidgets.QGroupBox):
         self.gratings.clear()
         for g in info.gratings:
             self.gratings.addItem(g.title, g.index)
+        self._slit_max = list(info.slit_max_um)
         self.slit_idx.clear()
         for i, name in enumerate(info.slits or ["Входная щель"]):
             self.slit_idx.addItem(name, i)
+        self._slit_range()
         self.mirror_box.clear()
         for i, name in enumerate(info.mirror_positions):
             self.mirror_box.addItem(name, i)
         lo, hi = info.wl_range
         if hi > lo:
             self.target.setRange(lo, hi)
+
+    def _slit_range(self) -> None:
+        """Поле ширины — не шире, чем позволяет щель (из файла прибора)."""
+        i = self.slit_idx.currentData()
+        mx = self._slit_max[i] if i is not None and 0 <= i < len(self._slit_max) else 0
+        self.slit_w.setMaximum(mx or 3000)
+        self.slit_w.setToolTip(f"0…{mx:g} мкм" if mx else "")
 
     def set_connected(self, on: bool) -> None:
         for w in (self.target, self.btn_go, self.presets, self.gratings, self.btn_grating, self.slit_idx,

@@ -413,6 +413,8 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow("Таймаут движения монохроматора:", self.mono_to)
         self.warm = QtWidgets.QCheckBox("отогревать ПЗС до +2 °C при отключении (как SpectraSP)")
         self.warm.setChecked(settings.warm_up_on_close)
+        self.warm.setToolTip("Защита матрицы от конденсата и термоудара. Выключать не рекомендуется.")
+        self.warm.toggled.connect(self._warm_toggled)
         form.addRow(self.warm)
         self.fmt = QtWidgets.QComboBox()
         self.fmt.addItem("TXT (табуляция, точка)", ".txt")
@@ -433,3 +435,67 @@ class SettingsDialog(QtWidgets.QDialog):
         s.warm_up_on_close = self.warm.isChecked()
         s.save_format = self.fmt.currentData()
         self.accept()
+
+    def _warm_toggled(self, on: bool) -> None:
+        if not on and not _confirm_no_warm_up(self):
+            self.warm.blockSignals(True)
+            self.warm.setChecked(True)
+            self.warm.blockSignals(False)
+
+
+def _confirm_no_warm_up(parent) -> bool:
+    r = QtWidgets.QMessageBox.question(
+        parent, "Отогрев ПЗС",
+        "Без отогрева охлаждённая ПЗС останется холодной после отключения программы. Если затем выключить "
+        "питание камеры, на матрице может выпасть конденсат.\n\nВсё равно не отогревать?",
+        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+    return r == QtWidgets.QMessageBox.Yes
+
+
+class BusyDialog(QtWidgets.QDialog):
+    """Окно «подождите»: текст обновляет фоновая задача (text_changed можно вызывать из любого
+    потока), закрыть его может только сама программа (finish). Кнопка — необязательная."""
+    text_changed = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent, text: str, button_text: str = "", on_button: Optional[Callable[[], None]] = None,
+                 button_tip: str = ""):
+        super().__init__(parent)
+        from .. import APP_NAME
+        self.setWindowTitle(APP_NAME)
+        self.setModal(True)
+        self.setWindowFlag(QtCore.Qt.WindowContextHelpButtonHint, False)
+        self.setWindowFlag(QtCore.Qt.WindowCloseButtonHint, False)
+        self._done = False
+        lay = QtWidgets.QVBoxLayout(self)
+        self.label = QtWidgets.QLabel(text)
+        self.label.setWordWrap(True)
+        self.label.setMinimumWidth(420)
+        lay.addWidget(self.label)
+        bar = QtWidgets.QProgressBar()
+        bar.setRange(0, 0)
+        lay.addWidget(bar)
+        if button_text:
+            self.button = QtWidgets.QPushButton(button_text)
+            self.button.setToolTip(button_tip)
+
+            def pressed():
+                self.button.setEnabled(False)
+                if on_button:
+                    on_button()
+            self.button.clicked.connect(pressed)
+            lay.addWidget(self.button, 0, QtCore.Qt.AlignRight)
+        self.text_changed.connect(self.label.setText)
+
+    def finish(self) -> None:
+        self._done = True
+        self.accept()
+
+    def reject(self) -> None:             # Esc не закрывает окно, пока задача не закончилась
+        if self._done:
+            super().reject()
+
+    def closeEvent(self, event) -> None:
+        if self._done:
+            event.accept()
+        else:
+            event.ignore()

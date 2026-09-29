@@ -134,6 +134,7 @@ class SpectrumPlot(QtWidgets.QWidget):
         self.plot.setLabel("left", "Интенсивность, отсч.")
         self.legend = self.plot.addLegend(offset=(-10, 10))
         self.vb = self.plot.getPlotItem().getViewBox()
+        self.vb.setDefaultPadding(0.06)         # запас по Y, чтобы подписи пиков у верхнего края не обрезались
         lay.addWidget(self.plot, 1)
         self.readout = QtWidgets.QLabel(" ")
         self.readout.setStyleSheet("color: #444; padding: 2px 6px;")
@@ -245,7 +246,7 @@ class SpectrumPlot(QtWidgets.QWidget):
     def _top_selected(self) -> None:
         self.s.x_top_unit = self.top_box.currentData() or ""
         self._update_laser_visibility()
-        self.set_scale(self._amap, self._unit)
+        self.units_changed.emit()          # главное окно заново решит, какую шкалу можно показать сверху
         self._update_info()
 
     def _laser_changed(self, value: float) -> None:
@@ -253,13 +254,16 @@ class SpectrumPlot(QtWidgets.QWidget):
         self.units_changed.emit()
 
     # ------------------------------------------------------------------ шкала и диапазон
-    def set_scale(self, amap: AxisMap, unit: str) -> None:
-        """Шкала текущих данных: amap — пересчёт единиц, unit — в чём построены данные."""
+    def set_scale(self, amap: AxisMap, unit: str, pixels_ok: bool = True) -> None:
+        """Шкала текущих данных: amap — пересчёт единиц, unit — в чём построены данные;
+        pixels_ok=False — точки не соответствуют пикселям ПЗС (сшитая панорама): шкалу
+        и положение курсора в пикселях не показываем."""
         self._amap, self._unit = amap, unit
+        self._pixels_ok = pixels_ok
         self.plot.setLabel("bottom", axis_label(unit, amap.laser_nm)
                            + ("" if unit == self.s.x_unit else "  (нет шкалы длин волн)"))
         top = self.s.x_top_unit
-        if top and top != unit and amap.can_convert(unit, top):
+        if top and top != unit and (pixels_ok or top != X_PX) and amap.can_convert(unit, top):
             self.top_axis.set_mapping((lambda v: amap.convert(v, unit, top),
                                        lambda v: amap.convert(v, top, unit)))
             self.plot.setLabel("top", axis_label(top, amap.laser_nm))
@@ -482,6 +486,8 @@ class SpectrumPlot(QtWidgets.QWidget):
     def cursor_text(self, x: float, y: float) -> str:
         parts = [_fmt_pos(x, self._unit)]
         for u in (X_NM, X_PX, self.s.x_top_unit):
+            if u == X_PX and not self._pixels_ok:
+                continue
             if u and u != self._unit and self._amap.can_convert(self._unit, u):
                 txt = _fmt_pos(float(self._amap.convert([x], self._unit, u)[0]), u)
                 if txt not in parts:
@@ -489,7 +495,7 @@ class SpectrumPlot(QtWidgets.QWidget):
         text = "Курсор: " + "  |  ".join(parts) + f"      I = {y:.1f}"
         if self._x.size:
             i = int(np.argmin(np.abs(self._x - x)))
-            text += f"      спектр здесь: I = {self._y[i]:.1f} (пиксель {i})"
+            text += f"      спектр здесь: I = {self._y[i]:.1f} ({'пиксель' if self._pixels_ok else 'точка'} {i})"
         return text
 
     def _mouse_moved(self, evt) -> None:
@@ -554,7 +560,13 @@ class ImagePanel(QtWidgets.QWidget):
     def set_image(self, image: np.ndarray) -> None:
         # ImageView ожидает (x, y): транспонируем, чтобы столбцы ПЗС шли по горизонтали
         img = np.asarray(image, dtype=np.float32).T
-        self.view.setImage(img, autoLevels=self._first, autoRange=self._first)
+        if self._first:
+            # уровни по процентилям, а не по мин./макс.: одна космическая частица
+            # иначе «растягивает» шкалу, и весь кадр выглядит чёрным
+            lo, hi = (float(v) for v in np.percentile(img, (0.5, 99.95)))
+            self.view.setImage(img, autoLevels=False, levels=(lo, max(hi, lo + 1)), autoRange=True)
+        else:
+            self.view.setImage(img, autoLevels=False, autoRange=False)
         self._first = False
 
     def set_rows(self, top: int, bottom: int) -> None:

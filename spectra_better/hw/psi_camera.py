@@ -15,14 +15,13 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
-import time
 from typing import List, Optional
 
 import numpy as np
 
 from . import psi_structs as S
 from .base import (AcqSettings, Camera, CameraInfo, CameraState, DeviceError,
-                   Region, exposure_to_unit_value, unit_value_to_us)
+                   Region, exposure_to_unit_value, unit_value_to_us, warm_up_camera)
 from .winutil import DllDirectory, free_dll, load_dll, ping, stdcall_function
 
 log = logging.getLogger(__name__)
@@ -180,11 +179,11 @@ class PsiCamera(Camera):
                 for r in regs[:max(0, min(count.value, S.MAX_REGIONS))]]
 
     # ------------------------------------------------------------ закрытие
-    def close(self, warm_up: bool = True) -> None:
+    def close(self, warm_up: bool = False) -> None:
         if self._h >= 0:
             try:
-                if warm_up:
-                    self._warm_up_before_close()
+                if warm_up and self.info.cooling_type:
+                    warm_up_camera(self.get_state, self.set_cooling, say=log.info)
             except Exception as e:  # noqa: BLE001
                 log.warning("Отогрев перед отключением не выполнен: %s", e)
             try:
@@ -193,22 +192,6 @@ class PsiCamera(Camera):
                 log.warning("CloseDevice завершился с ошибкой", exc_info=True)
             self._h = -1
         self._unload()
-
-    def _warm_up_before_close(self, timeout_s: float = 60.0) -> None:
-        """Как SpectraSP: если ПЗС охлаждена ниже 0 °C, поднять уставку до +2 °C
-        и дождаться стабилизации (защита от конденсата)."""
-        if not self.info.cooling_type:
-            return
-        st = self.get_state()
-        if st.temperature is None or st.temperature > 0:
-            return
-        log.info("Отогрев ПЗС до +2 °C перед отключением...")
-        self.set_cooling(True, 2)
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout_s:
-            time.sleep(1.0)
-            if self.get_state().cooling_state == 2:
-                break
 
     def _unload(self) -> None:
         free_dll(self._dll)

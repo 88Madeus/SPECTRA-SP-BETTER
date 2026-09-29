@@ -237,6 +237,7 @@ class MonoConfig:
     has_shutter: bool = False
     current_grating: int = -1
     step_limits: Dict[Tuple[str, int], int] = field(default_factory=dict)
+    slit_max_um: List[float] = field(default_factory=list)
 
 
 def find_mono_cfg(directory: str) -> Optional[str]:
@@ -282,15 +283,25 @@ def read_mono_cfg(directory: str) -> MonoConfig:
         mc.step_limits[("grating", 0)] = int(_num(cp["Grating1"].get("MaxMayStepCount"), 0))
     for i in range(len(mc.slits)):
         sec = f"Slit{i + 1}"
+        max_um = 0.0
         if cp.has_section(sec):
-            mc.step_limits[("slit", i)] = int(_num(cp[sec].get("MaxMayStepCount"), 0))
+            s = cp[sec]
+            steps = int(_num(s.get("MaxMayStepCount"), 0))
+            mc.step_limits[("slit", i)] = steps
+            # ширина по шагам: (шаги − нулевое положение) × размер шага; берём меньшую (осторожную) оценку
+            step_m = _num(s.get("StepSize"), 0.0)
+            if steps > 0 and step_m > 0:
+                max_um = float(int((steps - max(0, int(_num(s.get("NullPosition"), 0)))) * step_m * 1e6))
+        mc.slit_max_um.append(max(0.0, max_um))
     if cp.has_section("Mirror1"):
         mc.step_limits[("mirror", 0)] = int(_num(cp["Mirror1"].get("MaxMayStepCount"), 0))
     if cp.has_section("Turret1"):
         t = cp["Turret1"]
         pos = [int(_num(t.get(f"TurretPosition{k}"), 0)) for k in range(1, int(_num(t.get("PositionCount"), 0)) + 1)]
         if pos:
-            mc.step_limits[("turret", 0)] = max(pos) + max(1000, (max(pos) - min(pos)) // max(1, len(pos) - 1))
+            # за последней позицией турели — не дальше половины промежутка между позициями
+            gap = (max(pos) - min(pos)) // max(1, len(pos) - 1)
+            mc.step_limits[("turret", 0)] = max(pos) + max(500, gap // 2)
     mc.step_limits = {k: v for k, v in mc.step_limits.items() if v > 0}
     if cp.has_section("Turret1"):
         mc.current_grating = int(_num(cp["Turret1"].get("CurGrating"), 0)) - 1

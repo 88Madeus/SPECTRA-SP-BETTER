@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import math
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeout
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -20,9 +22,9 @@ import numpy as np
 from . import processing as P
 from .calibration import WavelengthAxis, geometries_from_config
 from .config import ACQ_IMAGE, ACQ_SPECTRUM, AppSettings
-from .hw.base import (MECH_GRATING, MECH_MIRROR, MECH_SLIT, MECH_TURRET, AcqSettings, Camera, CameraInfo,
-                      CameraState, DeviceError, GratingInfo, Monochromator, MonoInfo, full_frame_region,
-                      spectrum_region)
+from .hw.base import (MECH_GRATING, MECH_MIRROR, MECH_SLIT, MECH_TITLES, MECH_TURRET, AcqSettings, Camera,
+                      CameraInfo, CameraState, DeviceError, GratingInfo, Monochromator, MonoInfo,
+                      full_frame_region, spectrum_region, warm_up_camera)
 from .hw.worker import DeviceThread
 from .spectrasp_config import InstalledSetup, find_spectrasp_dir, read_installation
 
@@ -56,6 +58,7 @@ class Measurement:
     calibration_source: str = ""
     is_background: bool = False
     label: str = ""
+    stitched: bool = False                # сшит из нескольких кадров (панорама): «пиксель» не имеет смысла
 
     def meta(self) -> Dict[str, object]:
         m: Dict[str, object] = {
@@ -100,6 +103,7 @@ class Instrument:
         self._abort = threading.Event()
         self.camera_stuck = False
         self.last_state: Optional[CameraState] = None
+        self._mono_exclusive: Optional[Tuple[str, int]] = None     # (кто, поток) — см. mono_exclusive()
         self.axis = WavelengthAxis(settings.calibration, {})
         self.load_installation()
 
@@ -194,6 +198,7 @@ class Instrument:
             info.mirror_positions = list(mc.mirror_positions)
             info.has_shutter = mc.has_shutter
             info.step_limits = dict(mc.step_limits)
+            info.slit_max_um = list(mc.slit_max_um)
         return info
 
     def connect_camera(self) -> CameraInfo:
@@ -254,25 +259,66 @@ class Instrument:
         m = self.mono
         return m is not None and m.is_open
 
-    def disconnect(self, warm_up: Optional[bool] = None) -> None:
+    def disconnect(self, warm_up: Optional[bool] = None, say: Optional[Callable[[str], None]] = None,
+                   cancel_warm_up: Optional[threading.Event] = None) -> None:
+        """Безопасное отключение приборов.
+
+        * идущая экспозиция прерывается;
+        * охлаждённая ПЗС сначала плавно отогревается до +2 °C (если включено в настройках;
+          ожидание можно прервать через cancel_warm_up — уставка +2 °C всё равно остаётся);
+        * монохроматор закрывается только после окончания движения: иначе DevCtrl может
+          не сохранить положение механизмов, и при следующем запуске оно будет неверным.
+        """
         warm = self.settings.warm_up_on_close if warm_up is None else warm_up
+        say = say or (lambda text: None)
         errors = []
+        self.abort()
+        # не меньше 5 минут: даже при коротком таймауте в настройках не закрываем DevCtrl посреди движения
+        t = max(self.settings.mono_timeout_s, 300.0)
+        mono_fut = self.mono_thread.submit(self._close_mono_safely, t, label="close") \
+            if self.mono is not None else None
         if self.camera is not None:
             try:
-                self.cam_thread.call(self.camera.close, warm, timeout=90)
+                self.cam_thread.call(lambda: None, timeout=60)       # дождаться прерванной экспозиции
+            except FutureTimeout:
+                errors.append("камера: экспозиция не прервалась за 60 с")
+            if warm and self.camera_connected and not self.camera_stuck and self.camera.info.cooling_type:
+                try:
+                    warm_up_camera(lambda: self.cam_thread.call(self.camera.get_state, timeout=15),
+                                   lambda on, c: self.cam_thread.call(self.camera.set_cooling, on, c, timeout=15),
+                                   say=say, cancel=cancel_warm_up)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"отогрев ПЗС: {e}")
+            try:
+                self.cam_thread.call(self.camera.close, False, timeout=60)
             except Exception as e:  # noqa: BLE001
                 errors.append(f"камера: {e}")
-        if self.mono is not None:
+        if mono_fut is not None:
+            if not mono_fut.done():
+                say("Ожидание окончания движения монохроматора…")
             try:
-                self.mono_thread.call(self.mono.close, timeout=30)
+                mono_fut.result(timeout=t + 90)
             except Exception as e:  # noqa: BLE001
                 errors.append(f"монохроматор: {e}")
         if errors:
             log.warning("При отключении: %s", "; ".join(errors))
 
-    def shutdown(self) -> None:
+    def _close_mono_safely(self, timeout_s: float) -> None:
+        """В потоке монохроматора: дождаться конца движения и штатно закрыть DevCtrl."""
+        m = self.mono
+        if m.is_open:
+            try:
+                if m.is_busy():
+                    log.info("Отключение: ожидание окончания движения монохроматора…")
+                m.wait_idle(timeout_s)
+            except DeviceError as e:
+                log.warning("Монохроматор перед отключением: %s", e)
+        m.close()
+
+    def shutdown(self, say: Optional[Callable[[str], None]] = None,
+                 cancel_warm_up: Optional[threading.Event] = None) -> None:
         try:
-            self.disconnect()
+            self.disconnect(say=say, cancel_warm_up=cancel_warm_up)
         finally:
             self.cam_thread.stop(2)
             self.mono_thread.stop(2)
@@ -469,25 +515,84 @@ class Instrument:
         return f"№{index + 1}"
 
     # ================================================================ монохроматор
-    def _require_mono(self) -> None:
+    def _require_mono(self, control: bool = False) -> None:
+        """control=True — команда, которая что-то двигает (проверяется и монопольный режим)."""
         if not self.mono_connected:
             raise DeviceError("Монохроматор не подключён")
+        if control:
+            excl = self._mono_exclusive
+            if excl is not None and excl[1] != threading.get_ident():
+                raise DeviceError(f"Монохроматором сейчас управляет {excl[0]} — дождитесь окончания или нажмите «Стоп»")
+
+    @contextmanager
+    def mono_exclusive(self, who: str):
+        """На время панорамы и т. п. ручные команды монохроматору из других потоков отклоняются."""
+        self._mono_exclusive = (who, threading.get_ident())
+        try:
+            yield
+        finally:
+            self._mono_exclusive = None
+
+    # --- «защита от дурака»: проверка команд до отправки в прибор
+    def _check_wavelength(self, wl: float) -> None:
+        if not math.isfinite(wl) or wl <= 0:
+            raise DeviceError(f"Недопустимая длина волны: {wl}")
+        lo, hi = self.mono.info.wl_range
+        if hi > lo and not (lo <= wl <= hi):
+            raise DeviceError(f"Длина волны {wl:g} нм вне диапазона текущей решётки {lo:g}…{hi:g} нм")
+
+    def _check_grating(self, index: int) -> None:
+        n = len(self.mono.info.gratings)
+        if index < 0 or (n and index >= n):
+            raise DeviceError(f"В приборе нет решётки №{index + 1}" + (f" (решёток: {n})" if n else ""))
+
+    def _check_mirror(self, position: int) -> None:
+        n = len(self.mono.info.mirror_positions) or 2
+        if not 0 <= position < n:
+            raise DeviceError(f"У выходного зеркала нет положения {position}")
+
+    def slit_max(self, index: int) -> float:
+        """Наибольшая допустимая ширина щели, мкм (0 — неизвестна)."""
+        mx = self.mono.info.slit_max_um if self.mono is not None else []
+        return float(mx[index]) if 0 <= index < len(mx) else 0.0
+
+    def _check_slit(self, index: int, width_um: float) -> None:
+        n = len(self.mono.info.slits)
+        if index < 0 or (n and index >= n):
+            raise DeviceError(f"В приборе нет щели №{index + 1}")
+        if not math.isfinite(width_um) or width_um < 0:
+            raise DeviceError(f"Недопустимая ширина щели: {width_um}")
+        mx = self.slit_max(index)
+        if mx and width_um > mx:
+            raise DeviceError(f"Ширина {width_um:g} мкм больше допустимой для этой щели ({mx:g} мкм)")
+
+    def _check_steps(self, mech: str, index: int, target: int) -> None:
+        limit = self.mono.info.step_limits.get((mech, index))
+        name = MECH_TITLES.get(mech, mech)
+        if not limit:
+            raise DeviceError(f"Для механизма «{name}» неизвестен предел хода (нет MaxMayStepCount в файле прибора) — "
+                              "перемещение по шагам заблокировано. Доступен «Сброс» или штатное окно DevCtrl.")
+        if not 0 <= target <= limit:
+            raise DeviceError(f"Положение {target} шагов вне допустимого диапазона 0…{limit} для «{name}»")
 
     def goto_wavelength(self, wl: float) -> float:
-        self._require_mono()
+        self._require_mono(control=True)
+        self._check_wavelength(float(wl))
         t = self.settings.mono_timeout_s
         self.mono_thread.call(self.mono.set_wavelength, float(wl), True, t, timeout=t + 30)
         self.refresh_mono()
         return self.mono_wl
 
     def set_grating(self, index: int) -> None:
-        self._require_mono()
+        self._require_mono(control=True)
+        self._check_grating(int(index))
         t = self.settings.mono_timeout_s
         self.mono_thread.call(self.mono.set_grating, int(index), True, t, timeout=t + 30)
         self.refresh_mono()
 
     def set_slit(self, index: int, width_um: float) -> float:
-        self._require_mono()
+        self._require_mono(control=True)
+        self._check_slit(int(index), float(width_um))
         self.mono_thread.call(self.mono.set_slit, int(index), float(width_um), timeout=120)
         w = self.mono_thread.call(self.mono.get_slit, int(index), timeout=60)
         if index == 0:
@@ -499,7 +604,8 @@ class Instrument:
         return self.mono_thread.call(self.mono.get_slit, int(index), timeout=60)
 
     def set_mirror(self, position: int, index: int = 0) -> None:
-        self._require_mono()
+        self._require_mono(control=True)
+        self._check_mirror(int(position))
         self.mono_thread.call(self.mono.set_mirror, index, int(position), timeout=120)
 
     def get_mirror(self, index: int = 0) -> int:
@@ -507,7 +613,7 @@ class Instrument:
         return self.mono_thread.call(self.mono.get_mirror, index, timeout=60)
 
     def set_shutter(self, is_open: bool) -> None:
-        self._require_mono()
+        self._require_mono(control=True)
         self.mono_thread.call(self.mono.set_shutter, bool(is_open), 0, timeout=60)
 
     def get_shutter(self) -> Optional[bool]:
@@ -567,23 +673,28 @@ class Instrument:
         return snap
 
     def service_set_steps(self, mech: str, index: int, position: int) -> None:
-        self._require_mono()
+        self._require_mono(control=True)
+        self._check_steps(mech, int(index), int(position))
         t = self.settings.mono_timeout_s
         self.mono_thread.call(self.mono.set_steps, mech, int(index), int(position), t, timeout=t + 30)
 
     def service_move_steps(self, mech: str, index: int, delta: int) -> None:
-        self._require_mono()
+        self._require_mono(control=True)
         t = self.settings.mono_timeout_s
-        self.mono_thread.call(self.mono.move_steps, mech, int(index), int(delta), t, timeout=t + 30)
+
+        def work():          # положение читается и проверяется в потоке прибора непосредственно перед движением
+            self._check_steps(mech, int(index), self.mono.get_steps(mech, int(index)) + int(delta))
+            self.mono.move_steps(mech, int(index), int(delta), t)
+        self.mono_thread.call(work, timeout=t + 30)
 
     def service_reset(self, mech: str, index: int) -> None:
-        self._require_mono()
+        self._require_mono(control=True)
         t = self.settings.mono_timeout_s
         self.mono_thread.call(self.mono.reset, mech, int(index), t, timeout=t + 30)
 
     def show_native_window(self) -> None:
         """Штатное окно DevCtrl (выполняется в потоке монохроматора — там живут окна драйвера)."""
-        self._require_mono()
+        self._require_mono(control=True)
         self.mono_thread.call(self.mono.show_native_window, timeout=60)
 
     def mono_busy(self) -> bool:

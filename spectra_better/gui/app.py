@@ -52,6 +52,8 @@ def main(argv=None) -> int:
     app = QtWidgets.QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
+    from .icons import app_icon
+    app.setWindowIcon(app_icon())            # тот же значок, что у ярлыков на рабочем столе
     qt_ru = QtCore.QTranslator(app)          # «Да»/«Нет»/«Отмена» в стандартных окнах Qt
     if qt_ru.load("qtbase_ru", QtCore.QLibraryInfo.location(QtCore.QLibraryInfo.TranslationsPath)):
         app.installTranslator(qt_ru)
