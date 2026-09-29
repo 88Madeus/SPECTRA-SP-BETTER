@@ -170,6 +170,12 @@ class PsiCamera(Camera):
     def current_readout_speed(self) -> int:
         return int(self._params.lReadoutSpeed)
 
+    @property
+    def sync_out(self):
+        if self._h < 0:
+            return (-1, -1)
+        return int(self._params.wSynchOut1Type), int(self._params.wSynchOut2Type)
+
     def read_regions(self) -> List[Region]:
         self._require_open()
         count = ctypes.c_int32(0)
@@ -237,6 +243,11 @@ class PsiCamera(Camera):
         p.lFactReadoutSpeed = _SPECTRASP_FACT_READOUT
         p.lRegNum = len(settings.regions)
         p.wSynchMode = 0                      # внутренний запуск
+        # выходы синхронизации (к ним подключают лазер/затвор) — как в SpectraSP, из её настроек
+        if settings.sync_out[0] >= 0:
+            p.wSynchOut1Type = int(settings.sync_out[0])
+        if settings.sync_out[1] >= 0:
+            p.wSynchOut2Type = int(settings.sync_out[1])
         regs = (S.TPSICCDRegionV2 * len(settings.regions))()
         for i, r in enumerate(settings.regions):
             regs[i].wLeft, regs[i].wTop, regs[i].wRight, regs[i].wBottom = r.left, r.top, r.right, r.bottom
@@ -251,8 +262,9 @@ class PsiCamera(Camera):
         self._check(f["psiccd2_SetParameters"](self._h, p), "записи параметров")
         self._read_params()
         self._applied = settings
-        log.info("Камера: экспозиция %.0f мкс (%d×%d), %d кГц, область %s",
-                 self.current_exposure_us, value, unit, self._params.lReadoutSpeed, settings.regions[0])
+        log.info("Камера: экспозиция %.0f мкс (%d×%d), %d кГц, область %s, синхровыходы %d/%d",
+                 self.current_exposure_us, value, unit, self._params.lReadoutSpeed, settings.regions[0],
+                 self._params.wSynchOut1Type, self._params.wSynchOut2Type)
 
     def invalidate(self) -> None:
         """Забыть применённые параметры: при следующем configure() они уйдут заново."""

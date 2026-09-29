@@ -154,11 +154,31 @@ class AcqSettings:
     exposure_us: int
     readout_speed: int                  # кГц, из списка CameraInfo.readout_speeds
     regions: Tuple[Region, ...]
+    sync_out: Tuple[int, int] = (-1, -1)   # режимы выходов синхронизации 1 и 2 (−1 — не менять)
 
     @property
     def out_shape(self) -> Tuple[int, int]:
         r = self.regions[0]
         return r.out_rows, r.out_cols
+
+
+# Режимы выходов синхронизации камеры PSI («Выход синхр. 1/2» в SpectraSP). Номер режима —
+# значение поля wSynchOutNType параметров камеры; список и порядок — как у SpectraSP для
+# PSI_CCD_VER3 (camera info сообщает 9 режимов, девятый SpectraSP не показывает).
+SYNC_OUT_MODES = {
+    0: "Экспозиция, импульс «−»",
+    1: "Экспозиция, импульс «+»",
+    2: "Перед экспозицией, импульс «−»",
+    3: "После экспозиции, импульс «−»",
+    4: "Внешняя синхронизация 0",
+    5: "Логическая 1 (постоянно)",
+    6: "Логический 0 (постоянно)",
+    7: "Программный старт",
+}
+SYNC_OUT_SPECTRASP = {0: "EXP polar negative", 1: "EXP polar positive", 2: "PRED DELAY polar negative",
+                      3: "POST DELAY polar negative", 4: "EXTERNAL SYNCH 0", 5: "LOGICAL 1", 6: "LOGICAL 0",
+                      7: "SOFT START SCAN"}
+SYNC_LOGICAL_1, SYNC_LOGICAL_0 = 5, 6
 
 
 class Camera(abc.ABC):
@@ -186,6 +206,11 @@ class Camera(abc.ABC):
     @abc.abstractmethod
     def configure(self, settings: AcqSettings) -> None:
         """Передать параметры в камеру (только если они изменились)."""
+
+    @property
+    def sync_out(self) -> Tuple[int, int]:
+        """Текущие режимы выходов синхронизации 1 и 2 (−1 — неизвестно)."""
+        return (-1, -1)
 
     @abc.abstractmethod
     def acquire(self) -> np.ndarray:

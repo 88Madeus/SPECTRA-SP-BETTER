@@ -132,6 +132,7 @@ class SensorSettings:
     region: Tuple[int, int, int, int] = (0, 0, 0, 0)
     region_bin: Tuple[int, int] = (1, 1)
     flip: str = "NONE"
+    sync_out: Tuple[int, int] = (-1, -1)     # SynchroOut1/2 — режимы выходов синхронизации
 
 
 def read_sensor_xml(path: str) -> Optional[SensorSettings]:
@@ -154,6 +155,7 @@ def read_sensor_xml(path: str) -> Optional[SensorSettings]:
     if ch is not None:
         out.exposure_us = _num(ch.findtext("ExpTime"), out.exposure_us)
         out.readout_speed = int(_num(ch.findtext("SensorReadOutSpeed"), 0))
+        out.sync_out = (int(_num(ch.findtext("SynchroOut1"), -1)), int(_num(ch.findtext("SynchroOut2"), -1)))
     cal = s.find("Calibration")
     if cal is not None:
         out.calib_mode = (cal.findtext("ClbrMode") or "Static").strip()

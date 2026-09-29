@@ -6,7 +6,7 @@ from typing import Optional, Sequence
 from PyQt5 import QtCore, QtWidgets
 
 from ..config import ACQ_IMAGE, ACQ_SPECTRUM, AppSettings
-from ..hw.base import CameraInfo, CameraState, MonoInfo
+from ..hw.base import SYNC_OUT_MODES, SYNC_OUT_SPECTRASP, CameraInfo, CameraState, MonoInfo
 
 
 def _big(label: QtWidgets.QLabel, pt: int = 15) -> QtWidgets.QLabel:
@@ -32,6 +32,8 @@ def _row(*widgets) -> QtWidgets.QWidget:
 class CameraPanel(QtWidgets.QGroupBox):
     cooling_on = QtCore.pyqtSignal(int)
     cooling_off = QtCore.pyqtSignal()
+    laser = QtCore.pyqtSignal(bool)                 # включить/выключить лазер
+    sync_out = QtCore.pyqtSignal(int, int)          # (номер выхода, режим)
 
     def __init__(self, parent=None):
         super().__init__("Камера ПЗС", parent)
@@ -54,7 +56,51 @@ class CameraPanel(QtWidgets.QGroupBox):
         form.addRow("Уставка:", _row(self.target, self.btn_on, self.btn_off))
         self.btn_on.clicked.connect(lambda: self.cooling_on.emit(self.target.value()))
         self.btn_off.clicked.connect(self.cooling_off.emit)
+
+        # лазер и выходы синхронизации камеры (как «Выход синхр. 1/2» в SpectraSP)
+        self.btn_laser = QtWidgets.QPushButton("Включить")
+        self.btn_laser.setCheckable(True)
+        self.btn_laser.setToolTip("Лазер, подключённый к выходу синхронизации камеры (какому — «Настройка → Настройки…»)")
+        self.lbl_laser = QtWidgets.QLabel("")
+        self.lbl_laser.setStyleSheet("color: #555;")
+        form.addRow("Лазер:", _row(self.btn_laser, self.lbl_laser, 1))
+        self.sync_boxes = []
+        for n in (1, 2):
+            cb = QtWidgets.QComboBox()
+            for mode, text in SYNC_OUT_MODES.items():
+                cb.addItem(text, mode)
+                cb.setItemData(cb.count() - 1, f"В SpectraSP: {SYNC_OUT_SPECTRASP[mode]}", QtCore.Qt.ToolTipRole)
+            cb.setToolTip(f"Режим выхода синхронизации {n} камеры (разъём на камере). «Логическая 1/0» — "
+                          "постоянный уровень, остальные — импульсы, привязанные к экспозиции")
+            cb.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            cb.setMinimumContentsLength(12)
+            cb.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            cb.activated.connect(lambda _i, n=n, cb=cb: self.sync_out.emit(n, cb.currentData()))
+            form.addRow(f"Синхр. {n}:", cb)
+            self.sync_boxes.append(cb)
+        self.btn_laser.clicked.connect(lambda checked: self.laser.emit(checked))
+        self._laser_output = 0
         self.set_connected(False)
+
+    def set_sync(self, modes: Sequence[int], laser_output: int, laser_on: bool) -> None:
+        """Показать режимы выходов и состояние лазера (без сигналов)."""
+        for cb, mode in zip(self.sync_boxes, modes):
+            cb.blockSignals(True)
+            i = cb.findData(mode)
+            cb.setCurrentIndex(i)
+            cb.blockSignals(False)
+        self._laser_output = laser_output
+        self.btn_laser.blockSignals(True)
+        self.btn_laser.setChecked(laser_on)
+        self.btn_laser.blockSignals(False)
+        self.btn_laser.setText("Выключить" if laser_on else "Включить")
+        self.btn_laser.setStyleSheet("background: #d62728; color: white; font-weight: bold;" if laser_on else "")
+        if laser_output in (1, 2):
+            self.lbl_laser.setText(("<b style='color:#b00020'>ВКЛ</b>" if laser_on else "выкл.")
+                                   + f" (синхр. {laser_output})")
+        else:
+            self.lbl_laser.setText("не подключён (см. настройки)")
+        self.btn_laser.setEnabled(self.btn_on.isEnabled() and laser_output in (1, 2))
 
     def set_info(self, info: Optional[CameraInfo], ip: str) -> None:
         if info is None:
@@ -78,8 +124,9 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.cooling.setStyleSheet("color: #b00020;" if st.overheat else "color: #555;")
 
     def set_connected(self, on: bool) -> None:
-        for w in (self.target, self.btn_on, self.btn_off):
+        for w in (self.target, self.btn_on, self.btn_off, *self.sync_boxes):
             w.setEnabled(on)
+        self.btn_laser.setEnabled(on and self._laser_output in (1, 2))
 
 
 class AcquisitionPanel(QtWidgets.QGroupBox):

@@ -55,6 +55,12 @@ class AppSettings:
     # охлаждение (уставка не хранится — см. COOLING_TARGET_DEFAULT_C)
     warm_up_on_close: bool = True
 
+    # выходы синхронизации камеры (SynchroOut1/2 в SpectraSP; к ним подключают лазер)
+    sync_out1: int = -1                       # режим выхода 1 (−1 — взять из настроек SpectraSP)
+    sync_out2: int = -1
+    laser_output: int = 2                     # к какому выходу подключён лазер: 0 — ни к какому, 1, 2
+    laser_active_high: bool = True            # лазер включается логической 1 (иначе — логическим 0)
+
     # обработка
     subtract_background: bool = True
     close_shutter_for_background: bool = True

@@ -160,3 +160,34 @@ def test_mono_panel_locked_during_panorama(win):
     win._acq_thread.join(2)
     win._update_actions()
     assert win.mono_panel.btn_go.isEnabled() and win._mono_ready()
+
+
+def test_laser_needs_confirmation(win, app, monkeypatch):
+    QMB = QtWidgets.QMessageBox
+    answer = {"v": QMB.No}
+    monkeypatch.setattr(QMB, "warning", staticmethod(lambda *a, **k: win.msgs.append(("warning", a[1]))
+                                                     or answer["v"]))
+    win.cam_panel.btn_laser.click()                          # «нет» — лазер не включается
+    pump(app)
+    assert not win.inst.laser_on and not win.cam_panel.btn_laser.isChecked()
+    answer["v"] = QMB.Yes
+    win.cam_panel.btn_laser.click()
+    pump(app)
+    assert win.inst.laser_on and not win.lbl_laser.isHidden()     # «ЛАЗЕР ВКЛ» в строке состояния
+    assert win.cam_panel.btn_laser.text() == "Выключить"
+    win.cam_panel.btn_laser.click()                          # выключение — без вопросов
+    pump(app)
+    assert not win.inst.laser_on and win.lbl_laser.isHidden()
+    assert [m for m in win.msgs if m[1] == "Включение лазера"] == [("warning", "Включение лазера")] * 2
+
+
+def test_constant_high_on_other_output_asks(win, app):
+    from spectra_better.hw.base import SYNC_LOGICAL_1
+    win.answers["question"] = QtWidgets.QMessageBox.No
+    win.set_sync_out(1, SYNC_LOGICAL_1)
+    pump(app)
+    assert win.inst.camera.sync_out[0] != SYNC_LOGICAL_1
+    win.answers["question"] = QtWidgets.QMessageBox.Yes
+    win.set_sync_out(1, SYNC_LOGICAL_1)
+    pump(app)
+    assert win.inst.camera.sync_out[0] == SYNC_LOGICAL_1
