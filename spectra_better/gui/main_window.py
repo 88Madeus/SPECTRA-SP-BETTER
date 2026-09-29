@@ -14,7 +14,7 @@ from .. import APP_NAME, __version__
 from .. import processing as P
 from ..calibration import WavelengthAxis
 from ..config import COOLING_TARGET_DEFAULT_C, AppSettings
-from ..hw.base import WARM_UP_TARGET_C, DeviceError
+from ..hw.base import SYNC_LOGICAL_1, WARM_UP_TARGET_C, DeviceError
 from ..hw.winutil import spectrasp_is_running
 from ..instrument import Instrument, Measurement
 from ..reference_lines import nearest_line
@@ -218,6 +218,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_cam = QtWidgets.QLabel("Камера: —")
         self.lbl_mono = QtWidgets.QLabel("Монохроматор: —")
         self.lbl_meas = QtWidgets.QLabel("")
+        self.lbl_laser = QtWidgets.QLabel("<b style='color:white; background:#d62728'>&nbsp;ЛАЗЕР ВКЛ&nbsp;</b>")
+        self.lbl_laser.setVisible(False)
+        sb.addPermanentWidget(self.lbl_laser)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setMaximumWidth(220)
         self.progress.setVisible(False)
@@ -252,6 +255,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.cam_panel.cooling_on.connect(self.cooling_on)
         self.cam_panel.cooling_off.connect(self.cooling_off)
+        self.cam_panel.laser.connect(self.set_laser)
+        self.cam_panel.sync_out.connect(self.set_sync_out)
         self.acq_panel.changed.connect(self._acq_settings_changed)
         self.image.rows_changed.connect(self.acq_panel.set_rows)
         self.mono_panel.goto.connect(self.goto_wavelength)
@@ -380,6 +385,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.acq_panel.load_from_settings()
         self.image.set_rows(self.s.rows_top, self.s.rows_bottom)
         self.cam_panel.set_state(self.inst.last_state)
+        self._show_sync()
         self._acq_settings_changed()
         self._update_actions()
 
@@ -457,6 +463,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _disconnected(self, dlg) -> None:
         dlg.finish()
+        self._show_sync()
         log.info("Приборы отключены")
         self._refresh_static_info()
         self.cam_panel.set_state(None)
@@ -548,6 +555,57 @@ class MainWindow(QtWidgets.QMainWindow):
         log.info("Охлаждение: уставка %+d °C", target)
         self.tasks.run(lambda: self.inst.set_cooling(True, target), None,
                        lambda e: self._error("Охлаждение", e))
+
+    # ---------------------------------------------------------------- лазер и выходы синхронизации
+    def _show_sync(self) -> None:
+        inst = self.inst
+        self.cam_panel.set_sync((inst.sync_out_setting(1), inst.sync_out_setting(2)),
+                                self.s.laser_output, inst.laser_on and inst.camera_connected)
+        self.lbl_laser.setVisible(inst.laser_on and inst.camera_connected)
+
+    def _confirm_laser_on(self) -> bool:
+        n = self.s.laser_output
+        r = QtWidgets.QMessageBox.warning(
+            self, "Включение лазера",
+            f"Включить лазер (синхровыход {n} камеры)?\n\n"
+            "Перед включением убедитесь, что луч направлен в прибор, посторонние предметы убраны "
+            "с его пути, а все в помещении в защитных очках.\n\n"
+            "Лазер выключается этой же кнопкой, а также сам — при отключении приборов и выходе из программы.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+        return r == QtWidgets.QMessageBox.Yes
+
+    def set_laser(self, on: bool) -> None:
+        if not self.inst.camera_connected:
+            self._show_sync()
+            return
+        if on and not self._confirm_laser_on():
+            self._show_sync()
+            return
+        if not on and self._acquiring():
+            self.stop()               # выключить сразу, не дожидаясь конца кадра
+        self.tasks.run(lambda: self.inst.set_laser(on), lambda _: self._show_sync(),
+                       lambda e: (self._error("Лазер", e), self._show_sync()), "laser")
+
+    def set_sync_out(self, n: int, mode: int) -> None:
+        if not self.inst.camera_connected or mode == self.inst.sync_out_setting(n):
+            self._show_sync()
+            return
+        on_mode = self.inst.laser_modes()[0]
+        if n == self.s.laser_output and mode == on_mode:
+            if not self._confirm_laser_on():
+                self._show_sync()
+                return
+        elif mode == SYNC_LOGICAL_1:
+            r = QtWidgets.QMessageBox.question(
+                self, "Выход синхронизации",
+                f"На синхровыходе {n} камеры будет постоянно высокий уровень (логическая 1). Если к этому "
+                "выходу что-то подключено (лазер, затвор), оно сработает.\n\nПродолжить?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+            if r != QtWidgets.QMessageBox.Yes:
+                self._show_sync()
+                return
+        self.tasks.run(lambda: self.inst.set_sync_out(n, mode), lambda _: self._show_sync(),
+                       lambda e: (self._error("Выход синхронизации", e), self._show_sync()), "sync-out")
 
     def _ask_cooling_off(self, temperature: float) -> str:
         """Как выключать охлаждение холодной ПЗС: "warm" (отогреть и выключить), "now" или ""."""
@@ -1147,9 +1205,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def settings_dialog(self) -> None:
         old_dir = self.s.spectrasp_dir
-        dlg = SettingsDialog(self.s, self.inst.camera_ip(), self.inst.mono_address(), self)
+        dlg = SettingsDialog(self.s, self.inst.camera_ip(), self.inst.mono_address(), self,
+                             laser_on=self.inst.laser_on and self.inst.camera_connected)
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
+        self._show_sync()
         if self.s.spectrasp_dir != old_dir:
             if self.inst.camera_connected or self.inst.mono_connected:
                 QtWidgets.QMessageBox.information(self, "Настройки", "Новый каталог будет использован после "

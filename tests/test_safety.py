@@ -141,3 +141,64 @@ def test_warm_up_can_be_cancelled_and_skipped():
     assert calls == [2]                                     # уставка +2 °C всё равно отправлена
     assert warm_up_camera(lambda: CameraState(temperature=5), lambda on, t: calls.append(t))
     assert calls == [2]                                     # тёплую ПЗС не трогаем
+
+
+# ------------------------------------------------------------------ лазер на выходе синхронизации камеры
+def test_sync_outputs_applied_like_spectrasp(inst):
+    # после включения питания камера сообщает (0, 0); SpectraSP выставляет свои (0, 6 = LOGICAL 0)
+    assert inst.camera.sync_out == (0, 6)
+    assert not inst.laser_on
+
+
+def test_laser_on_off_and_off_on_disconnect(inst):
+    from spectra_better.hw.base import SYNC_LOGICAL_0, SYNC_LOGICAL_1
+    inst.set_laser(True)
+    assert inst.laser_on and inst.camera.sync_out[1] == SYNC_LOGICAL_1
+    inst.acquire()                                        # съёмка не сбрасывает выход
+    assert inst.camera.sync_out[1] == SYNC_LOGICAL_1
+    cam = inst.camera
+    inst.disconnect(warm_up=False)
+    assert cam.sync_out[1] == SYNC_LOGICAL_0              # лазер выключен перед отключением
+
+
+def test_laser_is_off_after_connect_even_if_saved_on(spectrasp_dir):
+    from spectra_better.hw.base import SYNC_LOGICAL_0, SYNC_LOGICAL_1
+    s = AppSettings()
+    s.spectrasp_dir = spectrasp_dir
+    s.sync_out2 = SYNC_LOGICAL_1                          # «остался включённым» в файле настроек
+    i = Instrument(s, simulate=True)
+    try:
+        i.connect_camera()
+        assert i.camera.sync_out[1] == SYNC_LOGICAL_0 and not i.laser_on
+    finally:
+        i.shutdown()
+
+
+def test_laser_active_low_and_bad_requests(inst):
+    from spectra_better.hw.base import SYNC_LOGICAL_0, SYNC_LOGICAL_1
+    inst.settings.laser_active_high = False
+    inst.set_laser(True)
+    assert inst.camera.sync_out[1] == SYNC_LOGICAL_0
+    inst.set_laser(False)
+    assert inst.camera.sync_out[1] == SYNC_LOGICAL_1
+    for bad in (lambda: inst.set_sync_out(3, 0), lambda: inst.set_sync_out(1, 42)):
+        with pytest.raises(DeviceError):
+            bad()
+    inst.settings.laser_output = 0
+    with pytest.raises(DeviceError, match="не указано|Не указано"):
+        inst.set_laser(True)
+
+
+def test_laser_off_interrupts_long_exposure(inst):
+    from spectra_better.hw.base import SYNC_LOGICAL_0
+    inst.set_laser(True)
+    inst.camera.time_scale = 1.0
+    inst.settings.exposure_ms = 20000                      # 20-секундный кадр
+    t = threading.Thread(target=lambda: pytest.raises(DeviceError, inst.acquire))
+    t.start()
+    time.sleep(0.5)
+    t0 = time.monotonic()
+    inst.set_laser(False)
+    assert time.monotonic() - t0 < 5                       # не ждали конца кадра
+    assert inst.camera.sync_out[1] == SYNC_LOGICAL_0
+    t.join(10)

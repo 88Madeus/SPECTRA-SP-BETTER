@@ -218,6 +218,7 @@ class SimCamera(Camera):
         self._temp = 22.0
         self._target: Optional[float] = None
         self.fan_on = True             # для проверки защит можно «сломать» вентилятор
+        self._sync = (0, 0)            # после включения питания PSI сообщает режим 0 на обоих выходах
         self.overheat = False          # и «перегреть» камеру
         self._t_last = time.monotonic()
         self.stripe_center, self.stripe_sigma = 297.0, 9.0
@@ -271,6 +272,11 @@ class SimCamera(Camera):
         for r in settings.regions:
             r.validate(self.WIDTH, self.HEIGHT)
         self._settings = settings
+        self._sync = tuple(m if m >= 0 else old for m, old in zip(settings.sync_out, self._sync))
+
+    @property
+    def sync_out(self):
+        return self._sync
 
     def abort(self) -> None:
         self._abort.set()

@@ -16,6 +16,7 @@ def test_read_installation(spectrasp_dir):
     assert inst.stripe == (282, 311)
     assert inst.main.wl_presets[:3] == [290.0, 320.0, 460.0]
     assert inst.main.used_sensors["Sensor_PSI_CCD_VER3"] is True
+    assert inst.sensor.sync_out == (0, 6)        # «Выход синхр. 1/2»: EXP polar negative / LOGICAL 0
 
 
 def test_mono_cfg(spectrasp_dir):

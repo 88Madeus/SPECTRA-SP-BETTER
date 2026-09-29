@@ -24,7 +24,8 @@ from .calibration import WavelengthAxis, geometries_from_config
 from .config import ACQ_IMAGE, ACQ_SPECTRUM, AppSettings
 from .hw.base import (MECH_GRATING, MECH_MIRROR, MECH_SLIT, MECH_TITLES, MECH_TURRET, AcqSettings, Camera,
                       CameraInfo, CameraState, DeviceError, GratingInfo, Monochromator, MonoInfo,
-                      full_frame_region, spectrum_region, warm_up_camera)
+                      SYNC_LOGICAL_0, SYNC_LOGICAL_1, SYNC_OUT_MODES, full_frame_region, spectrum_region,
+                      warm_up_camera)
 from .hw.worker import DeviceThread
 from .spectrasp_config import InstalledSetup, find_spectrasp_dir, read_installation
 
@@ -148,6 +149,10 @@ class Instrument:
             s.exposure_ms = st.sensor.exposure_us / 1000.0
         if st.sensor and st.sensor.flip.upper().startswith("HOR"):
             s.flip_x = True
+        if st.sensor:
+            for n, mode in enumerate(st.sensor.sync_out, start=1):
+                if getattr(s, f"sync_out{n}") < 0 and mode in SYNC_OUT_MODES:
+                    setattr(s, f"sync_out{n}", mode)
 
     def camera_ip(self) -> str:
         if self.settings.camera_ip_override:
@@ -209,6 +214,14 @@ class Instrument:
             raise DeviceError("Камера не ответила за 3 минуты при подключении") from None
         self.camera_stuck = False
         self._fix_rows(info)
+        # выходы синхронизации — сразу, как SpectraSP при запуске; лазер при подключении всегда выключен
+        s = self.settings
+        if s.laser_output in (1, 2):
+            setattr(s, f"sync_out{s.laser_output}", self.laser_modes()[1])
+        try:
+            self.cam_thread.call(self.camera.configure, self.acq_settings(), timeout=60)
+        except (DeviceError, FutureTimeout, ValueError) as e:
+            log.warning("Параметры камеры (выходы синхронизации) не переданы: %s", e)
         try:
             self.last_state = self.cam_thread.call(self.camera.get_state)
         except DeviceError:
@@ -282,6 +295,12 @@ class Instrument:
                 self.cam_thread.call(lambda: None, timeout=60)       # дождаться прерванной экспозиции
             except FutureTimeout:
                 errors.append("камера: экспозиция не прервалась за 60 с")
+            if self.camera_connected and not self.camera_stuck and self.laser_on:
+                say("Выключение лазера…")
+                try:
+                    self.set_laser(False)                            # лазер не оставляем включённым
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"выключение лазера: {e}")
             if warm and self.camera_connected and not self.camera_stuck and self.camera.info.cooling_type:
                 try:
                     warm_up_camera(lambda: self.cam_thread.call(self.camera.get_state, timeout=15),
@@ -356,7 +375,45 @@ class Instrument:
             if region.bin_y > info.max_bin_y:
                 region = spectrum_region(info.width, info.height, s.rows_top, s.rows_bottom, False)
         speed = s.readout_speed or (info.readout_speeds[0] if info.readout_speeds else 0)
-        return AcqSettings(exposure_us=int(round(s.exposure_ms * 1000)), readout_speed=speed, regions=(region,))
+        sync = tuple(m if m in SYNC_OUT_MODES else -1 for m in (s.sync_out1, s.sync_out2))
+        return AcqSettings(exposure_us=int(round(s.exposure_ms * 1000)), readout_speed=speed, regions=(region,),
+                           sync_out=sync)
+
+    # ---------------------------------------------------------------- выходы синхронизации, лазер
+    def laser_modes(self) -> Tuple[int, int]:
+        """(режим «лазер включён», режим «выключен») для выхода, к которому подключён лазер."""
+        if self.settings.laser_active_high:
+            return SYNC_LOGICAL_1, SYNC_LOGICAL_0
+        return SYNC_LOGICAL_0, SYNC_LOGICAL_1
+
+    def sync_out_setting(self, n: int) -> int:
+        return int(getattr(self.settings, f"sync_out{n}"))
+
+    def set_sync_out(self, n: int, mode: int) -> None:
+        """Режим выхода синхронизации n (1 или 2) — сразу передаётся в камеру."""
+        if n not in (1, 2):
+            raise DeviceError(f"У камеры нет выхода синхронизации {n}")
+        if mode not in SYNC_OUT_MODES:
+            raise DeviceError(f"Недопустимый режим выхода синхронизации: {mode}")
+        self._require_camera()
+        setattr(self.settings, f"sync_out{n}", int(mode))
+        log.info("Камера: выход синхронизации %d — %s", n, SYNC_OUT_MODES[mode])
+        self.cam_thread.call(self.camera.configure, self.acq_settings(), timeout=self.settings.frame_timeout_s + 60)
+
+    @property
+    def laser_on(self) -> bool:
+        n = self.settings.laser_output
+        return n in (1, 2) and self.sync_out_setting(n) == self.laser_modes()[0]
+
+    def set_laser(self, on: bool) -> None:
+        n = self.settings.laser_output
+        if n not in (1, 2):
+            raise DeviceError("Не указано, к какому выходу синхронизации камеры подключён лазер "
+                              "(«Настройка → Настройки…»)")
+        if not on and self.cam_thread.current_label == "acquire":
+            self.abort()          # иначе новый режим выхода дойдёт до камеры только после кадра
+        self.set_sync_out(n, self.laser_modes()[0 if on else 1])
+        log.info("Лазер %s", "ВКЛЮЧЁН" if on else "выключен")
 
     def expected_frame_time(self, acq: AcqSettings) -> float:
         r = acq.regions[0]

@@ -383,7 +383,8 @@ class CalibrationDialog(QtWidgets.QDialog):
 # ----------------------------------------------------------------- настройки
 
 class SettingsDialog(QtWidgets.QDialog):
-    def __init__(self, settings: AppSettings, camera_ip: str, mono_address: str, parent=None):
+    def __init__(self, settings: AppSettings, camera_ip: str, mono_address: str, parent=None,
+                 laser_on: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Настройки")
         self.s = settings
@@ -416,6 +417,21 @@ class SettingsDialog(QtWidgets.QDialog):
         self.warm.setToolTip("Защита матрицы от конденсата и термоудара. Выключать не рекомендуется.")
         self.warm.toggled.connect(self._warm_toggled)
         form.addRow(self.warm)
+        self.laser_out = QtWidgets.QComboBox()
+        self.laser_out.addItem("не подключён", 0)
+        self.laser_out.addItem("к синхровыходу 1 камеры", 1)
+        self.laser_out.addItem("к синхровыходу 2 камеры", 2)
+        self.laser_out.setCurrentIndex(max(0, self.laser_out.findData(settings.laser_output)))
+        self.laser_level = QtWidgets.QComboBox()
+        self.laser_level.addItem("логической 1 (высоким уровнем)", True)
+        self.laser_level.addItem("логическим 0 (низким уровнем)", False)
+        self.laser_level.setCurrentIndex(0 if settings.laser_active_high else 1)
+        form.addRow("Лазер подключён:", self.laser_out)
+        form.addRow("Лазер включается:", self.laser_level)
+        if laser_on:
+            for w in (self.laser_out, self.laser_level):
+                w.setEnabled(False)
+                w.setToolTip("Сначала выключите лазер")
         self.fmt = QtWidgets.QComboBox()
         self.fmt.addItem("TXT (табуляция, точка)", ".txt")
         self.fmt.addItem("CSV (для Excel: ; и запятая)", ".csv")
@@ -433,6 +449,8 @@ class SettingsDialog(QtWidgets.QDialog):
         s.frame_timeout_s = self.frame_to.value()
         s.mono_timeout_s = self.mono_to.value()
         s.warm_up_on_close = self.warm.isChecked()
+        s.laser_output = int(self.laser_out.currentData())
+        s.laser_active_high = bool(self.laser_level.currentData())
         s.save_format = self.fmt.currentData()
         self.accept()
 
