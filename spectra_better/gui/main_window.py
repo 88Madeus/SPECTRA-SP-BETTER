@@ -58,6 +58,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overheat_handled = False
         self._fan_warned = False
         self._foreign = False             # запущена SpectraSP/DevCtrl (две программы на одних приборах)
+        self._temp_block = ""             # почему съёмка недоступна из-за температуры ПЗС ("" — доступна)
         self._poll_ticks = 0
         self._image_meas: Optional[Measurement] = None   # измерение, из которого показан кадр ПЗС
 
@@ -313,7 +314,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_connect.setEnabled(not (cam and mono) and not acq)
         self.act_disconnect.setEnabled((cam or mono) and not acq)
         self.act_reconnect_cam.setEnabled(not acq)
-        free = not acq and not self._foreign
+        self._temp_block = self.inst.temperature_changing()
+        free = not acq and not self._foreign and not self._temp_block
         for a in (self.act_snap, self.act_live, self.act_bg, self.act_series):
             a.setEnabled(cam and free)
         self.act_pano.setEnabled(cam and mono and free)
@@ -336,7 +338,7 @@ class MainWindow(QtWidgets.QMainWindow):
         has = self.inst.has_background()
         txt = ""
         if not has and self.background is not None:
-            txt = "фон снят с другими параметрами"
+            txt = self.inst.background_problem() or "фон снят с другими параметрами"
         self.proc_panel.set_background_status(has, txt)
 
     def _error(self, title: str, exc: BaseException) -> None:
@@ -516,11 +518,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
             def done(st):
                 self._poll_cam = False
-                self.cam_panel.set_state(st)
+                block = self.inst.temperature_changing()
+                if block != self._temp_block:
+                    if not block and self._temp_block:
+                        log.info("Температура ПЗС установилась — съёмка снова доступна")
+                    self._update_actions()
+                if block:
+                    self.cam_panel.set_state(st, f"выход на {self.inst.cooling_target:+d} °C — съёмка "
+                                                 "недоступна", warn=True)
+                elif self.inst.temperature_stalled():
+                    self.cam_panel.set_state(st, f"уставка {self.inst.cooling_target:+d} °C недостижима — "
+                                                 "съёмка разрешена", warn=True)
+                else:
+                    self.cam_panel.set_state(st)
                 if st is not None and st.temperature is not None:
                     self.lbl_cam.setText(f"Камера: {st.temperature:+.0f} °C, {st.cooling_text}"
                                          + (" — отогрев перед выключением" if self._warm_then_off else ""))
                 self._camera_safety(st)
+                self._update_bg_status()           # фон мог «устареть» из-за смены температуры
             self.tasks.run(self.inst.camera_state, done, lambda e: setattr(self, "_poll_cam", False), "poll-cam")
         if self.inst.mono_connected and not self._poll_mono and not self._mono_moving:
             self._poll_mono = True
@@ -552,8 +567,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._warm_then_off:
             log.info("Отогрев перед выключением отменён: задана новая уставка")
         self._stop_warm_up()
+        if self._acquiring():
+            # пока ПЗС выходит на новую уставку, снимать нельзя (как в SpectraSP)
+            self.stop()
+            self.statusBar().showMessage("Съёмка остановлена: меняется температура ПЗС", 8000)
         log.info("Охлаждение: уставка %+d °C", target)
-        self.tasks.run(lambda: self.inst.set_cooling(True, target), None,
+        self.tasks.run(lambda: self.inst.set_cooling(True, target), lambda _: self._update_actions(),
                        lambda e: self._error("Охлаждение", e))
 
     # ---------------------------------------------------------------- лазер и выходы синхронизации
@@ -633,14 +652,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
         self._stop_warm_up()
         log.info("Охлаждение: выключение")
-        self.tasks.run(lambda: self.inst.set_cooling(False, 0), None, lambda e: self._error("Охлаждение", e))
+        self.tasks.run(lambda: self.inst.set_cooling(False, 0), lambda _: self._update_actions(),
+                       lambda e: self._error("Охлаждение", e))
 
     def _start_warm_up(self) -> None:
         """Плавный отогрев: уставка +2 °C, охлаждение выключится, когда ПЗС отогреется (см. _camera_safety)."""
         log.info("Охлаждение: отогрев до %+d °C, затем выключение", WARM_UP_TARGET_C)
         self._warm_then_off = True
+        if self._acquiring():
+            self.stop()
         self.statusBar().showMessage(f"Отогрев ПЗС до {WARM_UP_TARGET_C:+d} °C, затем охлаждение выключится", 8000)
-        self.tasks.run(lambda: self.inst.set_cooling(True, WARM_UP_TARGET_C), None,
+        self.tasks.run(lambda: self.inst.set_cooling(True, WARM_UP_TARGET_C), lambda _: self._update_actions(),
                        lambda e: (self._stop_warm_up(), self._error("Охлаждение", e)))
 
     def _stop_warm_up(self) -> None:
@@ -654,7 +676,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._warm_then_off and st.temperature is not None and st.temperature >= WARM_UP_TARGET_C - 1:
             self._stop_warm_up()
             log.info("ПЗС отогрета до %+.0f °C — охлаждение выключается", st.temperature)
-            self.tasks.run(lambda: self.inst.set_cooling(False, 0), None, lambda e: self._error("Охлаждение", e))
+            self.tasks.run(lambda: self.inst.set_cooling(False, 0), lambda _: self._update_actions(),
+                           lambda e: self._error("Охлаждение", e))
         # перегрев: два опроса подряд, чтобы не сработать от единичного сбоя
         self._overheat_count = self._overheat_count + 1 if st.overheat else 0
         if self._overheat_count >= 2 and not self._overheat_handled:
@@ -700,6 +723,11 @@ class MainWindow(QtWidgets.QMainWindow):
     # ================================================================ съёмка
     def _start(self, kind: str, fn: Callable[[], None]) -> None:
         if self._acquiring() or self._foreign:
+            return
+        block = self.inst.temperature_changing()
+        if block:
+            self.statusBar().showMessage(f"Съёмка недоступна: {block}. Дождитесь, пока температура установится.",
+                                         8000)
             return
         self._acq_stop.clear()
         self._acq_kind = kind

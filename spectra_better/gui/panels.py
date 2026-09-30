@@ -111,17 +111,19 @@ class CameraPanel(QtWidgets.QGroupBox):
         if info.temp_max > info.temp_min:
             self.target.setRange(info.temp_min, info.temp_max)
 
-    def set_state(self, st: Optional[CameraState]) -> None:
+    def set_state(self, st: Optional[CameraState], note: str = "", warn: bool = False) -> None:
+        """note — пояснение вместо состояния охлаждения (например, «выход на уставку…»)."""
         if st is None or st.temperature is None:
             self.temp.setText("— °C")
             self.cooling.setText("")
             return
         self.temp.setText(f"{st.temperature:+.0f} °C")
-        txt = st.cooling_text
+        txt = note or st.cooling_text
         if st.overheat:
             txt += ", ПЕРЕГРЕВ!"
         self.cooling.setText(txt)
-        self.cooling.setStyleSheet("color: #b00020;" if st.overheat else "color: #555;")
+        self.cooling.setWordWrap(True)
+        self.cooling.setStyleSheet("color: #b00020;" if st.overheat else ("color: #a15c00;" if warn else "color: #555;"))
 
     def set_connected(self, on: bool) -> None:
         for w in (self.target, self.btn_on, self.btn_off, *self.sync_boxes):

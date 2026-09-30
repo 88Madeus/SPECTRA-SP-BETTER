@@ -191,3 +191,24 @@ def test_constant_high_on_other_output_asks(win, app):
     win.set_sync_out(1, SYNC_LOGICAL_1)
     pump(app)
     assert win.inst.camera.sync_out[0] == SYNC_LOGICAL_1
+
+
+def test_setpoint_change_stops_live_and_blocks_until_reached(win, app):
+    cam(win)._update_temp = lambda: None                     # «заморозить» тепловую модель
+    win.s.warm_up_on_close = False                           # (и не ждать отогрева при выходе)
+    cam(win)._temp = 20.0
+    win.inst.camera_state()
+    win.live()
+    pump(app, 0.5)
+    assert win._acquiring()
+    win.cooling_on(-5)                                       # подтверждение — «Да» (фикстура)
+    pump(app, 1.0)
+    assert not win._acquiring()                              # непрерывная съёмка остановлена
+    win._update_actions()
+    assert not win.act_snap.isEnabled() and not win.act_live.isEnabled() and not win.act_bg.isEnabled()
+    win.snap()                                               # даже в обход кнопки — не запускается
+    assert not win._acquiring()
+    cam(win)._temp = -5.0                                    # температура установилась
+    win.inst.camera_state()
+    win._update_actions()
+    assert win.act_snap.isEnabled()
