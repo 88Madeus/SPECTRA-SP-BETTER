@@ -259,3 +259,40 @@ def test_disconnect_forgets_setpoint(inst):
     inst.set_cooling(True, 5)
     inst.disconnect(warm_up=False)
     assert inst.cooling_target is None
+
+
+# ------------------------------------------------------------------ шторка (DevCtrl выполняет команду не сразу)
+def test_shutter_state_confirmed_after_command(inst):
+    assert inst.mono.shutter_delay > 0                     # имитатор, как DevCtrl, отвечает с задержкой
+    inst.set_shutter(False)
+    assert inst.get_shutter() is False                     # сразу после команды — уже новое состояние
+    inst.set_shutter(True)
+    assert inst.get_shutter() is True
+
+
+def test_background_taken_only_with_closed_shutter(inst, monkeypatch):
+    inst.settings.close_shutter_for_background = True
+    assert inst.get_shutter() is True
+    seen = []
+    orig = inst._frame
+
+    def frame(acq):
+        inst.mono._apply_shutter()
+        seen.append(inst.mono.shutter_open)
+        return orig(acq)
+    monkeypatch.setattr(inst, "_frame", frame)
+    inst.acquire(background=True)
+    assert seen and not any(seen)                          # ни одного кадра фона при открытой шторке
+    assert inst.get_shutter() is True                      # после фона шторка снова открыта
+
+
+def test_background_refused_if_shutter_does_not_close(inst, monkeypatch):
+    import spectra_better.instrument as I
+    monkeypatch.setattr(I, "SHUTTER_CONFIRM_S", 0.5)
+    inst.settings.close_shutter_for_background = True
+    monkeypatch.setattr(inst.mono, "set_shutter", lambda is_open, index=0: None)     # «заела»
+    shots = []
+    monkeypatch.setattr(inst, "_frame", lambda acq: shots.append(1))
+    with pytest.raises(DeviceError, match="Шторка не закрылась"):
+        inst.acquire(background=True)
+    assert not shots and not inst.has_background()

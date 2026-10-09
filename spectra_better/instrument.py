@@ -41,6 +41,11 @@ TEMP_TOLERANCE_C = 1.0
 TEMP_STALL_S = 120.0
 # фон, снятый при другой температуре, не вычитается (темновой ток ~×2 на каждые 6–7 °C)
 BG_TEMP_TOLERANCE_C = 2.0
+# DevCtrl выполняет OpenShutter/CloseShutter асинхронно: команда уходит в очередь, а состояние
+# меняется, когда прибор ответит. Поэтому после команды ждём подтверждения (SwitchTimeout шторки
+# в MS7504_*.cfg — 2 с, плюс обмен по сети) и даём шторке доехать.
+SHUTTER_CONFIRM_S = 6.0
+SHUTTER_SETTLE_S = 0.3
 
 
 @dataclass
@@ -547,18 +552,25 @@ class Instrument:
         acq = self.acq_settings()
         t0 = time.monotonic()
         shutter_restore = None
-        if background and s.close_shutter_for_background and self.mono_connected:
+        close_shutter = background and s.close_shutter_for_background and self.mono_connected
+        if close_shutter:
             try:
                 prev = self.mono_thread.call(self.mono.get_shutter, 0, timeout=30)
-                self.mono_thread.call(self.mono.set_shutter, False, 0, timeout=30)
-                shutter_restore = prev if prev is not None else True
-                time.sleep(0.2)
             except (DeviceError, FutureTimeout) as e:
-                log.warning("Не удалось закрыть шторку для фона: %s", e)
+                raise DeviceError(f"Не удалось прочитать состояние шторки перед съёмкой фона: {e}") from e
+            shutter_restore = prev if prev is not None else True
         spectra: List[np.ndarray] = []
         frame = None
         sat = False
         try:
+            if close_shutter:
+                try:
+                    self._shutter_to(False)
+                except (DeviceError, FutureTimeout) as e:
+                    # фон при открытой шторке испортил бы все спектры после вычитания — не снимаем
+                    raise DeviceError(f"Шторка не закрылась, фон не снят: {e}. Закройте вход вручную и "
+                                      "снимите фон без шторки (Обработка → «закрывать шторку при съёмке "
+                                      "фона»).") from e
             for i in range(n):
                 if self._abort.is_set():
                     raise DeviceError("Остановлено пользователем")
@@ -572,7 +584,7 @@ class Instrument:
         finally:
             if shutter_restore is not None:
                 try:
-                    self.mono_thread.call(self.mono.set_shutter, shutter_restore, 0, timeout=30)
+                    self._shutter_to(shutter_restore)
                 except Exception as e:  # noqa: BLE001
                     log.warning("Не удалось вернуть шторку: %s", e)
         if progress:
@@ -742,7 +754,34 @@ class Instrument:
 
     def set_shutter(self, is_open: bool) -> None:
         self._require_mono(control=True)
-        self.mono_thread.call(self.mono.set_shutter, bool(is_open), 0, timeout=60)
+        self._shutter_to(is_open)
+
+    def _shutter_to(self, is_open: bool) -> bool:
+        """Переключить шторку и дождаться, пока прибор подтвердит новое состояние.
+
+        DevCtrl лишь ставит команду в очередь, и сразу после неё прибор сообщает ещё
+        прежнее состояние (из-за этого кнопка шторки «отставала» на одно нажатие, а фон
+        мог сниматься при открытой шторке). Возвращает True, если состояние подтверждено,
+        False — если прибор состояние не сообщает (тогда выждано SHUTTER_CONFIRM_S).
+        """
+        is_open = bool(is_open)
+        self.mono_thread.call(self.mono.set_shutter, is_open, 0, timeout=60)
+        deadline = time.monotonic() + SHUTTER_CONFIRM_S
+        while True:
+            time.sleep(0.05)            # поток монохроматора тем временем обрабатывает сообщения DevCtrl
+            state = self.mono_thread.call(self.mono.get_shutter, 0, timeout=30)
+            if state is not None and state == is_open:
+                time.sleep(SHUTTER_SETTLE_S)
+                log.info("Шторка %s", "открыта" if is_open else "закрыта")
+                return True
+            if time.monotonic() > deadline:
+                break
+        if state is None:
+            log.warning("Монохроматор не сообщает состояние шторки — команда «%s» не подтверждена",
+                        "открыть" if is_open else "закрыть")
+            return False
+        raise DeviceError(f"шторка не {'открылась' if is_open else 'закрылась'} за {SHUTTER_CONFIRM_S:.0f} с "
+                          f"(прибор сообщает: {'открыта' if state else 'закрыта'})")
 
     def get_shutter(self) -> Optional[bool]:
         self._require_mono()

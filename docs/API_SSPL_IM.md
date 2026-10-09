@@ -26,8 +26,16 @@
 | `GetSlitWidth` / `SetSlitWidth` | `int slit, double* мкм` / `int slit, double мкм` | 8 / 12 | Boolean |
 | `GetMirrorState` / `SetMirrorState` | `int mirror, int* pos` / `int mirror, int pos` | 8 / 8 | Boolean; pos 0 — «Top (CCD)», 1 — «Lateral (Slit)» |
 | `GetSignalSourceState` | `int shutter` | 4 | 0 — неизвестно, 1 — открыта (SSS_ON), 2 — закрыта (SSS_OFF) |
-| `SetSignalSourceState` | `int shutter, int state` | 8 | ≠0 — успех |
+| `SetSignalSourceState` | `int shutter, int state` | 8 | ≠0 — команда принята (не выполнена!), см. ниже |
 | `GetCalibrationByTurret` | `int turret, double centerWL, int centerPx, double pxWidth, int n, double* out` | 32 | ≠0 — успех; длины волн n пикселей по модели DevCtrl |
+
+**Шторка.** `SetSignalSourceState(0, 1)` вызывает `DevCtrl.OpenShutter`, `(0, 2)` — `CloseShutter`
+(SpectraSP перед фоном вызывает именно `(0, 2)`). `GetSignalSourceState` берёт `DevCtrl.GetShutterState`:
+внутреннее состояние `shOpen` → 1, `shClose` → 2; окно DevCtrl подписывает их «Shutter is opened» /
+«is closed». `OpenShutter`/`CloseShutter` лишь ставят команду в очередь окна DevCtrl, и состояние
+меняется после ответа прибора (время переключения — `SwitchTimeout` в `MS7504_*.cfg`, 2 с). Сразу
+после команды `GetSignalSourceState` возвращает ещё прежнее состояние, поэтому программа ждёт
+подтверждения (до 6 с), а фон без подтверждённо закрытой шторки не снимает.
 
 ### Сервисные функции (шаговые двигатели и окно DevCtrl)
 

@@ -119,7 +119,8 @@ def main(argv=None) -> int:
             for i in range(max(1, len(inst.mono.slits))):
                 R.step(f"Щель {i + 1}", lambda i=i: R(f"    {mono.get_slit(i):g} мкм"))
             R.step("Выходное зеркало", lambda: R(f"    положение {mono.get_mirror(0)}"))
-            R.step("Шторка", lambda: R(f"    {'открыта' if mono.get_shutter(0) else 'закрыта / неизвестно'}"))
+            R.step("Шторка", lambda: R("    " + {True: "открыта", False: "закрыта"}.get(mono.get_shutter(0),
+                                                                              "прибор не сообщает")))
             if args.goto is not None:
                 R.step(f"Переход на {args.goto} нм", lambda: mono.set_wavelength(args.goto, True, 600))
                 R.step("Длина волны после перехода", lambda: R(f"    {mono.get_wavelength():.4f} нм"))

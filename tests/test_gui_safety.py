@@ -212,3 +212,21 @@ def test_setpoint_change_stops_live_and_blocks_until_reached(win, app):
     win.inst.camera_state()
     win._update_actions()
     assert win.act_snap.isEnabled()
+
+
+def test_shutter_button_shows_confirmed_state(win, app):
+    btn = win.mono_panel.btn_shutter
+    win._refresh_mono_misc()
+    pump(app, 0.5)
+    assert btn.text().startswith("открыта")
+    btn.click()                                              # закрыть
+    t0 = time.monotonic()
+    while win._shutter_task and time.monotonic() - t0 < 10:
+        pump(app, 0.05)
+    assert btn.text().startswith("закрыта") and not btn.isChecked()
+    # шторку открыли в штатном окне DevCtrl — опрос показывает это на кнопке
+    win.inst.mono.shutter_open = True
+    for _ in range(2):
+        win._poll()
+        pump(app, 0.3)
+    assert btn.text().startswith("открыта") and btn.isChecked()

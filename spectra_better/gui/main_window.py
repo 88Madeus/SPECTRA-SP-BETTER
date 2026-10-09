@@ -49,6 +49,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._poll_cam = False
         self._poll_mono = False
         self._mono_was_busy = False
+        self._shutter_task = False     # идёт переключение шторки (опрос её не трогает)
+        self._poll_shutter = False
         self._mono_moving = False
         self._closing = False
         self._service_dlg = None
@@ -550,6 +552,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._mono_moving:
             t = self.inst.mono_thread.busy_for
             self.mono_panel.set_busy(True, f"движение… {t:.0f} с" if t else "движение…")
+        elif self.inst.mono_connected and self._poll_ticks % 2 == 0 and not self._shutter_task \
+                and not self._poll_shutter and not self._acquiring():
+            # шторку могут переключить и в штатном окне DevCtrl — кнопка должна показывать факт
+            self._poll_shutter = True
+
+            def done_s(state):
+                self._poll_shutter = False
+                if not self._shutter_task:
+                    self.mono_panel.set_shutter_value(state)
+            self.tasks.run(self.inst.get_shutter, done_s, lambda e: setattr(self, "_poll_shutter", False),
+                           "poll-shutter")
 
     # ================================================================ камера
     def cooling_on(self, target: int) -> None:
@@ -1192,10 +1205,20 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         def work():
-            self.inst.set_shutter(is_open)
+            self.inst.set_shutter(is_open)         # ждёт, пока прибор подтвердит новое состояние
             return self.inst.get_shutter()
-        self.tasks.run(work, self.mono_panel.set_shutter_value,
-                       lambda e: (self._error("Шторка", e), self.mono_panel.set_shutter_value(None)))
+
+        def done(state):
+            self._shutter_task = False
+            self.mono_panel.set_shutter_value(state)
+
+        def failed(e):
+            self._shutter_task = False
+            self._error("Шторка", e)
+            self._refresh_mono_misc()
+        self._shutter_task = True
+        self.mono_panel.btn_shutter.setText("шторка: открывается…" if is_open else "шторка: закрывается…")
+        self.tasks.run(work, done, failed)
 
     # ================================================================ настройки
     def calibration(self) -> None:

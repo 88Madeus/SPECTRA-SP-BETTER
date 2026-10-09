@@ -51,6 +51,9 @@ class SimMonochromator(Monochromator):
         self.slits = [50.0, 50.0]
         self.mirror = 0
         self.shutter_open = True
+        # как DevCtrl: команда шторки выполняется не сразу, до этого прибор сообщает прежнее состояние
+        self.shutter_delay = 0.4
+        self._shutter_cmd: Optional[tuple] = None      # (состояние, когда выполнится)
         # положения шаговых двигателей (для сервисного окна)
         self.steps = {(MECH_TURRET, 0): 9528, (MECH_SLIT, 0): 20, (MECH_SLIT, 1): 600,
                       (MECH_MIRROR, 0): 2124}
@@ -144,13 +147,20 @@ class SimMonochromator(Monochromator):
         self._req()
         self.mirror = int(position)
 
+    def _apply_shutter(self) -> None:
+        cmd = self._shutter_cmd
+        if cmd is not None and time.monotonic() >= cmd[1]:
+            self.shutter_open = cmd[0]
+            self._shutter_cmd = None
+
     def get_shutter(self, index: int = 0) -> Optional[bool]:
         self._req()
+        self._apply_shutter()
         return self.shutter_open
 
     def set_shutter(self, is_open: bool, index: int = 0) -> None:
         self._req()
-        self.shutter_open = bool(is_open)
+        self._shutter_cmd = (bool(is_open), time.monotonic() + self.shutter_delay * self.time_scale)
 
     def pixel_wavelengths(self, center_wl, center_pixel, pixel_width_um, n_pixels):
         g = self.geometries.get(self._grating)
@@ -291,6 +301,8 @@ class SimCamera(Camera):
         """Поток на столбец (отсчётов/с) для одной строки в центре полосы."""
         cols = np.arange(self.WIDTH, dtype=float)
         m = self.mono
+        if m is not None:
+            m._apply_shutter()                 # шторка «доехала», если её команда уже выполнилась
         if m is None or not m._open or not m.shutter_open or m.mirror != 0:
             return np.zeros(self.WIDTH)
         wl = m.geometries[m._grating].wavelengths(m._wl, self.true_center_pixel, self.PIXEL_UM, self.WIDTH)
