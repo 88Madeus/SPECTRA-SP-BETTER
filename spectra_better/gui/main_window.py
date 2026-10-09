@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Optional
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -16,11 +16,13 @@ from ..calibration import WavelengthAxis
 from ..config import COOLING_TARGET_DEFAULT_C, AppSettings
 from ..hw.base import SYNC_LOGICAL_1, WARM_UP_TARGET_C, DeviceError
 from ..hw.winutil import spectrasp_is_running
+from ..buffer import SpectrumBuffer
 from ..instrument import Instrument, Measurement
 from ..reference_lines import nearest_line
 from ..storage import load_spectrum, save_image, save_spectrum, unique_path
 from ..units import (X_DECIMALS, X_EV, X_NM, X_PX, X_RAMAN, X_SHORT, X_UNITS, X_WAVENUMBER, AxisMap, from_nm,
                      is_spectral)
+from .buffer_panel import BufferPanel, entry_color
 from .dialogs import BusyDialog, CalibrationDialog, PanoramaDialog, SeriesDialog, SettingsDialog
 from .icons import gear_icon
 from .log_widget import LogView, QtLogHandler
@@ -41,8 +43,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.emitter = Emitter()
         self.current: Optional[Measurement] = None
         self.background: Optional[Measurement] = None
-        self.overlays: Dict[str, Measurement] = {}
-        self._overlay_seq = 0
+        self.buffer = SpectrumBuffer()
+        try:
+            n = self.buffer.load_state(self._buffer_path())
+            if n:
+                log.info("Буфер спектров: загружено %d спектр(ов) с прошлого сеанса", n)
+        except (OSError, ValueError, KeyError) as e:
+            log.warning("Буфер спектров прошлого сеанса не прочитан: %s", e)
         self._acq_thread: Optional[threading.Thread] = None
         self._acq_stop = threading.Event()
         self._acq_kind = ""
@@ -115,9 +122,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_pano = act("Панорама…", SP.SP_ArrowRight, None, "Спектр широкого диапазона со сшивкой")
         self.act_save = act("Сохранить спектр…", SP.SP_DialogSaveButton, "Ctrl+S", "Сохранить текущий спектр")
         self.act_save_img = act("Сохранить кадр…", None, None, "Сохранить изображение ПЗС")
-        self.act_open = act("Открыть спектр…", SP.SP_DialogOpenButton, "Ctrl+O", "Загрузить спектр для наложения")
-        self.act_pin = act("Закрепить", SP.SP_DialogYesButton, "Ctrl+D", "Оставить текущий спектр на графике для сравнения")
-        self.act_clear = act("Очистить наложения", SP.SP_TrashIcon, None, "Убрать все наложенные спектры")
+        self.act_open = act("Открыть спектр…", SP.SP_DialogOpenButton, "Ctrl+O",
+                            "Загрузить спектры из файлов в буфер для сравнения")
+        self.act_pin = act("В буфер", SP.SP_DialogYesButton, "Ctrl+D",
+                           "Положить текущий спектр в буфер спектров — для сравнения с другими")
+        self.act_clear = act("Очистить буфер", SP.SP_TrashIcon, None, "Удалить все спектры из буфера")
         self.act_autorange = act("Весь спектр", SP.SP_TitleBarMaxButton, "Ctrl+A",
                                  "Показать весь спектр по X и подобрать масштаб по Y")
         self.act_calib = act("Калибровка шкалы…", None, None, "Центральный пиксель, модель, поправка по реперным линиям")
@@ -195,18 +204,19 @@ class MainWindow(QtWidgets.QMainWindow):
         hh.setStretchLastSection(True)
         self.peaks_table.verticalHeader().setVisible(False)
         self.peaks_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        rv.addWidget(self.peaks_table, 2)
-        rv.addWidget(QtWidgets.QLabel("Наложенные спектры:"))
-        self.overlay_list = QtWidgets.QListWidget()
-        self.overlay_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        rv.addWidget(self.overlay_list, 1)
-        self.btn_overlay_del = QtWidgets.QPushButton("Убрать выбранные")
-        rv.addWidget(self.btn_overlay_del)
+        rv.addWidget(self.peaks_table, 1)
         right.setMinimumWidth(330)
         rdock = QtWidgets.QDockWidget("Анализ", self)
         rdock.setObjectName("dock_analysis")
         rdock.setWidget(right)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, rdock)
+        self.buffer_panel = BufferPanel(self.buffer)
+        self.buffer_panel.auto.setChecked(self.s.buffer_auto)
+        bdock = QtWidgets.QDockWidget("Буфер спектров", self)
+        bdock.setObjectName("dock_buffer")
+        bdock.setWidget(self.buffer_panel)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, bdock)
+        self.splitDockWidget(rdock, bdock, QtCore.Qt.Vertical)
 
         # снизу — журнал
         self.log_view = LogView(log_handler)
@@ -247,14 +257,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_save_img.triggered.connect(self.save_frame)
         self.act_open.triggered.connect(self.open_spectrum)
         self.act_pin.triggered.connect(self.pin_current)
-        self.act_clear.triggered.connect(self.clear_overlays)
+        self.act_clear.triggered.connect(self.buffer_panel._ask_clear)
         self.act_autorange.triggered.connect(self.plot.show_all)
         self.plot.units_changed.connect(self._display_settings_changed)
         self.act_calib.triggered.connect(self.calibration)
         self.act_settings.triggered.connect(self.settings_dialog)
         self.act_about.triggered.connect(self.about)
         self.act_exit.triggered.connect(self.close)
-        self.btn_overlay_del.clicked.connect(self.remove_selected_overlays)
+        bp = self.buffer_panel
+        bp.changed.connect(self._redraw)
+        bp.add_current.connect(self.pin_current)
+        bp.load_files.connect(self.open_spectrum)
+        bp.save_entries.connect(self.save_buffer_entries)
+        bp.make_current.connect(self.buffer_to_current)
+        bp.auto.toggled.connect(lambda on: setattr(self.s, "buffer_auto", on))
 
         self.cam_panel.cooling_on.connect(self.cooling_on)
         self.cam_panel.cooling_off.connect(self.cooling_off)
@@ -972,6 +988,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._redraw()
             return
         self.current = m
+        kind = self._acq_kind
+        if self.buffer_panel.auto.isChecked() and (kind in ("snap", "series") or (kind == "panorama" and m.stitched)):
+            e = self.buffer.add(m)
+            self.buffer_panel.refresh()
+            self.buffer_panel.select(e.key)
         if m.image is not None:
             self._image_meas = m
             self.image.set_image(m.image)
@@ -986,7 +1007,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _redraw(self) -> None:
         m = self.current
-        ref = m if m is not None else next(iter(self.overlays.values()), None)
+        ref = m if m is not None else next((e.m for e in self.buffer.visible()), None)
         amap, unit = self._scale_for(ref)
         laser = self.s.laser_nm
         # у сшитой панорамы «пиксель» — это номер точки, а не пиксель ПЗС
@@ -1002,18 +1023,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                      self.proc_panel.show_bg.isChecked())
         else:
             self.plot.set_background(None, None, False)
-        hidden = set()
-        for key, om in self.overlays.items():
-            ox = self._x_in(om, unit, laser)
-            self.plot.update_overlay(key, ox, om.y)
-            if ox is None:
-                hidden.add(key)
-        for i in range(self.overlay_list.count()):
-            item = self.overlay_list.item(i)
-            off = item.data(QtCore.Qt.UserRole) in hidden
-            item.setForeground(QtGui.QColor("#999" if off else "#000"))
-            item.setToolTip(f"Спектр только в пикселях — в единицах «{X_UNITS.get(unit, unit)}» не показывается"
-                            if off else "")
+        self._draw_buffer(unit, laser)
         if ref is not None:
             self.plot.set_info(*self._coverage_text(ref, amap, unit))
         self.plot.refresh_view()
@@ -1050,35 +1060,73 @@ class MainWindow(QtWidgets.QMainWindow):
         self._redraw()
         self._update_bg_status()
 
-    # ================================================================ наложения
+    # ================================================================ буфер спектров
+    def _buffer_path(self) -> str:
+        base = getattr(self.s, "_path", None) or AppSettings.default_path()
+        return os.path.join(os.path.dirname(os.path.abspath(base)), "buffer.npz")
+
+    def _draw_buffer(self, unit: str, laser: float) -> None:
+        """Отмеченные спектры буфера — поверх текущего, каждый своим постоянным цветом."""
+        shown = {e.key: e for e in self.buffer.visible()}
+        for key in list(self.plot.overlays):
+            if key not in shown:
+                self.plot.remove_overlay(key)
+        hidden = set()
+        for key, e in shown.items():
+            x = self._x_in(e.m, unit, laser)
+            item = self.plot.overlays.get(key)
+            if item is None or item.name() != e.name:
+                self.plot.add_overlay(key, x, e.m.y, e.name, entry_color(e))
+            else:
+                self.plot.update_overlay(key, x, e.m.y)
+            if x is None:
+                hidden.add(key)
+        self.buffer_panel.mark_unavailable(
+            hidden, f"Спектр только в пикселях — в единицах «{X_UNITS.get(unit, unit)}» не показывается")
+
     def pin_current(self) -> None:
+        """Положить текущий спектр в буфер."""
         if self.current is None:
             return
-        self._add_overlay(self.current, self.current.label or f"{self.current.timestamp:%H:%M:%S}")
-
-    def _add_overlay(self, m: Measurement, name: str) -> None:
-        self._overlay_seq += 1
-        key = f"ov{self._overlay_seq}"
-        self.overlays[key] = m
-        self.plot.add_overlay(key, None, m.y, name)
-        item = QtWidgets.QListWidgetItem(name)
-        item.setData(QtCore.Qt.UserRole, key)
-        self.overlay_list.addItem(item)
+        e = self.buffer.add(self.current)
+        self.buffer_panel.refresh()
+        self.buffer_panel.select(e.key)
         self._redraw()
+        log.info("В буфер: %s", e.name)
 
-    def remove_selected_overlays(self) -> None:
-        for item in self.overlay_list.selectedItems():
-            key = item.data(QtCore.Qt.UserRole)
-            self.plot.remove_overlay(key)
-            self.overlays.pop(key, None)
-            self.overlay_list.takeItem(self.overlay_list.row(item))
+    def buffer_to_current(self, key: str) -> None:
+        """Сделать спектр из буфера текущим (пики, сохранение, «В буфер» под другим именем)."""
+        e = self.buffer.get(key)
+        if e is None or self._acquiring():
+            return
+        self.current = e.m
         self._redraw()
+        self.lbl_meas.setText(f"Из буфера: {e.name}")
+        self._update_actions()
+
+    def save_buffer_entries(self, keys: list) -> None:
+        entries = [e for e in (self.buffer.get(k) for k in keys) if e is not None]
+        if not entries:
+            return
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, f"Папка для {len(entries)} спектр(ов) из буфера",
+                                                       self.s.save_dir or os.path.expanduser("~"))
+        if not d:
+            return
+        bad = '<>:"/\\|?*'
+        for e in entries:
+            stem = "".join("_" if c in bad else c for c in e.name).strip() or e.key
+            path = unique_path(d, stem, self.s.save_format)
+            try:
+                self._save_measurement(path, e.m)
+            except OSError as err:
+                self._error("Сохранение буфера", err)
+                return
+        log.info("Сохранено спектров из буфера: %d → %s", len(entries), d)
+        self.statusBar().showMessage(f"Сохранено {len(entries)} спектр(ов) в {d}", 6000)
 
     def clear_overlays(self) -> None:
-        self.plot.clear_overlays()
-        self.overlays.clear()
-        self.overlay_list.clear()
-        self._redraw()
+        """Очистить буфер (без вопроса — для программного вызова)."""
+        self.buffer_panel.clear()
 
     def open_spectrum(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -1092,7 +1140,11 @@ class MainWindow(QtWidgets.QMainWindow):
             first = header[0].lower() if header else ""
             is_px = "pixel" in first or "пиксел" in first or not (100 < float(np.median(x)) < 5000)
             m = Measurement(x=x, x_unit=X_PX if is_px else X_NM, y=y, raw=y, label=os.path.basename(path))
-            self._add_overlay(m, os.path.basename(path))
+            props = {str(k): str(v) for k, v in meta.items()}
+            props["source_file"] = path
+            self.buffer.add(m, os.path.basename(path), props=props)
+            self.buffer_panel.refresh()
+            self._redraw()
             log.info("Загружен спектр %s (%d точек)", path, x.size)
 
     # ================================================================ сохранение
@@ -1326,6 +1378,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.s.save()
         except OSError as e:
             log.warning("Настройки не сохранены: %s", e)
+        try:
+            self.buffer.save_state(self._buffer_path())
+        except OSError as e:
+            log.warning("Буфер спектров не сохранён: %s", e)
         if self.inst.camera_connected or self.inst.mono_connected:
             r = QtWidgets.QMessageBox.question(self, APP_NAME, "Отключить приборы и выйти?")
             if r != QtWidgets.QMessageBox.Yes:

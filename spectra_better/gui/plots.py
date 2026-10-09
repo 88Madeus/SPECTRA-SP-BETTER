@@ -439,9 +439,10 @@ class SpectrumPlot(QtWidgets.QWidget):
             self.legend.removeItem(self.bg_curve)
             self._bg_in_legend = False
 
-    def add_overlay(self, key: str, x: Optional[np.ndarray], y: np.ndarray, name: str) -> None:
+    def add_overlay(self, key: str, x: Optional[np.ndarray], y: np.ndarray, name: str,
+                    color: Optional[str] = None) -> None:
         self.remove_overlay(key)
-        color = OVERLAY_COLORS[len(self.overlays) % len(OVERLAY_COLORS)]
+        color = color or OVERLAY_COLORS[len(self.overlays) % len(OVERLAY_COLORS)]
         self.overlays[key] = self.plot.plot([], [], pen=pg.mkPen(color, width=1.1), name=name)
         self.update_overlay(key, x, y)
 

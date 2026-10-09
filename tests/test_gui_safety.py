@@ -7,6 +7,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 QtWidgets = pytest.importorskip("PyQt5.QtWidgets")
+from PyQt5 import QtCore  # noqa: E402
 
 from spectra_better.config import AppSettings  # noqa: E402
 from spectra_better.hw.base import CameraState  # noqa: E402
@@ -251,3 +252,41 @@ def test_shutter_mode_selector(win, app):
         pump(app, 0.05)
     pump(app, 0.5)
     assert not win.inst.shutter_ttl and panel.btn_shutter.isEnabled()
+
+
+def _snap(win, app):
+    win.snap()
+    t0 = time.monotonic()
+    while win._acquiring() and time.monotonic() - t0 < 20:
+        pump(app, 0.05)
+    pump(app, 0.2)
+
+
+def test_spectrum_buffer_in_window(win, app):
+    bp = win.buffer_panel
+    win.clear_overlays()
+    _snap(win, app)
+    win.act_pin.trigger()                                    # «В буфер»
+    assert len(win.buffer) == 1 and bp.list.count() == 1
+    key = win.buffer.entries[0].key
+    assert key in win.plot.overlays and win.plot.overlays[key].isVisible()
+    bp.list.item(0).setCheckState(QtCore.Qt.Unchecked)       # снять отметку — спектр уходит с графика
+    assert key not in win.plot.overlays
+    bp.list.item(0).setText("эталон")                        # переименование
+    assert win.buffer.entries[0].name == "эталон"
+    bp.auto.setChecked(True)                                 # каждый снимок — в буфер
+    _snap(win, app)
+    assert len(win.buffer) == 2 and win.s.buffer_auto
+    win.live()                                               # кадры непрерывной съёмки — нет
+    pump(app, 0.8)
+    win.stop()
+    t0 = time.monotonic()
+    while win._acquiring() and time.monotonic() - t0 < 20:
+        pump(app, 0.05)
+    assert len(win.buffer) == 2
+    win.buffer_to_current(key)                               # «сделать текущим»
+    assert win.current is win.buffer.get(key).m
+    win.buffer.save_state(win._buffer_path())                # переживает перезапуск
+    from spectra_better.buffer import SpectrumBuffer
+    again = SpectrumBuffer()
+    assert again.load_state(win._buffer_path()) == 2 and again.entries[0].name == "эталон"
