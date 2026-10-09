@@ -23,7 +23,7 @@ import numpy as np
 
 from ..calibration import geometries_from_config
 from ..hw.base import DeviceError, spectrum_region, full_frame_region, AcqSettings
-from ..hw.winutil import PYTHON_BITS, spectrasp_is_running
+from ..hw.winutil import IS_WINDOWS, PYTHON_BITS, present_as_spectrasp, spectrasp_is_running
 from ..spectrasp_config import find_spectrasp_dir, read_installation
 from ..storage import save_image, save_spectrum
 
@@ -99,6 +99,10 @@ def main(argv=None) -> int:
         R("ОСТАНОВЛЕНО: запущена SpectraSP/DevCtrl. Закройте её и запустите проверку снова.")
         R.save()
         return 3
+    if IS_WINDOWS:
+        # драйверы ищут psi_ccd5.dll и DevCtrl.dll рядом с «программой» — она должна быть в каталоге SpectraSP
+        ok = present_as_spectrasp(directory)
+        R(f"  путь программы для драйверов: {os.path.join(directory, 'SpectraSP.exe') if ok else 'НЕ ПОДМЕНЁН'}")
     if PYTHON_BITS != 32:
         R("ВНИМАНИЕ: нужен 32-битный Python (драйверы 32-битные).")
 

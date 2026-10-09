@@ -62,14 +62,84 @@ def stdcall_function(dll, name: str, restype, argtypes: Iterable, arg_bytes: int
     return fn
 
 
-class DllDirectory:
-    """Контекст: добавляет каталог SpectraSP в пути поиска DLL и делает его текущим.
+HOST_EXE = "SpectraSP.exe"
+_host_path_buf = None       # строка с подменённым путём программы должна жить до конца процесса
 
-    Драйверы подгружают зависимые библиотеки по короткому имени
-    (psi_ccd5.dll, DevCtrl.dll, SOLCon.DLL), поэтому каталог должен быть виден.
-    Текущий каталог процесса остаётся каталогом SpectraSP (как у самой
-    SpectraSP): программа везде использует абсолютные пути, а восстановление
-    каталога из двух параллельных потоков подключения было бы гонкой.
+
+def _module_file_name(module=None) -> str:
+    buf = ctypes.create_unicode_buffer(32768)
+    n = ctypes.WinDLL("kernel32").GetModuleFileNameW(module, buf, len(buf))
+    return buf.value[:n]
+
+
+def present_as_spectrasp(directory: str) -> bool:
+    """Сделать так, чтобы драйверы видели программу лежащей в каталоге SpectraSP.
+
+    Драйверы ищут свои библиотеки не рядом с собой, а рядом с запущенной
+    программой — по GetModuleFileName(NULL) (в Delphi — ParamStr(0)):
+    psi_ccd2_ver*.dll грузит «<каталог программы>\\psi_ccd5.dll», SSPL_IM.dll —
+    «<каталог программы>\\DevCtrl.dll». У SpectraSP это её собственный каталог,
+    а у нас — каталог python.exe, и инициализация обоих приборов не проходит
+    («Failed to load psi_ccd5.dll», «SSPL_IM.Init вернула ошибку»).
+
+    Поэтому в записи загрузчика Windows о главном модуле процесса путь
+    заменяется на «<каталог SpectraSP>\\SpectraSP.exe» — ровно то, что драйверы
+    получают, работая внутри SpectraSP (и все их файлы — ini, cfg, журналы —
+    оказываются там же, где были). Сам python.exe и его файлы не меняются;
+    Python и Qt уже запущены и свои пути к этому моменту определили.
+    """
+    global _host_path_buf
+    if not IS_WINDOWS:
+        return False
+    fake = os.path.join(os.path.abspath(directory), HOST_EXE)
+    if os.path.normcase(_module_file_name()) == os.path.normcase(fake):
+        return True
+    from ctypes import wintypes
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT),
+                    ("Buffer", ctypes.c_void_p)]
+
+    ntdll = ctypes.WinDLL("ntdll")
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+    exe_base = kernel32.GetModuleHandleW(None)
+    entry = ctypes.c_void_p()
+    ntdll.LdrFindEntryForAddress.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    if ntdll.LdrFindEntryForAddress(ctypes.c_void_p(exe_base), ctypes.byref(entry)) != 0 or not entry.value:
+        log.warning("Не удалось найти запись загрузчика о главном модуле")
+        return False
+    # LDR_DATA_TABLE_ENTRY: три LIST_ENTRY, DllBase, EntryPoint, SizeOfImage, затем FullDllName
+    ptr = ctypes.sizeof(ctypes.c_void_p)
+    full_name = UNICODE_STRING.from_address(entry.value + 6 * ptr + 3 * ptr)
+    if ctypes.c_void_p.from_address(entry.value + 6 * ptr).value != exe_base:
+        log.warning("Неожиданная структура записи загрузчика — путь программы не подменён")
+        return False
+    old = _module_file_name()
+    buf = ctypes.create_unicode_buffer(fake, len(fake) + 1)
+    _host_path_buf = buf
+    full_name.Length = 0                       # сначала обнулить длину: чтение в момент записи безопасно
+    full_name.Buffer = ctypes.addressof(buf)
+    full_name.MaximumLength = (len(fake) + 1) * 2
+    full_name.Length = len(fake) * 2
+    now = _module_file_name()
+    if os.path.normcase(now) != os.path.normcase(fake):
+        log.warning("Путь программы для драйверов не подменился: %s", now)
+        return False
+    log.info("Для драйверов программа представлена как %s (был %s)", fake, old)
+    return True
+
+
+class DllDirectory:
+    """Контекст: готовит процесс к загрузке драйверов из каталога SpectraSP.
+
+    Драйверы подгружают зависимые библиотеки из каталога программы
+    (см. present_as_spectrasp) и по короткому имени (SOLCon.DLL и др.),
+    поэтому каталог SpectraSP становится «каталогом программы», добавляется
+    в пути поиска DLL и делается текущим. Текущий каталог остаётся каталогом
+    SpectraSP (как у самой SpectraSP): программа везде использует абсолютные
+    пути, а восстановление каталога из двух параллельных потоков подключения
+    было бы гонкой.
     """
 
     def __init__(self, path: str):
@@ -81,6 +151,7 @@ class DllDirectory:
             raise DeviceError(f"Не найден каталог SpectraSP: {self.path}")
         os.chdir(self.path)
         if IS_WINDOWS:
+            present_as_spectrasp(self.path)
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             kernel32.SetDllDirectoryW(self.path)
             if hasattr(os, "add_dll_directory"):
