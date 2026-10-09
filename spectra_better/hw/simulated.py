@@ -40,6 +40,8 @@ class SimMonochromator(Monochromator):
             self.info.mirror_positions = ["Верх (ПЗС)", "Боковой (щель)"]
         self.info.model = self.info.model or "MS7504i (имитация)"
         self.info.serial = self.info.serial or "SIM"
+        if info is None:
+            self.info.shutter_ttl = True
         self.speed = speed_nm_s
         self.time_scale = time_scale
         self._lock = threading.Lock()
@@ -54,6 +56,7 @@ class SimMonochromator(Monochromator):
         # как DevCtrl: команда шторки выполняется не сразу, до этого прибор сообщает прежнее состояние
         self.shutter_delay = 0.4
         self._shutter_cmd: Optional[tuple] = None      # (состояние, когда выполнится)
+        self.shutter_ttl = False         # шторку открывает сигнал экспозиции камеры
         # положения шаговых двигателей (для сервисного окна)
         self.steps = {(MECH_TURRET, 0): 9528, (MECH_SLIT, 0): 20, (MECH_SLIT, 1): 600,
                       (MECH_MIRROR, 0): 2124}
@@ -161,6 +164,12 @@ class SimMonochromator(Monochromator):
     def set_shutter(self, is_open: bool, index: int = 0) -> None:
         self._req()
         self._shutter_cmd = (bool(is_open), time.monotonic() + self.shutter_delay * self.time_scale)
+
+    def set_shutter_ttl(self, on: bool, index: int = 0) -> None:
+        self._req()
+        if not self.info.shutter_ttl:
+            raise DeviceError("Шторка не поддерживает управление по TTL")
+        self.shutter_ttl = bool(on)
 
     def pixel_wavelengths(self, center_wl, center_pixel, pixel_width_um, n_pixels):
         g = self.geometries.get(self._grating)
@@ -303,7 +312,10 @@ class SimCamera(Camera):
         m = self.mono
         if m is not None:
             m._apply_shutter()                 # шторка «доехала», если её команда уже выполнилась
-        if m is None or not m._open or not m.shutter_open or m.mirror != 0:
+        # в режиме TTL шторку на время кадра открывает импульс экспозиции с выхода камеры (режимы 0/1 — EXP)
+        ttl_open = m is not None and m.shutter_ttl and any(mode in (0, 1) for mode in self._sync)
+        if m is None or not m._open or not (ttl_open or (m.shutter_open and not m.shutter_ttl)) \
+                or m.mirror != 0:
             return np.zeros(self.WIDTH)
         wl = m.geometries[m._grating].wavelengths(m._wl, self.true_center_pixel, self.PIXEL_UM, self.WIDTH)
         disp = abs(wl[-1] - wl[0]) / (self.WIDTH - 1)

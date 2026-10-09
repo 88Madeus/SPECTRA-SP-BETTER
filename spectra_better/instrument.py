@@ -25,7 +25,8 @@ from .calibration import WavelengthAxis, geometries_from_config
 from .config import ACQ_IMAGE, ACQ_SPECTRUM, AppSettings
 from .hw.base import (MECH_GRATING, MECH_MIRROR, MECH_SLIT, MECH_TITLES, MECH_TURRET, AcqSettings, Camera,
                       CameraInfo, CameraState, DeviceError, GratingInfo, Monochromator, MonoInfo,
-                      SYNC_LOGICAL_0, SYNC_LOGICAL_1, SYNC_OUT_MODES, full_frame_region, spectrum_region,
+                      SYNC_EXPOSURE_MODES, SYNC_LOGICAL_0, SYNC_LOGICAL_1, SYNC_OUT_MODES, full_frame_region,
+                      spectrum_region,
                       warm_up_camera)
 from .hw.worker import DeviceThread
 from .spectrasp_config import InstalledSetup, find_spectrasp_dir, read_installation
@@ -120,6 +121,7 @@ class Instrument:
         self.last_state: Optional[CameraState] = None
         self._mono_exclusive: Optional[Tuple[str, int]] = None     # (кто, поток) — см. mono_exclusive()
         self.shutter_state: Optional[bool] = None     # последнее известное состояние шторки (True — открыта)
+        self.shutter_ttl: Optional[bool] = None       # режим шторки в приборе: True — по экспозиции (TTL)
         self._shutter_warned = False
         self.cooling_target: Optional[int] = None    # уставка, заданная в этом сеансе (None — выкл./неизвестна)
         self._temp_hist: deque = deque(maxlen=400)   # (время, температура ПЗС) — для «уставка недостижима»
@@ -222,6 +224,7 @@ class Instrument:
             info.slits = list(mc.slits)
             info.mirror_positions = list(mc.mirror_positions)
             info.has_shutter = mc.has_shutter
+            info.shutter_ttl = mc.shutter_ttl
             info.step_limits = dict(mc.step_limits)
             info.slit_max_um = list(mc.slit_max_um)
         return info
@@ -263,7 +266,23 @@ class Instrument:
         except FutureTimeout:
             raise DeviceError("Монохроматор не ответил при подключении") from None
         self.refresh_mono()
+        self._apply_shutter_mode()
         return info
+
+    def _apply_shutter_mode(self) -> None:
+        """Режим шторки (ручной / по экспозиции) хранится в самом приборе — после подключения
+        выставляем выбранный в программе, чтобы он был известен наверняка."""
+        self.shutter_ttl = None
+        if not (self.mono.info.has_shutter and self.mono.info.shutter_ttl):
+            self.shutter_ttl = False
+            return
+        want = bool(self.settings.shutter_ttl)
+        try:
+            self.mono_thread.call(self.mono.set_shutter_ttl, want, 0, timeout=60)
+            self.shutter_ttl = want
+            log.info("Шторка: %s", "по экспозиции (TTL)" if want else "ручное управление")
+        except (DeviceError, FutureTimeout) as e:
+            log.warning("Не удалось выставить режим шторки: %s", e)
 
     def refresh_mono(self) -> None:
         if not self.mono_connected:
@@ -347,6 +366,7 @@ class Instrument:
         """В потоке монохроматора: дождаться конца движения и штатно закрыть DevCtrl."""
         m = self.mono
         self.shutter_state = None
+        self.shutter_ttl = None
         if m.is_open:
             try:
                 if m.is_busy():
@@ -554,7 +574,7 @@ class Instrument:
         self._abort.clear()
         acq = self.acq_settings()
         t0 = time.monotonic()
-        if not background and self.mono_connected and self.shutter_state is False:
+        if not background and self.mono_connected and not self.shutter_ttl and self.shutter_state is False:
             # закрытая шторка сохраняется между сеансами (и в SpectraSP) — сигнал тогда только темновой
             if not self._shutter_warned:
                 log.warning("Входная шторка монохроматора закрыта — на ПЗС попадает только темновой "
@@ -563,7 +583,18 @@ class Instrument:
         elif self.shutter_state:
             self._shutter_warned = False
         shutter_restore = None
+        ttl_restore = False
         close_shutter = background and s.close_shutter_for_background and self.mono_connected
+        if background and self.mono_connected and self.shutter_ttl:
+            # по TTL шторка открылась бы на время каждого кадра фона — на фон переводим её на ручное
+            # управление (закрытой), потом возвращаем режим по экспозиции
+            try:
+                self.mono_thread.call(self.mono.set_shutter_ttl, False, 0, timeout=60)
+            except (DeviceError, FutureTimeout) as e:
+                raise DeviceError(f"Не удалось перевести шторку на ручное управление для фона: {e}") from e
+            self.shutter_ttl = False
+            ttl_restore = True
+            close_shutter = True
         if close_shutter:
             try:
                 prev = self.mono_thread.call(self.mono.get_shutter, 0, timeout=30)
@@ -593,7 +624,13 @@ class Instrument:
                 sat = sat or P.saturated(frame)
                 spectra.append(self._frame_to_spectrum(frame, acq))
         finally:
-            if shutter_restore is not None:
+            if ttl_restore:
+                try:
+                    self.mono_thread.call(self.mono.set_shutter_ttl, True, 0, timeout=60)
+                    self.shutter_ttl = True
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Не удалось вернуть шторку в режим по экспозиции: %s", e)
+            elif shutter_restore is not None:
                 try:
                     self._shutter_to(shutter_restore)
                 except Exception as e:  # noqa: BLE001
@@ -765,7 +802,37 @@ class Instrument:
 
     def set_shutter(self, is_open: bool) -> None:
         self._require_mono(control=True)
+        if self.shutter_ttl:
+            raise DeviceError("Шторка работает по экспозиции (TTL) — чтобы открыть или закрыть её вручную, "
+                              "переключите режим шторки на «вручную»")
         self._shutter_to(is_open)
+
+    def set_shutter_ttl(self, on: bool) -> None:
+        """Шторка по экспозиции: открывается импульсом с выхода синхронизации камеры только на время
+        кадра (как кнопка «TTL» в окне DevCtrl). False — ручное управление («Internal»)."""
+        self._require_mono(control=True)
+        if not (self.mono.info.has_shutter and self.mono.info.shutter_ttl):
+            raise DeviceError("Шторка этого монохроматора не управляется по TTL (в MS*.cfg нет TTL=1)")
+        on = bool(on)
+        self.mono_thread.call(self.mono.set_shutter_ttl, on, 0, timeout=60)
+        self.shutter_ttl = on
+        self.settings.shutter_ttl = on
+        self.shutter_state = None
+        if on:
+            log.info("Шторка: по экспозиции (TTL) — открывается только на время кадра")
+            if self.camera_connected and not self.exposure_sync_output():
+                log.warning("Ни один выход синхронизации камеры не выдаёт сигнал экспозиции (режим EXP). "
+                            "Шторка по TTL откроется, только если на её вход заведён такой выход — "
+                            "в SpectraSP это выход 1 в режиме 0 «EXP».")
+        else:
+            log.info("Шторка: ручное управление")
+
+    def exposure_sync_output(self) -> int:
+        """Номер выхода синхронизации камеры, выдающего импульс экспозиции (0 — такого нет)."""
+        for n in (1, 2):
+            if self.sync_out_setting(n) in SYNC_EXPOSURE_MODES:
+                return n
+        return 0
 
     def _shutter_to(self, is_open: bool) -> bool:
         """Переключить шторку и дождаться, пока прибор подтвердит новое состояние.

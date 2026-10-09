@@ -230,3 +230,24 @@ def test_shutter_button_shows_confirmed_state(win, app):
         win._poll()
         pump(app, 0.3)
     assert btn.text().startswith("открыта") and btn.isChecked()
+
+
+def test_shutter_mode_selector(win, app):
+    panel = win.mono_panel
+    assert panel.shutter_mode.isEnabled() and panel.shutter_mode.currentData() is False
+    panel.shutter_mode.setCurrentIndex(1)
+    panel.shutter_mode.activated.emit(1)                     # «по экспозиции»
+    t0 = time.monotonic()
+    while (win._shutter_task or not win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
+        pump(app, 0.05)
+    assert win.inst.shutter_ttl and not panel.btn_shutter.isEnabled()
+    assert "время кадра" in panel.btn_shutter.text()
+    win._update_actions()                                    # общая разблокировка панели не включает кнопку
+    assert not panel.btn_shutter.isEnabled()
+    panel.shutter_mode.setCurrentIndex(0)
+    panel.shutter_mode.activated.emit(0)
+    t0 = time.monotonic()
+    while (win._shutter_task or win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
+        pump(app, 0.05)
+    pump(app, 0.5)
+    assert not win.inst.shutter_ttl and panel.btn_shutter.isEnabled()

@@ -208,6 +208,9 @@ class MonoServiceDialog(QtWidgets.QDialog):
         on = not self._busy and not self._lock_reason
         for w in self._controls:
             w.setEnabled(on and w not in self._locked_controls)
+        if self.inst.shutter_ttl:                   # по TTL шторку открывает камера, вручную — нельзя
+            self.btn_sh_open.setEnabled(False)
+            self.btn_sh_close.setEnabled(False)
         self.btn_refresh.setEnabled(not self._busy)
 
     def set_locked(self, reason: str) -> None:
@@ -288,7 +291,14 @@ class MonoServiceDialog(QtWidgets.QDialog):
 
     def _show(self, snap: Dict[str, object]) -> None:
         sh = snap.get("shutter")
-        self.lbl_shutter.setText({True: "открыта", False: "закрыта"}.get(sh, "неизвестно"))
+        if self.inst.shutter_ttl:
+            self.lbl_shutter.setText("по экспозиции (TTL)")
+        else:
+            self.lbl_shutter.setText({True: "открыта", False: "закрыта"}.get(sh, "неизвестно"))
+        for b in (self.btn_sh_open, self.btn_sh_close):
+            b.setToolTip("Шторка работает по экспозиции — переключите её на «вручную» на панели монохроматора"
+                         if self.inst.shutter_ttl else "")
+        self._apply_enabled()
         mirror = snap.get("mirror")
         if mirror is not None and self.mirror_group.button(mirror) is not None:
             self.mirror_group.button(mirror).setChecked(True)

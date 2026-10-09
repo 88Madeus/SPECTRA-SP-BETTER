@@ -267,6 +267,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mono_panel.slit.connect(self.set_slit)
         self.mono_panel.mirror.connect(self.set_mirror)
         self.mono_panel.shutter.connect(self.set_shutter)
+        self.mono_panel.shutter_ttl.connect(self.set_shutter_ttl)
         self.proc_panel.changed.connect(self._display_settings_changed)
         self.proc_panel.take_background.connect(self.take_background)
         self.proc_panel.reset_background.connect(self.reset_background)
@@ -396,9 +397,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _mono_connected(self, info) -> None:
         log.info("Монохроматор подключён: %s № %s", info.model, info.serial)
         self.mono_panel.set_info(info, self.inst.mono_address())
+        self._show_shutter_mode()
         self._update_mono_view()
         self._update_actions()
         self._refresh_mono_misc()
+
+    def _show_shutter_mode(self) -> None:
+        m = self.inst.mono
+        available = bool(m is not None and m.info.has_shutter and m.info.shutter_ttl)
+        self.mono_panel.set_shutter_mode(self.inst.shutter_ttl, available)
 
     def _refresh_mono_misc(self) -> None:
         """Прочитать положение зеркала, шторки и ширину щели для панели монохроматора."""
@@ -553,6 +560,7 @@ class MainWindow(QtWidgets.QMainWindow):
             t = self.inst.mono_thread.busy_for
             self.mono_panel.set_busy(True, f"движение… {t:.0f} с" if t else "движение…")
         elif self.inst.mono_connected and self._poll_ticks % 2 == 0 and not self._shutter_task \
+                and not self.inst.shutter_ttl \
                 and not self._poll_shutter and not self._acquiring():
             # шторку могут переключить и в штатном окне DevCtrl — кнопка должна показывать факт
             self._poll_shutter = True
@@ -1198,6 +1206,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._mono_task("зеркало…", lambda: self.inst.set_mirror(pos),
                         lambda _: log.info("Выходное зеркало: положение %d", pos))
+
+    def set_shutter_ttl(self, on: bool) -> None:
+        if not self._mono_ready():
+            self._show_shutter_mode()
+            return
+
+        def done(_):
+            self._shutter_task = False
+            self._show_shutter_mode()
+            if not on:
+                self._refresh_mono_misc()
+
+        def failed(e):
+            self._shutter_task = False
+            self._error("Режим шторки", e)
+            self._show_shutter_mode()
+        self._shutter_task = True
+        self.tasks.run(lambda: self.inst.set_shutter_ttl(on), done, failed)
 
     def set_shutter(self, is_open: bool) -> None:
         if not self._mono_ready():

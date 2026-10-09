@@ -259,6 +259,7 @@ class MonoPanel(QtWidgets.QGroupBox):
     slit = QtCore.pyqtSignal(int, float)
     mirror = QtCore.pyqtSignal(int)
     shutter = QtCore.pyqtSignal(bool)
+    shutter_ttl = QtCore.pyqtSignal(bool)
     service = QtCore.pyqtSignal()
 
     def __init__(self, settings: AppSettings, parent=None):
@@ -307,7 +308,16 @@ class MonoPanel(QtWidgets.QGroupBox):
         form.addRow("Выход:", self.mirror_box)
         self.btn_shutter = QtWidgets.QPushButton("Шторка: ?")
         self.btn_shutter.setCheckable(True)
-        form.addRow("Шторка:", self.btn_shutter)
+        self.shutter_mode = QtWidgets.QComboBox()
+        self.shutter_mode.addItem("вручную", False)
+        self.shutter_mode.addItem("по экспозиции", True)
+        self.shutter_mode.setToolTip(
+            "«по экспозиции» — шторку открывает импульс экспозиции с выхода синхронизации камеры только на "
+            "время кадра и закрывает после него (режим TTL штатного окна DevCtrl). Фон снимается при "
+            "закрытой шторке автоматически.")
+        self._ttl = False
+        self._ttl_available = False
+        form.addRow("Шторка:", _row(self.shutter_mode, self.btn_shutter, 1))
         self._fill_presets(settings.wl_presets)
         self.btn_go.clicked.connect(lambda: self.goto.emit(self.target.value()))
         self.target.lineEdit().returnPressed.connect(lambda: self.goto.emit(self.target.value()))
@@ -318,6 +328,7 @@ class MonoPanel(QtWidgets.QGroupBox):
         self.slit_idx.currentIndexChanged.connect(self._slit_range)
         self.mirror_box.activated.connect(lambda i: self.mirror.emit(self.mirror_box.itemData(i)))
         self.btn_shutter.clicked.connect(lambda checked: self.shutter.emit(checked))
+        self.shutter_mode.activated.connect(lambda i: self.shutter_ttl.emit(bool(self.shutter_mode.itemData(i))))
         self.set_connected(False)
 
     def _fill_presets(self, presets: Sequence[float]) -> None:
@@ -360,8 +371,10 @@ class MonoPanel(QtWidgets.QGroupBox):
 
     def set_connected(self, on: bool) -> None:
         for w in (self.target, self.btn_go, self.presets, self.gratings, self.btn_grating, self.slit_idx,
-                  self.slit_w, self.btn_slit, self.mirror_box, self.btn_shutter):
+                  self.slit_w, self.btn_slit, self.mirror_box):
             w.setEnabled(on)
+        self.btn_shutter.setEnabled(on and not self._ttl)
+        self.shutter_mode.setEnabled(on and self._ttl_available)
 
     def set_service_enabled(self, on: bool) -> None:
         self.btn_service.setEnabled(on)
@@ -389,7 +402,24 @@ class MonoPanel(QtWidgets.QGroupBox):
         if idx >= 0:
             self.mirror_box.setCurrentIndex(idx)
 
+    def set_shutter_mode(self, ttl: Optional[bool], available: bool) -> None:
+        """Режим шторки: True — по экспозиции (TTL), False — вручную, None — неизвестен."""
+        self._ttl_available = available
+        self._ttl = bool(ttl)
+        self.shutter_mode.blockSignals(True)
+        self.shutter_mode.setCurrentIndex(1 if ttl else 0)
+        self.shutter_mode.blockSignals(False)
+        self.shutter_mode.setEnabled(available and self.btn_go.isEnabled())
+        self.btn_shutter.setEnabled(not self._ttl and self.btn_go.isEnabled())
+        if self._ttl:
+            self.btn_shutter.blockSignals(True)
+            self.btn_shutter.setChecked(False)
+            self.btn_shutter.setText("открывается на время кадра")
+            self.btn_shutter.blockSignals(False)
+
     def set_shutter_value(self, is_open: Optional[bool]) -> None:
+        if self._ttl:
+            return                       # по TTL состояние меняется само на каждом кадре
         self.btn_shutter.blockSignals(True)
         self.btn_shutter.setChecked(bool(is_open))
         self.btn_shutter.setText("Шторка: ?" if is_open is None else

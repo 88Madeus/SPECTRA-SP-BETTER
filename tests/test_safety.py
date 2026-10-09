@@ -312,3 +312,62 @@ def test_warns_once_when_shooting_with_closed_shutter(inst, caplog):
     with caplog.at_level(logging.WARNING, logger="spectra_better.instrument"):
         inst.acquire()
     assert not [r for r in caplog.records if "шторка" in r.getMessage()]
+
+
+# ------------------------------------------------------------------ шторка по экспозиции (TTL)
+def _signal(m):
+    """Сигнал над уровнем смещения камеры."""
+    import numpy as np
+    return float(m.raw.max() - np.median(m.raw))
+
+
+def _bright(inst):
+    inst.settings.exposure_ms = 200
+    inst.goto_wavelength(546.0)                            # линия ртути в спектре лампы имитатора
+
+
+def test_shutter_ttl_mode_light_only_during_exposure(inst):
+    assert inst.mono.info.shutter_ttl                      # в MS7504_20126.cfg: [Shutter1] TTL=1
+    assert inst.shutter_ttl is False                       # после подключения — ручной режим (настройка)
+    _bright(inst)
+    inst.set_shutter(False)
+    dark = _signal(inst.acquire())
+    inst.set_shutter_ttl(True)
+    assert inst.mono.shutter_ttl and inst.settings.shutter_ttl
+    lit = _signal(inst.acquire())
+    assert lit > dark * 20                                 # шторку открыл импульс экспозиции камеры
+    with pytest.raises(DeviceError, match="по экспозиции"):
+        inst.set_shutter(True)                             # вручную — только после смены режима
+    inst.set_shutter_ttl(False)
+    assert not inst.mono.shutter_ttl
+    inst.set_shutter(True)
+
+
+def test_background_in_ttl_mode_is_dark_and_mode_restored(inst):
+    inst.settings.close_shutter_for_background = False    # даже так: по TTL шторка открылась бы на фон
+    _bright(inst)
+    inst.set_shutter_ttl(True)
+    lit = _signal(inst.acquire())
+    bg = _signal(inst.acquire(background=True))
+    assert bg < lit / 20                                   # фон тёмный
+    assert inst.shutter_ttl and inst.mono.shutter_ttl     # режим по экспозиции вернулся
+
+
+def test_ttl_mode_applied_on_connect(spectrasp_dir):
+    s = AppSettings()
+    s.spectrasp_dir = spectrasp_dir
+    s.shutter_ttl = True
+    i = Instrument(s, simulate=True)
+    try:
+        i.connect_mono()
+        assert i.shutter_ttl and i.mono.shutter_ttl
+    finally:
+        i.shutdown()
+
+
+def test_ttl_mode_warns_without_exposure_output(inst, caplog):
+    import logging
+    inst.set_sync_out(1, 6)                                 # оба выхода — постоянный уровень
+    with caplog.at_level(logging.WARNING, logger="spectra_better.instrument"):
+        inst.set_shutter_ttl(True)
+    assert any("сигнал экспозиции" in r.getMessage() for r in caplog.records)

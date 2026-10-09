@@ -64,6 +64,7 @@ class AppSettings:
     # обработка
     subtract_background: bool = True
     close_shutter_for_background: bool = True
+    shutter_ttl: bool = False                 # шторку открывает сигнал экспозиции камеры (режим TTL DevCtrl)
     remove_cosmics: bool = False
     laser_nm: float = 532.0
 
