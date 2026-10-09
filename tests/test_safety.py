@@ -296,3 +296,19 @@ def test_background_refused_if_shutter_does_not_close(inst, monkeypatch):
     with pytest.raises(DeviceError, match="Шторка не закрылась"):
         inst.acquire(background=True)
     assert not shots and not inst.has_background()
+
+
+def test_warns_once_when_shooting_with_closed_shutter(inst, caplog):
+    import logging
+    inst.set_shutter(False)
+    with caplog.at_level(logging.WARNING, logger="spectra_better.instrument"):
+        inst.acquire()
+        inst.acquire()
+        inst.acquire(background=True)                      # фон при закрытой шторке — норма
+    warns = [r for r in caplog.records if "шторка монохроматора закрыта" in r.getMessage()]
+    assert len(warns) == 1
+    inst.set_shutter(True)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="spectra_better.instrument"):
+        inst.acquire()
+    assert not [r for r in caplog.records if "шторка" in r.getMessage()]

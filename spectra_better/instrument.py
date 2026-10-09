@@ -119,6 +119,8 @@ class Instrument:
         self.camera_stuck = False
         self.last_state: Optional[CameraState] = None
         self._mono_exclusive: Optional[Tuple[str, int]] = None     # (кто, поток) — см. mono_exclusive()
+        self.shutter_state: Optional[bool] = None     # последнее известное состояние шторки (True — открыта)
+        self._shutter_warned = False
         self.cooling_target: Optional[int] = None    # уставка, заданная в этом сеансе (None — выкл./неизвестна)
         self._temp_hist: deque = deque(maxlen=400)   # (время, температура ПЗС) — для «уставка недостижима»
         self._state_time = 0.0
@@ -344,6 +346,7 @@ class Instrument:
     def _close_mono_safely(self, timeout_s: float) -> None:
         """В потоке монохроматора: дождаться конца движения и штатно закрыть DevCtrl."""
         m = self.mono
+        self.shutter_state = None
         if m.is_open:
             try:
                 if m.is_busy():
@@ -551,6 +554,14 @@ class Instrument:
         self._abort.clear()
         acq = self.acq_settings()
         t0 = time.monotonic()
+        if not background and self.mono_connected and self.shutter_state is False:
+            # закрытая шторка сохраняется между сеансами (и в SpectraSP) — сигнал тогда только темновой
+            if not self._shutter_warned:
+                log.warning("Входная шторка монохроматора закрыта — на ПЗС попадает только темновой "
+                            "сигнал. Откройте шторку на панели «Монохроматор».")
+                self._shutter_warned = True
+        elif self.shutter_state:
+            self._shutter_warned = False
         shutter_restore = None
         close_shutter = background and s.close_shutter_for_background and self.mono_connected
         if close_shutter:
@@ -770,6 +781,7 @@ class Instrument:
         while True:
             time.sleep(0.05)            # поток монохроматора тем временем обрабатывает сообщения DevCtrl
             state = self.mono_thread.call(self.mono.get_shutter, 0, timeout=30)
+            self.shutter_state = state
             if state is not None and state == is_open:
                 time.sleep(SHUTTER_SETTLE_S)
                 log.info("Шторка %s", "открыта" if is_open else "закрыта")
@@ -785,7 +797,8 @@ class Instrument:
 
     def get_shutter(self) -> Optional[bool]:
         self._require_mono()
-        return self.mono_thread.call(self.mono.get_shutter, 0, timeout=60)
+        self.shutter_state = self.mono_thread.call(self.mono.get_shutter, 0, timeout=60)
+        return self.shutter_state
 
     # ---------------------------------------------------------------- сервис
     def service_mechanisms(self) -> List[Tuple[str, int, str]]:
