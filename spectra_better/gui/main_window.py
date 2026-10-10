@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime as _dt
 import logging
 import os
 import threading
@@ -20,7 +21,7 @@ from ..hw.winutil import spectrasp_is_running
 from ..buffer import SpectrumBuffer
 from ..instrument import Instrument, Measurement
 from ..reference_lines import nearest_line
-from ..storage import load_spectrum, save_image, save_spectrum, unique_path
+from ..storage import load_image, load_spectrum, save_image, save_spectrum, unique_path
 from ..units import (X_DECIMALS, X_EV, X_NM, X_PX, X_RAMAN, X_SHORT, X_UNITS, X_WAVENUMBER, AxisMap, from_nm,
                      is_spectral)
 from .bands import BandHistory, BandsHistoryWindow, BandsPanel
@@ -51,6 +52,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.band_history = BandHistory()
         self._hist_win: Optional[BandsHistoryWindow] = None
         self._calc: Optional[CalculatorDialog] = None
+        self._series_beep = False
         self._scale = None                        # (пересчёт единиц, единицы) последней перерисовки
         try:
             n = self.buffer.load_state(self._buffer_path())
@@ -130,6 +132,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_pano = act("Панорама…", SP.SP_ArrowRight, None, "Спектр широкого диапазона со сшивкой")
         self.act_save = act("Сохранить спектр…", SP.SP_DialogSaveButton, "Ctrl+S", "Сохранить текущий спектр")
         self.act_save_img = act("Сохранить кадр…", None, None, "Сохранить изображение ПЗС")
+        self.act_open_frame = act("Открыть кадр ПЗС…", None, None,
+                                  "Посмотреть сохранённый кадр (.npy, .txt, .csv, 16-битный TIFF SpectraSP) "
+                                  "и построить спектры полос по нему")
         self.act_export = act("Сохранить график…", None, "Ctrl+Shift+S",
                               "Картинка PNG или SVG того, что сейчас на графике (спектр или кадр ПЗС) — для отчёта")
         self.act_open = act("Открыть спектр…", SP.SP_DialogOpenButton, "Ctrl+O",
@@ -164,7 +169,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         mb = self.menuBar()
         m = mb.addMenu("&Файл")
-        for a in (self.act_open, self.act_save, self.act_save_img, self.act_export, None, self.act_exit):
+        for a in (self.act_open, self.act_open_frame, self.act_save, self.act_save_img, self.act_export, None,
+                  self.act_exit):
             m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("&Прибор")
         for a in (self.act_connect, self.act_disconnect, self.act_reconnect_cam, None, self.act_service):
@@ -293,6 +299,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bands_panel.changed.connect(self._redraw)
         self.act_calc.triggered.connect(self.calculator)
         self.act_export.triggered.connect(self.export_plot)
+        self.act_open_frame.triggered.connect(self.open_frame)
         self.act_bands_peaks.triggered.connect(self.bands_from_peaks)
         self.act_band_hist.triggered.connect(self.show_band_history)
         self.bands_panel.track_changed.connect(lambda _: self._redraw())
@@ -875,26 +882,59 @@ class MainWindow(QtWidgets.QMainWindow):
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
         p = dlg.params()
+        if p.wavelengths and not self.inst.mono_connected:
+            self._error("Серия", DeviceError("Для списка длин волн нужен подключённый монохроматор"))
+            return
         self.s.autosave_series = p.save
         if p.save:
             self.s.save_dir = p.directory
-        log.info("Серия: %d спектров, интервал %.1f с%s", p.count, p.interval_s,
+        log.info("Серия: %d спектров, интервал %.1f с%s%s%s", p.count, p.interval_s,
+                 f", длины волн {', '.join(f'{w:g}' for w in p.wavelengths)} нм" if p.wavelengths else "",
+                 f", старт в {p.start_at:%H:%M}" if p.start_at else "",
                  f", сохранение в {p.directory}" if p.save else "")
+        self._series_beep = p.beep
+        total = p.count * max(1, len(p.wavelengths))
 
-        def loop():
+        def wait_start():
+            while p.start_at and not self._acq_stop.is_set():
+                left = (p.start_at - _dt.datetime.now()).total_seconds()
+                if left <= 0:
+                    break
+                self.emitter.progress.emit(0, 0, f"ожидание старта в {p.start_at:%H:%M} ({left / 60:.0f} мин)")
+                time.sleep(min(1.0, left))
+
+        def run_at(wl, done):
             for i in range(p.count):
                 if self._acq_stop.is_set():
-                    break
+                    return done
                 t0 = time.monotonic()
-                m = self.inst.acquire(progress=lambda a, b, t: None, label=f"серия {i + 1}/{p.count}")
-                self.emitter.progress.emit(i + 1, p.count, "серия")
+                tag = f" {wl:g} нм" if wl is not None else ""
+                m = self.inst.acquire(progress=lambda a, b, t: None, label=f"серия{tag} {i + 1}/{p.count}")
+                done += 1
+                self.emitter.progress.emit(done, total, "серия")
                 if p.save:
-                    path = unique_path(p.directory, p.prefix, p.ext)
+                    prefix = p.prefix + (f"_{wl:g}nm" if wl is not None else "")
+                    path = unique_path(p.directory, prefix, p.ext)
                     self._save_measurement(path, m)
                     self.emitter.message.emit(f"Сохранено: {path}")
                 self.emitter.measurement.emit(m)
                 while not self._acq_stop.is_set() and time.monotonic() - t0 < p.interval_s:
                     time.sleep(0.05)
+            return done
+
+        def loop():
+            wait_start()
+            if not p.wavelengths:
+                run_at(None, 0)
+                return
+            done = 0
+            with self.inst.mono_exclusive("серия"):
+                for wl in p.wavelengths:
+                    if self._acq_stop.is_set():
+                        break
+                    self.emitter.progress.emit(done, total, f"серия: переход на {wl:g} нм")
+                    self.inst.goto_wavelength(wl)
+                    done = run_at(wl, done)
         self._start("series", loop)
 
     def panorama(self) -> None:
@@ -964,8 +1004,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._acq_thread = None
         self.progress.setVisible(False)
         self._update_actions()
-        if kind == "panorama":
+        if kind in ("panorama", "series"):
             self._update_mono_view()
+        if kind == "series" and self._series_beep:
+            QtWidgets.QApplication.beep()
+            self.statusBar().showMessage("Серия завершена", 15000)
 
     # ================================================================ отображение
     @staticmethod
@@ -1232,6 +1275,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except DeviceError as e:
             self._error("Полосы строк", e)
         self.acq_panel.set_rows(*self.inst.stripes()[0])          # → _acq_settings_changed
+        self._refresh_file_frame()
 
     def edit_stripes(self) -> None:
         if self._acquiring():
@@ -1262,6 +1306,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.acq_panel.load_from_settings()
         self._acq_settings_changed()
+        self._refresh_file_frame()
         n = len(self.inst.stripes())
         log.info("Полосы строк: %s", ", ".join(f"{a}–{b}" for a, b in self.inst.stripes()))
         if n > 1:
@@ -1416,6 +1461,50 @@ class MainWindow(QtWidgets.QMainWindow):
             extra["raw_counts"] = m.raw
         save_spectrum(path, m.x if m.x_unit == "nm" else np.arange(m.y.size), m.y, meta,
                       x_name=x_name, extra=extra)
+
+    def open_frame(self, path: str = "") -> None:
+        """Сохранённый кадр ПЗС: показать и построить спектры по текущим полосам строк."""
+        if self._acquiring():
+            return
+        if not path:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Открыть кадр ПЗС", self.s.save_dir or "",
+                "Кадры (*.npy *.txt *.csv *.tif *.tiff);;Все файлы (*)")
+            if not path:
+                return
+        try:
+            img, meta = load_image(path)
+        except (OSError, ValueError) as e:
+            self._error("Открытие кадра", e)
+            return
+        m = Measurement(x=np.arange(img.shape[1], dtype=float), x_unit=X_PX, y=np.zeros(img.shape[1]),
+                        raw=np.zeros(img.shape[1]), image=img, acq_mode="image", label=os.path.basename(path),
+                        comment=meta.get("comment", ""), source_file=path)
+        self._frame_tracks(m)
+        self.current = m
+        self._image_meas = m
+        self.image._first = True
+        self.image.set_image(img)
+        self.tabs.setCurrentIndex(1)
+        self._redraw()
+        self._update_actions()
+        log.info("Открыт кадр %s (%d×%d)", path, img.shape[1], img.shape[0])
+
+    def _frame_tracks(self, m: Measurement) -> None:
+        """Спектры полос по кадру из файла (программное суммирование строк, без фона)."""
+        h = m.image.shape[0]
+        stripes = [(min(t, h - 1), min(b, h - 1)) for t, b in self.inst.stripes()]
+        tracks = np.vstack([P.bin_rows(m.image, t, b) for t, b in stripes])
+        m.y, m.raw = tracks[0], tracks[0]
+        m.tracks = tracks if tracks.shape[0] > 1 else None
+        m.track_rows = tuple(stripes)
+        m.rows = stripes[0]
+
+    def _refresh_file_frame(self) -> None:
+        m = self.current
+        if m is not None and m.source_file and m.image is not None:
+            self._frame_tracks(m)
+            self._redraw()
 
     def export_plot(self) -> None:
         """Картинка графика (PNG — растровая, SVG — векторная, для статей и отчётов)."""

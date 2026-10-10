@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -43,6 +44,22 @@ class SeriesParams:
     directory: str
     prefix: str
     ext: str
+    wavelengths: List[float] = field(default_factory=list)   # пусто — на текущей длине волны
+    start_at: Optional[_dt.datetime] = None                  # None — сразу
+    beep: bool = True
+
+
+def parse_wavelengths(text: str) -> List[float]:
+    """«546.07; 585,25 640.2» → [546.07, 585.25, 640.2] (разделители — ; пробел, запятая между числами)."""
+    import re
+    vals = []
+    for tok in re.split(r"[;\s]+", text.strip()):
+        if not tok:
+            continue
+        for part in re.split(r",(?=\s|$)", tok):
+            if part:
+                vals.append(float(part.replace(",", ".")))
+    return vals
 
 
 class SeriesDialog(QtWidgets.QDialog):
@@ -60,6 +77,27 @@ class SeriesDialog(QtWidgets.QDialog):
         self.interval.setSuffix(" с")
         self.interval.setToolTip("Пауза между началами спектров (0 — без пауз)")
         form.addRow("Интервал:", self.interval)
+        self.wls = QtWidgets.QLineEdit()
+        self.wls.setPlaceholderText("пусто — на текущей длине волны")
+        self.wls.setToolTip("Список длин волн через пробел или «;» (например: 546.07; 585.25; 640.2). "
+                            "На каждой снимается серия из указанного количества спектров.")
+        form.addRow("Длины волн, нм:", self.wls)
+        start_row = QtWidgets.QHBoxLayout()
+        self.delayed = QtWidgets.QCheckBox("начать в")
+        self.start_time = QtWidgets.QTimeEdit(QtCore.QTime.currentTime().addSecs(600))
+        self.start_time.setDisplayFormat("HH:mm")
+        self.start_time.setEnabled(False)
+        self.delayed.toggled.connect(self.start_time.setEnabled)
+        start_row.addWidget(self.delayed)
+        start_row.addWidget(self.start_time)
+        start_row.addStretch(1)
+        w = QtWidgets.QWidget()
+        w.setLayout(start_row)
+        start_row.setContentsMargins(0, 0, 0, 0)
+        form.addRow("Старт:", w)
+        self.beep = QtWidgets.QCheckBox("звуковой сигнал по окончании")
+        self.beep.setChecked(True)
+        form.addRow(self.beep)
         self.save = QtWidgets.QCheckBox("сохранять каждый спектр")
         self.save.setChecked(settings.autosave_series)
         form.addRow(self.save)
@@ -81,11 +119,28 @@ class SeriesDialog(QtWidgets.QDialog):
         if self.save.isChecked() and not self.dir.text().strip():
             QtWidgets.QMessageBox.warning(self, "Серия", "Укажите папку для сохранения")
             return
+        try:
+            wls = parse_wavelengths(self.wls.text())
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "Серия", "Не удалось прочитать список длин волн")
+            return
+        if any(not (0 < w < 3000) for w in wls):
+            QtWidgets.QMessageBox.warning(self, "Серия", "Длины волн должны быть в пределах 0…3000 нм")
+            return
         self.accept()
+
+    def start_at(self) -> Optional[_dt.datetime]:
+        if not self.delayed.isChecked():
+            return None
+        t = self.start_time.time()
+        now = _dt.datetime.now()
+        when = now.replace(hour=t.hour(), minute=t.minute(), second=0, microsecond=0)
+        return when if when > now else when + _dt.timedelta(days=1)
 
     def params(self) -> SeriesParams:
         return SeriesParams(self.count.value(), self.interval.value(), self.save.isChecked(),
-                            self.dir.text().strip(), self.prefix.text().strip() or "series", self.ext.currentData())
+                            self.dir.text().strip(), self.prefix.text().strip() or "series", self.ext.currentData(),
+                            parse_wavelengths(self.wls.text()), self.start_at(), self.beep.isChecked())
 
 
 # ----------------------------------------------------------------- панорама

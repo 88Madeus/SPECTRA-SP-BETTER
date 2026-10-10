@@ -71,3 +71,21 @@ def test_comment_in_name_and_props():
     e = b.add(m)
     assert e.name.startswith("образец 7, 77 K · ")
     assert dict(b.properties(e.key))["Комментарий"] == "образец 7, 77 K"
+
+
+def test_load_image_formats(tmp_path):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from spectra_better.storage import load_image, save_image
+    img = (np.arange(12 * 7).reshape(7, 12) * 300).astype(np.uint16)
+    for ext in (".npy", ".txt", ".csv"):
+        p = str(tmp_path / f"f{ext}")
+        save_image(p, img, {"comment": "проба"})
+        back, meta = load_image(p)
+        assert back.shape == (7, 12) and np.array_equal(back, img) and meta["comment"] == "проба"
+    from PyQt5 import QtGui
+    q = QtGui.QImage(img.tobytes(), 12, 7, 24, QtGui.QImage.Format_Grayscale16)
+    p = str(tmp_path / "f.tif")
+    assert q.save(p, "TIFF")
+    back, _ = load_image(p)
+    assert np.array_equal(back, img)

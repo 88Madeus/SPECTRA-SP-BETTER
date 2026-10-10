@@ -407,3 +407,48 @@ def test_export_plot_png_svg(win, app, tmp_path, monkeypatch):
         assert os.path.getsize(target) > 1000
     assert (tmp_path / "g.png").read_bytes()[:4] == b"\x89PNG"
     assert b"<svg" in (tmp_path / "g.svg").read_bytes()[:2000]
+
+
+def test_series_over_wavelength_list(win, app, monkeypatch, tmp_path):
+    from spectra_better.gui import dialogs as dl
+    from spectra_better.gui import main_window as mw
+    assert dl.parse_wavelengths("546.07; 585,25 640.2") == [546.07, 585.25, 640.2]
+    assert dl.parse_wavelengths("") == []
+    win.inst.camera._update_temp = lambda: None
+    win.s.warm_up_on_close = False
+
+    class FakeDlg:
+        def __init__(self, s, parent):
+            pass
+
+        def exec_(self):
+            return QtWidgets.QDialog.Accepted
+
+        def params(self):
+            return dl.SeriesParams(2, 0.0, True, str(tmp_path), "ser", ".txt", [550.0, 560.0], None, True)
+    monkeypatch.setattr(mw, "SeriesDialog", FakeDlg)
+    beeps = []
+    monkeypatch.setattr(QtWidgets.QApplication, "beep", staticmethod(lambda: beeps.append(1)))
+    win.series()
+    t0 = time.monotonic()
+    while (win._acquiring() or not beeps) and time.monotonic() - t0 < 30:
+        pump(app, 0.05)
+    names = sorted(p.name for p in tmp_path.glob("ser_*.txt"))
+    assert len(names) == 4 and sum("550nm" in n for n in names) == 2 and sum("560nm" in n for n in names) == 2
+    assert win.inst.mono_wl == pytest.approx(560.0) and beeps
+
+
+def test_open_frame_and_restripe(win, app, tmp_path):
+    from spectra_better.storage import save_image
+    rows = np.arange(506)[:, None]
+    img = 300 + 1000 * np.exp(-0.5 * ((rows - 100) / 3) ** 2) + np.zeros((1, 2048))
+    p = str(tmp_path / "frame.npy")
+    save_image(p, img)
+    win.inst.set_stripes([(90, 110)])
+    win.open_frame(p)
+    m = win.current
+    assert m.source_file == p and m.image.shape == (506, 2048)
+    assert m.y.max() == pytest.approx(img[90:111].sum(axis=0).max())
+    win.inst.set_stripes([(90, 110), (300, 320)])            # добавили полосу — спектры пересчитаны
+    win._refresh_file_frame()
+    assert win.current.n_tracks == 2 and win.current.track(1).max() < 21 * 400

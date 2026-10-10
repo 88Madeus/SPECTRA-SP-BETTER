@@ -99,7 +99,8 @@ def _fmt_pos(v: float, unit: str) -> str:
     return f"{v:.{X_DECIMALS.get(unit, 3)}f} {X_SHORT.get(unit, unit)}"
 
 
-BAND_COLORS = ["#2ca02c", "#d62728", "#9467bd", "#ff7f0e", "#17becf", "#8c564b", "#e377c2", "#7f7f7f"]
+# участки интегрирования — цвета, не совпадающие с текущим спектром (красный) и полосами строк
+BAND_COLORS = ["#2ca02c", "#9467bd", "#17becf", "#8c564b", "#bcbd22", "#e377c2", "#7f7f7f", "#1f77b4"]
 
 
 class SpectrumPlot(QtWidgets.QWidget):

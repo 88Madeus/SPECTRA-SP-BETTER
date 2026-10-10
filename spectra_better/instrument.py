@@ -81,6 +81,7 @@ class Measurement:
     defects_fixed: int = 0                # исправлено дефектных пикселей
     intensity_corrected: str = ""         # как скорректирована интенсивность ("" — нет)
     comment: str = ""                     # комментарий пользователя (образец, условия)
+    source_file: str = ""                 # кадр открыт из файла (не снят сейчас)
 
     def meta(self) -> Dict[str, object]:
         m: Dict[str, object] = {

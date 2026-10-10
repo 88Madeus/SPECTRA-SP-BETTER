@@ -240,7 +240,8 @@ class AcquisitionPanel(QtWidgets.QGroupBox):
     def set_stripes_count(self, n: int) -> None:
         """Число полос: при нескольких камера читает строки построчно, полосы суммируются программно."""
         self._n_stripes = max(1, int(n))
-        self.stripes_info.setText("1 полоса" if n <= 1 else f"{n} полос{'ы' if n < 5 else ''} — свой спектр с каждой")
+        self.stripes_info.setText("1 полоса" if n <= 1 else f"{n} полос{'ы' if n < 5 else ''}")
+        self.stripes_info.setToolTip("" if n <= 1 else "С каждой полосы строится свой спектр")
         self.hw_bin.setToolTip(
             "Камера сама суммирует строки полосы и передаёт одну строку:\n"
             "считывание в сотни раз быстрее, чем полный кадр.\n"

@@ -81,9 +81,9 @@ class BandsPanel(QtWidgets.QWidget):
         self.s = settings
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        hint = QtWidgets.QLabel("Сумма отсчётов в участках спектра. Участок можно перетащить на графике "
-                                "или ввести границы в таблице. «Σ над базой» — за вычетом прямой между "
-                                "краями участка (площадь линии).")
+        hint = QtWidgets.QLabel("Участки спектра: перетащите на графике или введите границы.")
+        hint.setToolTip("«Σ над базой» — сумма за вычетом прямой между краями участка (площадь линии); "
+                        "«Центр» — центр тяжести линии над этой прямой (точнее одного пикселя)")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #555;")
         lay.addWidget(hint)
@@ -98,7 +98,7 @@ class BandsPanel(QtWidgets.QWidget):
         self.btn_add = QtWidgets.QPushButton("Добавить")
         self.btn_add.setToolTip("Новый участок в середине видимой части графика")
         self.btn_del = QtWidgets.QPushButton("Удалить")
-        self.btn_copy = QtWidgets.QPushButton("Копировать")
+        self.btn_copy = QtWidgets.QPushButton("Копия")
         self.btn_copy.setToolTip("Скопировать таблицу (для вставки в Excel)")
         self.btn_hist = QtWidgets.QPushButton("История…")
         self.btn_hist.setToolTip("Результаты участков от снимка к снимку (непрерывная съёмка, серия): "
