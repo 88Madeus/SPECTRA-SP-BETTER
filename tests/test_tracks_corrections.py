@@ -24,8 +24,15 @@ def inst(spectrasp_dir):
     i.shutdown()
 
 
-def _sig(y):
-    return float(np.max(y) - np.median(y))
+def _sig(y, at=None):
+    """Сигнал над медианой в точке линии at (±2 пикселя), по умолчанию — в максимуме.
+
+    Сравнивая полосы, берём одну и ту же линию: максимум по всему спектру тёмной полосы
+    мог бы дать космическая частица (имитатор, как настоящая ПЗС, их «ловит»).
+    """
+    y = np.asarray(y)
+    i = int(np.argmax(y)) if at is None else at
+    return float(y[max(0, i - 2):i + 3].max() - np.median(y))
 
 
 # ------------------------------------------------------------------ несколько полос
@@ -37,7 +44,8 @@ def test_two_stripes_two_spectra(inst):
     assert (r.top, r.bottom, r.bin_y) == (140, 360, 1)          # построчно от верхней до нижней полосы
     m = inst.acquire()
     assert m.n_tracks == 2 and m.track_rows == ((140, 160), (340, 360))
-    ratio = _sig(m.track(1)) / _sig(m.track(0))
+    i = int(np.argmax(m.track(0)))
+    ratio = _sig(m.track(1), i) / _sig(m.track(0), i)
     assert 0.2 < ratio < 0.4
     np.testing.assert_array_equal(m.track(0), m.y)
     assert m.meta()["stripes"] == "140-160, 340-360"
@@ -56,7 +64,8 @@ def test_stripes_in_image_mode(inst):
     inst.set_stripes([(140, 160), (340, 360), (480, 500)])
     m = inst.acquire()
     assert m.n_tracks == 3 and m.image is not None
-    assert _sig(m.track(2)) < 0.05 * _sig(m.track(0))          # третья полоса — без света
+    i = int(np.argmax(m.track(0)))
+    assert _sig(m.track(2), i) < 0.05 * _sig(m.track(0), i)    # третья полоса — без света
 
 
 def test_background_per_stripe(inst):

@@ -315,10 +315,21 @@ def test_warns_once_when_shooting_with_closed_shutter(inst, caplog):
 
 
 # ------------------------------------------------------------------ шторка по экспозиции (TTL)
-def _signal(m):
-    """Сигнал над уровнем смещения камеры."""
+def _signal(m, at=None):
+    """Сигнал над уровнем смещения камеры в точке линии at (±2 пикселя).
+
+    Не максимум по всему спектру: имитатор, как настоящая ПЗС, иногда ловит
+    космическую частицу (до 20 000 отсчётов) — в тёмном кадре она дала бы «свет».
+    """
     import numpy as np
-    return float(m.raw.max() - np.median(m.raw))
+    y = m.raw
+    i = int(np.argmax(y)) if at is None else at
+    return float(y[max(0, i - 2):i + 3].max() - np.median(y))
+
+
+def _line(m):
+    import numpy as np
+    return int(np.argmax(m.raw))
 
 
 def _bright(inst):
@@ -331,11 +342,12 @@ def test_shutter_ttl_mode_light_only_during_exposure(inst):
     assert inst.shutter_ttl is False                       # после подключения — ручной режим (настройка)
     _bright(inst)
     inst.set_shutter(False)
-    dark = _signal(inst.acquire())
+    dark_m = inst.acquire()
     inst.set_shutter_ttl(True)
     assert inst.mono.shutter_ttl and inst.settings.shutter_ttl
-    lit = _signal(inst.acquire())
-    assert lit > dark * 20                                 # шторку открыл импульс экспозиции камеры
+    lit_m = inst.acquire()
+    i = _line(lit_m)                                       # линия ртути 546 нм
+    assert _signal(lit_m, i) > _signal(dark_m, i) * 20     # шторку открыл импульс экспозиции камеры
     with pytest.raises(DeviceError, match="по экспозиции"):
         inst.set_shutter(True)                             # вручную — только после смены режима
     inst.set_shutter_ttl(False)
@@ -347,9 +359,10 @@ def test_background_in_ttl_mode_is_dark_and_mode_restored(inst):
     inst.settings.close_shutter_for_background = False    # даже так: по TTL шторка открылась бы на фон
     _bright(inst)
     inst.set_shutter_ttl(True)
-    lit = _signal(inst.acquire())
-    bg = _signal(inst.acquire(background=True))
-    assert bg < lit / 20                                   # фон тёмный
+    lit_m = inst.acquire()
+    i = _line(lit_m)
+    bg = _signal(inst.acquire(background=True), i)
+    assert bg < _signal(lit_m, i) / 20                     # фон тёмный (в точке линии)
     assert inst.shutter_ttl and inst.mono.shutter_ttl     # режим по экспозиции вернулся
 
 
