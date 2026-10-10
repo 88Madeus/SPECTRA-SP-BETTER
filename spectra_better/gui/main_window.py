@@ -1,6 +1,7 @@
 """Главное окно программы."""
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import threading
@@ -23,6 +24,7 @@ from ..storage import load_spectrum, save_image, save_spectrum, unique_path
 from ..units import (X_DECIMALS, X_EV, X_NM, X_PX, X_RAMAN, X_SHORT, X_UNITS, X_WAVENUMBER, AxisMap, from_nm,
                      is_spectral)
 from .buffer_panel import BufferPanel, entry_color
+from .tools_dialogs import DefectPixelsDialog, IntensityCorrectionDialog, StripesDialog
 from .dialogs import BusyDialog, CalibrationDialog, PanoramaDialog, SeriesDialog, SettingsDialog
 from .icons import gear_icon
 from .log_widget import LogView, QtLogHandler
@@ -131,6 +133,10 @@ class MainWindow(QtWidgets.QMainWindow):
                                  "Показать весь спектр по X и подобрать масштаб по Y")
         self.act_calib = act("Калибровка шкалы…", None, None, "Центральный пиксель, модель, поправка по реперным линиям")
         self.act_settings = act("Настройки…", SP.SP_FileDialogDetailedView, None, "Каталог SpectraSP, таймауты")
+        self.act_stripes = act("Полосы строк…", None, None, "Несколько полос строк ПЗС — свой спектр с каждой")
+        self.act_defects = act("Дефектные пиксели…", None, None, "Список «горячих» и «мёртвых» столбцов ПЗС")
+        self.act_intensity = act("Коррекция интенсивности…", None, None,
+                                 "Поправка на спектральную чувствительность, расчёт по эталонной лампе")
         self.act_about = act("О программе", SP.SP_MessageBoxInformation)
         self.act_exit = act("Выход", None, "Alt+F4")
 
@@ -157,7 +163,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for a in (self.act_autorange, self.act_pin, self.act_clear):
             m.addAction(a)
         m = mb.addMenu("&Настройка")
-        for a in (self.act_calib, self.act_settings):
+        for a in (self.act_calib, self.act_stripes, self.act_defects, self.act_intensity, self.act_settings):
             m.addAction(a)
         m = mb.addMenu("&Справка")
         m.addAction(self.act_about)
@@ -277,7 +283,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cam_panel.laser.connect(self.set_laser)
         self.cam_panel.sync_out.connect(self.set_sync_out)
         self.acq_panel.changed.connect(self._acq_settings_changed)
-        self.image.rows_changed.connect(self.acq_panel.set_rows)
+        self.image.stripes_changed.connect(self._stripes_dragged)
+        self.acq_panel.stripes_requested.connect(self.edit_stripes)
+        self.act_stripes.triggered.connect(self.edit_stripes)
+        self.proc_panel.defects_requested.connect(self.edit_defects)
+        self.act_defects.triggered.connect(self.edit_defects)
+        self.proc_panel.intensity_requested.connect(self.edit_intensity)
+        self.act_intensity.triggered.connect(self.edit_intensity)
         self.mono_panel.goto.connect(self.goto_wavelength)
         self.mono_panel.grating.connect(self.change_grating)
         self.mono_panel.slit.connect(self.set_slit)
@@ -298,7 +310,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_static_info(self) -> None:
         self.cam_panel.set_info(self.inst.camera.info if self.inst.camera_connected else None, self.inst.camera_ip())
         self.mono_panel.set_info(self.inst.mono.info if self.inst.mono_connected else None, self.inst.mono_address())
-        self.image.set_rows(max(0, self.s.rows_top), max(0, self.s.rows_bottom))
+        self.image.set_stripes(self.inst.stripes())
 
     def _acquiring(self) -> bool:
         return self._acq_thread is not None and self._acq_thread.is_alive()
@@ -404,7 +416,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cam_panel.set_info(info, self.inst.camera_ip())
         self.acq_panel.set_camera(info)
         self.acq_panel.load_from_settings()
-        self.image.set_rows(self.s.rows_top, self.s.rows_bottom)
+        self.image.set_stripes(self.inst.stripes())
         self.cam_panel.set_state(self.inst.last_state)
         self._show_sync()
         self._acq_settings_changed()
@@ -746,7 +758,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._fan_warned = False
 
     def _acq_settings_changed(self) -> None:
-        self.image.set_rows(self.s.rows_top, self.s.rows_bottom)
+        stripes = self.inst.stripes()
+        self.image.set_stripes(stripes)
+        self.acq_panel.set_stripes_count(len(stripes))
         if self.inst.camera_connected:
             try:
                 acq = self.inst.acq_settings()
@@ -990,9 +1004,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current = m
         kind = self._acq_kind
         if self.buffer_panel.auto.isChecked() and (kind in ("snap", "series") or (kind == "panorama" and m.stitched)):
-            e = self.buffer.add(m)
+            added = self._buffer_add(m)
             self.buffer_panel.refresh()
-            self.buffer_panel.select(e.key)
+            self.buffer_panel.select(added[-1].key)
         if m.image is not None:
             self._image_meas = m
             self.image.set_image(m.image)
@@ -1014,7 +1028,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.set_scale(amap, unit, pixels_ok=not (ref is not None and ref.stitched))
         if m is not None:
             x = self._x_in(m, unit, laser)
-            self.plot.set_data(x, m.y, m.label or "Текущий")
+            multi = m.n_tracks > 1
+            name = m.label or "Текущий"
+            if multi:
+                a, b = m.track_rows[0]
+                name = f"Полоса 1 (строки {a}–{b})"
+            self.plot.set_data(x, m.y, name)
+            self.plot.set_tracks([(x, m.track(i), f"Полоса {i + 1} (строки {m.track_rows[i][0]}–{m.track_rows[i][1]})")
+                                  for i in range(1, m.n_tracks)] if multi else [])
             self._update_peaks(x, m.y, amap, unit)
         bg = self.background
         if bg is not None and m is not None and bg.y.size == m.y.size:
@@ -1060,6 +1081,72 @@ class MainWindow(QtWidgets.QMainWindow):
         self._redraw()
         self._update_bg_status()
 
+    # ================================================================ полосы, дефекты, коррекция
+    def _stripes_dragged(self, stripes: list) -> None:
+        """Полосу перетащили на изображении ПЗС."""
+        try:
+            self.inst.set_stripes(stripes)
+        except DeviceError as e:
+            self._error("Полосы строк", e)
+        self.acq_panel.set_rows(*self.inst.stripes()[0])          # → _acq_settings_changed
+
+    def edit_stripes(self) -> None:
+        if self._acquiring():
+            self.statusBar().showMessage("Полосы меняются, когда съёмка остановлена", 5000)
+            return
+        cam = self.inst.camera
+        height = cam.info.height if cam is not None and cam.info.height else 506
+        img = self._image_meas.image if self._image_meas is not None else None
+
+        def estimate(stripes):
+            if not self.inst.camera_connected:
+                return None
+            old = self.inst.stripes()
+            try:
+                self.inst.set_stripes(stripes)
+                return self.inst.expected_frame_time(self.inst.acq_settings())
+            except DeviceError:
+                return None
+            finally:
+                self.inst.set_stripes(old)
+        dlg = StripesDialog(self.inst.stripes(), height, img, estimate, self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        try:
+            self.inst.set_stripes(dlg.stripes())
+        except DeviceError as e:
+            self._error("Полосы строк", e)
+            return
+        self.acq_panel.load_from_settings()
+        self._acq_settings_changed()
+        n = len(self.inst.stripes())
+        log.info("Полосы строк: %s", ", ".join(f"{a}–{b}" for a, b in self.inst.stripes()))
+        if n > 1:
+            log.info("Несколько полос: камера читает строки построчно; фон нужно снять заново")
+
+    def edit_defects(self) -> None:
+        cam = self.inst.camera
+        width = cam.info.width if cam is not None and cam.info.width else 2048
+        dark = self.background.raw if self.background is not None else None
+        dlg = DefectPixelsDialog(self.s, width, dark, self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self.proc_panel.load_corrections()
+            log.info("Дефектные пиксели: %d, исправление %s", len(self.s.defect_pixels),
+                     "включено" if self.s.defect_correction else "выключено")
+
+    def edit_intensity(self) -> None:
+        m = self.current
+        x_nm = measured = None
+        if m is not None and m.x_unit == "nm" and not m.intensity_corrected and not m.stitched:
+            x_nm, measured = m.x, m.y
+        dlg = IntensityCorrectionDialog(self.s, x_nm, measured, self)
+        if m is not None and m.intensity_corrected:
+            dlg.btn_planck.setToolTip("Текущий спектр уже скорректирован — снимите эталон с выключенной коррекцией")
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self.proc_panel.load_corrections()
+            log.info("Коррекция интенсивности: %s, %d точек", "включена" if self.s.intensity_corr else "выключена",
+                     len(self.s.intensity_corr_points))
+
     # ================================================================ буфер спектров
     def _buffer_path(self) -> str:
         base = getattr(self.s, "_path", None) or AppSettings.default_path()
@@ -1088,11 +1175,26 @@ class MainWindow(QtWidgets.QMainWindow):
         """Положить текущий спектр в буфер."""
         if self.current is None:
             return
-        e = self.buffer.add(self.current)
+        e = None
+        for e in self._buffer_add(self.current):
+            pass
         self.buffer_panel.refresh()
         self.buffer_panel.select(e.key)
         self._redraw()
         log.info("В буфер: %s", e.name)
+
+    def _buffer_add(self, m: Measurement):
+        """В буфер — каждую полосу отдельным спектром (у одной полосы — как есть)."""
+        if m.n_tracks <= 1:
+            return [self.buffer.add(m)]
+        base = SpectrumBuffer.default_name(m)
+        out = []
+        for i in range(m.n_tracks):
+            a, b = m.track_rows[i]
+            part = dataclasses.replace(m, y=m.track(i), raw=m.track(i) if i else m.raw, tracks=None,
+                                       track_rows=(m.track_rows[i],))
+            out.append(self.buffer.add(part, f"{base} · полоса {i + 1} ({a}–{b})"))
+        return out
 
     def buffer_to_current(self, key: str) -> None:
         """Сделать спектр из буфера текущим (пики, сохранение, «В буфер» под другим именем)."""
@@ -1163,6 +1265,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 meta["laser_nm"] = self.s.laser_nm
         else:
             x_name = "pixel"
+        for i in range(1, m.n_tracks):
+            a, b = m.track_rows[i]
+            extra[f"stripe{i + 1}_rows_{a}-{b}"] = m.track(i)
         if m.background_used:
             extra["raw_without_background_subtraction"] = m.raw
         save_spectrum(path, m.x if m.x_unit == "nm" else np.arange(m.y.size), m.y, meta,

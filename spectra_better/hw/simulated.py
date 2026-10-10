@@ -241,6 +241,10 @@ class SimCamera(Camera):
         self.overheat = False          # и «перегреть» камеру
         self._t_last = time.monotonic()
         self.stripe_center, self.stripe_sigma = 297.0, 9.0
+        # несколько источников по высоте щели (например, волокна): [(центр, σ, доля), …]; пусто — один
+        self.fibers: list = []
+        # «горячие» столбцы ПЗС: столбец → темновой ток, отсч./с на строку
+        self.hot_columns: dict = {}
         self.lamp = {**{wl: i * 30000 for wl, i in LINES["Hg (ртуть)"]},
                      **{wl: i * 12000 for wl, i in LINES["Ar (аргон)"]},
                      **{wl: i * 9000 for wl, i in LINES["Ne (неон)"]}}
@@ -345,10 +349,14 @@ class SimCamera(Camera):
         self._update_temp()
         r = s.regions[0]
         rows = np.arange(r.top, r.bottom + 1, dtype=float)
-        profile = np.exp(-0.5 * ((rows - self.stripe_center) / self.stripe_sigma) ** 2)
+        sources = self.fibers or [(self.stripe_center, self.stripe_sigma, 1.0)]
+        profile = sum(k * np.exp(-0.5 * ((rows - c) / sg) ** 2) for c, sg, k in sources)
         rate = self._photon_rate()[r.left:r.right + 1]
         signal = np.outer(profile, rate) * exp_s
-        dark = 0.5 * 2 ** ((self._temp - 20.0) / 6.5) * exp_s
+        dark = np.full(r.width, 0.5 * 2 ** ((self._temp - 20.0) / 6.5) * exp_s)
+        for col, extra in self.hot_columns.items():
+            if r.left <= col <= r.right:
+                dark[col - r.left] += extra * exp_s
         img = self.rng.poisson(np.clip(signal + dark, 0, None)).astype(float)
         # космические частицы
         n_cr = self.rng.poisson(0.02 * exp_s * r.width * r.height / 1e4)

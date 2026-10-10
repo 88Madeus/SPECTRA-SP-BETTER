@@ -64,7 +64,7 @@ def combine_frames(spectra: Sequence[np.ndarray], mode: str = "average", reject_
     """Накопление серии: 'sum' или 'average'. При ≥3 кадрах выбросы
     отбрасываются сравнением с медианой по кадрам."""
     stack = np.asarray([np.asarray(s, dtype=np.float64) for s in spectra])
-    if stack.ndim != 2 or stack.shape[0] == 0:
+    if stack.ndim < 2 or stack.shape[0] == 0:          # (кадры, точки) или (кадры, полосы, точки)
         raise ValueError("Нет кадров для накопления")
     n = stack.shape[0]
     if reject_cosmics and n >= 3:
@@ -74,6 +74,176 @@ def combine_frames(spectra: Sequence[np.ndarray], mode: str = "average", reject_
         if np.any(mask):
             stack = np.where(mask, med, stack)
     return stack.sum(axis=0) if mode == "sum" else stack.mean(axis=0)
+
+
+# ---------------------------------------------------------------- полосы строк
+def find_stripes(image: np.ndarray, max_n: int = 8, min_rel: float = 0.1) -> List[tuple]:
+    """Освещённые участки по высоте кадра (например, изображения волокон) → [(верх, низ), …].
+
+    Профиль по строкам — сумма по столбцам за вычетом уровня тёмных строк. Участок —
+    строки, где профиль выше половины своего местного максимума; участки слабее min_rel
+    самого яркого отбрасываются. Сверху вниз, не больше max_n.
+    """
+    img = np.asarray(image, dtype=np.float64)
+    if img.ndim != 2 or img.shape[0] < 3:
+        return []
+    prof = img.sum(axis=1)
+    prof = prof - np.percentile(prof, 20)
+    k = np.ones(3) / 3
+    prof = np.convolve(np.pad(prof, 1, mode="edge"), k, mode="valid")
+    top = prof.max()
+    if top <= 0:
+        return []
+    found = []
+    work = prof.copy()
+    for _ in range(max_n):
+        i = int(np.argmax(work))
+        peak = work[i]
+        if peak < min_rel * top:
+            break
+        half = peak / 2
+        a = i
+        while a > 0 and prof[a - 1] > half:
+            a -= 1
+        b = i
+        while b < prof.size - 1 and prof[b + 1] > half:
+            b += 1
+        width = b - a + 1                                # полуширина → берём ~2 полуширины (≈95 % света)
+        a2, b2 = max(0, a - width // 2), min(prof.size - 1, b + width // 2)
+        found.append((a2, b2))
+        work[max(0, a2 - 1):b2 + 2] = -np.inf
+    found.sort()
+    merged: List[tuple] = []
+    for a, b in found:                                   # перекрывающиеся — объединить
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+# ---------------------------------------------------------------- дефектные пиксели
+def fix_defects(y: np.ndarray, columns, flip: bool = False) -> np.ndarray:
+    """Заменить дефектные столбцы линейной интерполяцией между ближайшими исправными.
+
+    y — спектр (N) или полосы (T×N); columns — номера столбцов ПЗС, как их отдаёт
+    камера; flip=True — спектр развёрнут по горизонтали (столбец c стал N−1−c).
+    """
+    arr = np.array(y, dtype=np.float64, copy=True)
+    n = arr.shape[-1]
+    bad = np.zeros(n, dtype=bool)
+    for c in columns:
+        c = int(c)
+        if 0 <= c < n:
+            bad[n - 1 - c if flip else c] = True
+    if not bad.any() or bad.all():
+        return arr
+    good = np.flatnonzero(~bad)
+    idx = np.flatnonzero(bad)
+    rows = arr.reshape(-1, n)
+    for r in rows:
+        r[idx] = np.interp(idx, good, r[good])       # за краями — значение ближайшего исправного
+    return rows.reshape(arr.shape)
+
+
+def find_defects(dark: np.ndarray, threshold: float = 8.0, window: int = 9) -> List[int]:
+    """Найти «горячие» и «мёртвые» столбцы по тёмному кадру (фону).
+
+    Столбец дефектный, если он отличается от медианы соседей больше чем на
+    threshold·σ (σ — устойчивая оценка шума по разностям соседних точек).
+    """
+    d = np.asarray(dark, dtype=np.float64)
+    if d.ndim == 2:
+        d = d.sum(axis=0)
+    n = d.size
+    if n < window:
+        return []
+    half = window // 2
+    pad = np.pad(d, half, mode="edge")
+    med = np.median(np.lib.stride_tricks.sliding_window_view(pad, window), axis=1)
+    resid = d - med
+    diff = np.diff(d)
+    sigma = 1.4826 * np.median(np.abs(diff - np.median(diff))) / np.sqrt(2)
+    sigma = max(sigma, 1.4826 * np.median(np.abs(resid)), 1e-9)
+    return [int(i) for i in np.flatnonzero(np.abs(resid) > threshold * sigma)]
+
+
+# ---------------------------------------------------------------- коррекция интенсивности
+def correction_curve(x: np.ndarray, points) -> Optional[np.ndarray]:
+    """Множитель K(x) по таблице [[x, K], …]: линейная интерполяция, за краями — крайние значения."""
+    pts = sorted((float(a), float(b)) for a, b in points)
+    if not pts:
+        return None
+    px = np.array([p[0] for p in pts])
+    pk = np.array([p[1] for p in pts])
+    return np.interp(np.asarray(x, dtype=np.float64), px, pk)
+
+
+def planck(wl_nm: np.ndarray, temperature_k: float) -> np.ndarray:
+    """Спектральная плотность излучения чёрного тела (относительные единицы) — эталон для
+    коррекции по лампе накаливания с известной цветовой температурой."""
+    wl = np.asarray(wl_nm, dtype=np.float64) * 1e-9
+    c2 = 1.438776877e-2                                  # h·c/k, м·К
+    with np.errstate(over="ignore"):
+        return 1.0 / (wl ** 5 * np.expm1(c2 / (wl * float(temperature_k))))
+
+
+def build_correction(x: np.ndarray, measured: np.ndarray, reference: np.ndarray, n_points: int = 40,
+                     smooth: int = 15) -> List[List[float]]:
+    """Таблица K(x) = эталон / измеренное (сглаженные), нормированная на среднее 1.
+
+    Возвращает n_points точек [[x, K], …], равномерно по оси. Точки, где измеренный
+    сигнал слишком слаб (< 2 % максимума), пропускаются — там K недостоверен.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    m = np.asarray(measured, dtype=np.float64)
+    r = np.asarray(reference, dtype=np.float64)
+    if smooth > 1:
+        k = np.ones(smooth) / smooth
+        m = np.convolve(np.pad(m, smooth // 2, mode="edge"), k, mode="valid")[: x.size]
+        r = np.convolve(np.pad(r, smooth // 2, mode="edge"), k, mode="valid")[: x.size]
+    ok = m > 0.02 * np.max(m)
+    if ok.sum() < 2:
+        raise ValueError("Измеренный спектр слишком слабый для расчёта коррекции")
+    ratio = np.where(ok, r / np.where(ok, m, 1.0), np.nan)
+    idx = np.linspace(0, x.size - 1, n_points).round().astype(int)
+    pts = [(float(x[i]), float(ratio[i])) for i in idx if np.isfinite(ratio[i])]
+    if len(pts) < 2:
+        raise ValueError("Недостаточно точек для таблицы коррекции")
+    mean = float(np.mean([p[1] for p in pts]))
+    return [[a, b / mean] for a, b in sorted(pts)]
+
+
+# ---------------------------------------------------------------- интегрирование в полосе
+@dataclass
+class BandResult:
+    lo: float
+    hi: float
+    points: int
+    total: float        # сумма отсчётов в полосе
+    net: float          # сумма за вычетом линейной базовой линии между краями полосы
+    mean: float
+    peak: float
+    peak_x: float
+
+
+def band_integral(x: np.ndarray, y: np.ndarray, lo: float, hi: float) -> Optional[BandResult]:
+    """Сумма отсчётов в полосе lo…hi (в единицах оси x) и она же над базовой линией."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    lo, hi = min(lo, hi), max(lo, hi)
+    sel = np.flatnonzero((x >= lo) & (x <= hi))
+    if sel.size == 0:
+        return None
+    ys = y[sel]
+    xs = x[sel]
+    if sel.size >= 2:
+        base = np.interp(xs, [xs[0], xs[-1]], [ys[0], ys[-1]])
+    else:
+        base = np.zeros_like(ys)
+    i = int(np.argmax(ys))
+    return BandResult(lo, hi, int(sel.size), float(ys.sum()), float((ys - base).sum()), float(ys.mean()),
+                      float(ys[i]), float(xs[i]))
 
 
 @dataclass

@@ -75,6 +75,11 @@ class Measurement:
     is_background: bool = False
     label: str = ""
     stitched: bool = False                # сшит из нескольких кадров (панорама): «пиксель» не имеет смысла
+    # несколько полос строк: спектр каждой (T×N, полоса 1 = y) и их строки ПЗС
+    tracks: Optional[np.ndarray] = None
+    track_rows: Tuple[Tuple[int, int], ...] = ()
+    defects_fixed: int = 0                # исправлено дефектных пикселей
+    intensity_corrected: str = ""         # как скорректирована интенсивность ("" — нет)
 
     def meta(self) -> Dict[str, object]:
         m: Dict[str, object] = {
@@ -98,7 +103,21 @@ class Measurement:
             m["ccd_temperature_C"] = f"{self.temperature:g}"
         if self.label:
             m["label"] = self.label
+        if self.track_rows and len(self.track_rows) > 1:
+            m["stripes"] = ", ".join(f"{a}-{b}" for a, b in self.track_rows)
+        if self.defects_fixed:
+            m["defect_pixels_fixed"] = str(self.defects_fixed)
+        if self.intensity_corrected:
+            m["intensity_correction"] = self.intensity_corrected
         return m
+
+    @property
+    def n_tracks(self) -> int:
+        return 1 if self.tracks is None else int(self.tracks.shape[0])
+
+    def track(self, i: int) -> np.ndarray:
+        """Спектр полосы i (0 — основная)."""
+        return self.y if i == 0 or self.tracks is None else self.tracks[i]
 
 
 class Instrument:
@@ -122,6 +141,7 @@ class Instrument:
         self._mono_exclusive: Optional[Tuple[str, int]] = None     # (кто, поток) — см. mono_exclusive()
         self.shutter_state: Optional[bool] = None     # последнее известное состояние шторки (True — открыта)
         self.shutter_ttl: Optional[bool] = None       # режим шторки в приборе: True — по экспозиции (TTL)
+        self._corr_warned = False
         self._shutter_warned = False
         self.cooling_target: Optional[int] = None    # уставка, заданная в этом сеансе (None — выкл./неизвестна)
         self._temp_hist: deque = deque(maxlen=400)   # (время, температура ПЗС) — для «уставка недостижима»
@@ -436,11 +456,43 @@ class Instrument:
         if self.camera_stuck:
             raise DeviceError("Камера не отвечает. Нажмите «Переподключить».")
 
+    MAX_STRIPES = 8
+
+    def stripes(self) -> List[Tuple[int, int]]:
+        """Полосы строк ПЗС: [(верх, низ), …], первая — основная (rows_top…rows_bottom)."""
+        s = self.settings
+        h = self.camera.info.height if self.camera is not None and self.camera.info.height else 0
+        out = []
+        for t, b in [(s.rows_top, s.rows_bottom)] + [tuple(p) for p in s.extra_stripes]:
+            t, b = int(round(t)), int(round(b))
+            t = max(0, t)
+            if h:
+                t, b = min(t, h - 1), min(b, h - 1)
+            out.append((t, max(t, b)))
+        return out[:self.MAX_STRIPES]
+
+    def set_stripes(self, stripes: List[Tuple[int, int]]) -> None:
+        """Задать полосы (первая — основная). Не больше MAX_STRIPES."""
+        if not stripes:
+            raise DeviceError("Нужна хотя бы одна полоса строк")
+        if len(stripes) > self.MAX_STRIPES:
+            raise DeviceError(f"Не больше {self.MAX_STRIPES} полос")
+        clean = [(int(min(a, b)), int(max(a, b))) for a, b in stripes]
+        s = self.settings
+        s.rows_top, s.rows_bottom = clean[0]
+        s.extra_stripes = [[a, b] for a, b in clean[1:]]
+
     def acq_settings(self) -> AcqSettings:
         s = self.settings
         info = self.camera.info
+        stripes = self.stripes()
         if s.acq_mode == ACQ_IMAGE:
             region = full_frame_region(info.width, info.height)
+        elif len(stripes) > 1:
+            # несколько полос: строки от верхней до нижней читаются построчно, полосы
+            # суммируются программно (как в SpectraSP — там всегда читался полный кадр)
+            region = spectrum_region(info.width, info.height, min(t for t, _ in stripes),
+                                     max(b for _, b in stripes), False)
         else:
             region = spectrum_region(info.width, info.height, s.rows_top, s.rows_bottom, s.hardware_binning)
             if region.bin_y > info.max_bin_y:
@@ -524,7 +576,27 @@ class Instrument:
                 log.exception("abort")
 
     def _bg_key(self, acq: AcqSettings) -> tuple:
-        return acq.exposure_us, acq.readout_speed, acq.regions, self.settings.flip_x
+        # полосы входят в ключ: фон снимается и вычитается для каждой полосы отдельно
+        return acq.exposure_us, acq.readout_speed, acq.regions, self.settings.flip_x, tuple(self.stripes())
+
+    def _intensity_correct(self, y: np.ndarray, x: np.ndarray, unit: str) -> Tuple[np.ndarray, str]:
+        """y × K: коррекция спектральной чувствительности по таблице из настроек."""
+        s = self.settings
+        if len(s.intensity_corr_points) < 2:
+            return y, ""
+        if s.intensity_corr_by == "wl":
+            if unit != "nm":
+                if not self._corr_warned:
+                    log.warning("Коррекция интенсивности по длинам волн не применена: шкала только в пикселях")
+                    self._corr_warned = True
+                return y, ""
+            k = P.correction_curve(x, s.intensity_corr_points)
+            how = f"по длинам волн, {len(s.intensity_corr_points)} точек"
+        else:
+            k = P.correction_curve(np.arange(y.shape[-1]), s.intensity_corr_points)
+            how = f"по пикселям, {len(s.intensity_corr_points)} точек"
+        self._corr_warned = False
+        return y * k, how
 
     def has_background(self) -> bool:
         return self.camera_connected and not self.background_problem() and \
@@ -548,12 +620,14 @@ class Instrument:
             self._backgrounds.clear()
             self._bg_images.clear()
 
-    def _frame_to_spectrum(self, frame: np.ndarray, acq: AcqSettings) -> np.ndarray:
-        s = self.settings
-        if s.acq_mode == ACQ_IMAGE:
-            top = max(0, s.rows_top)
-            return P.bin_rows(frame, top, s.rows_bottom)
-        return P.to_spectrum(frame)
+    def _frame_to_tracks(self, frame: np.ndarray, acq: AcqSettings) -> np.ndarray:
+        """Кадр → спектры полос (T×N)."""
+        stripes = self.stripes()
+        r = acq.regions[0]
+        if self.settings.acq_mode != ACQ_IMAGE and r.bin_y > 1:
+            return np.asarray(frame, dtype=np.float64)[:1]          # аппаратное объединение: одна строка
+        offset = 0 if self.settings.acq_mode == ACQ_IMAGE else r.top
+        return np.vstack([P.bin_rows(frame, t - offset, b - offset) for t, b in stripes])
 
     def acquire(self, n: Optional[int] = None, progress: Optional[ProgressFn] = None,
                 background: bool = False, label: str = "") -> Measurement:
@@ -622,7 +696,7 @@ class Instrument:
                 if s.flip_x:
                     frame = frame[:, ::-1]
                 sat = sat or P.saturated(frame)
-                spectra.append(self._frame_to_spectrum(frame, acq))
+                spectra.append(self._frame_to_tracks(frame, acq))
         finally:
             if ttl_restore:
                 try:
@@ -638,9 +712,13 @@ class Instrument:
         if progress:
             progress(n, n, "обработка")
         mode = "average" if background else s.accumulate_mode
-        raw = P.combine_frames(spectra, mode=mode, reject_cosmics=s.remove_cosmics)
+        raw = P.combine_frames(spectra, mode=mode, reject_cosmics=s.remove_cosmics)     # T×N
         if s.remove_cosmics and n < 3:
-            raw = P.remove_spikes(raw)
+            raw = np.vstack([P.remove_spikes(t) for t in raw])
+        n_fixed = 0
+        if s.defect_correction and s.defect_pixels:
+            raw = P.fix_defects(raw, s.defect_pixels, flip=s.flip_x)
+            n_fixed = len(s.defect_pixels)
         key = self._bg_key(acq)
         y = raw
         bg_used = False
@@ -662,8 +740,13 @@ class Instrument:
             if bg is not None and bg.shape == raw.shape:
                 y = raw - bg * (n if mode == "sum" else 1)
                 bg_used = True
-        x, unit = self.wavelength_axis(raw.size)
-        m = Measurement(x=x, x_unit=unit, y=y, raw=raw,
+        x, unit = self.wavelength_axis(raw.shape[-1])
+        corrected = ""
+        if s.intensity_corr and not background:
+            y, corrected = self._intensity_correct(y, x, unit)
+        m = Measurement(x=x, x_unit=unit, y=y[0], raw=raw[0],
+                        tracks=y if y.shape[0] > 1 else None, track_rows=tuple(self.stripes()[:y.shape[0]]),
+                        defects_fixed=n_fixed, intensity_corrected=corrected,
                         image=frame if s.acq_mode == ACQ_IMAGE else None,
                         background_used=bg_used, saturated=sat,
                         exposure_ms=acq.exposure_us / 1000.0, accumulations=n, accumulate_mode=mode,

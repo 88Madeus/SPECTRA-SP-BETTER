@@ -290,3 +290,50 @@ def test_spectrum_buffer_in_window(win, app):
     from spectra_better.buffer import SpectrumBuffer
     again = SpectrumBuffer()
     assert again.load_state(win._buffer_path()) == 2 and again.entries[0].name == "эталон"
+
+
+def test_stripes_in_window(win, app, monkeypatch):
+    from spectra_better.gui import main_window as mw
+    win.inst.camera.fibers = [(150, 3, 1.0), (350, 3, 0.4)]
+    win.inst.camera._update_temp = lambda: None
+    win.s.warm_up_on_close = False
+
+    class FakeDlg:
+        def __init__(self, stripes, height, img, estimate, parent):
+            self.est = estimate([(140, 160), (340, 360)])
+
+        def exec_(self):
+            return QtWidgets.QDialog.Accepted
+
+        def stripes(self):
+            return [(140, 160), (340, 360)]
+    monkeypatch.setattr(mw, "StripesDialog", FakeDlg)
+    win.edit_stripes()
+    assert win.inst.stripes() == [(140, 160), (340, 360)]
+    assert not win.acq_panel.hw_bin.isEnabled() and "2 полосы" in win.acq_panel.stripes_info.text()
+    assert len(win.image.extra_regions) == 1                  # вторая полоса нарисована на кадре
+    _snap(win, app)
+    assert win.current.n_tracks == 2 and len(win.plot.track_curves) == 1
+    win.clear_overlays()
+    win.pin_current()                                        # в буфер — обе полосы
+    assert [e.name.split("·")[-1].strip() for e in win.buffer.entries] == ["полоса 1 (140–160)",
+                                                                            "полоса 2 (340–360)"]
+    win.image.extra_regions[0].setRegion((300, 321))          # перетащили вторую полосу
+    win.image._region_changed()
+    assert win.inst.stripes()[1] == (300, 320)
+    win.inst.set_stripes([(140, 160)])
+    win._acq_settings_changed()
+    assert win.image.extra_regions == [] and win.acq_panel.hw_bin.isEnabled()
+
+
+def test_corrections_panel_reflects_settings(win, app):
+    p = win.proc_panel
+    assert not p.defects.isEnabled() and not p.intensity.isEnabled()      # пустые списки — выключено
+    win.s.defect_pixels = [10, 20]
+    win.s.intensity_corr_points = [[400, 1.0], [800, 2.0]]
+    win.s.intensity_corr = True
+    p.load_corrections()
+    assert p.defects.isChecked() and "(2)" in p.defects.text()
+    assert p.intensity.isChecked() and "2 точ." in p.intensity.text()
+    p.intensity.setChecked(False)
+    assert not win.s.intensity_corr
