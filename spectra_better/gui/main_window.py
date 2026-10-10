@@ -244,6 +244,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, rdock)
         self.buffer_panel = BufferPanel(self.buffer)
         self.buffer_panel.auto.setChecked(self.s.buffer_auto)
+        self.buffer_panel.offset.setValue(self.s.buffer_offset)
         bdock = QtWidgets.QDockWidget("Буфер спектров", self)
         bdock.setObjectName("dock_buffer")
         bdock.setWidget(self.buffer_panel)
@@ -313,6 +314,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bp.save_entries.connect(self.save_buffer_entries)
         bp.make_current.connect(self.buffer_to_current)
         bp.auto.toggled.connect(lambda on: setattr(self.s, "buffer_auto", on))
+        bp.offset.valueChanged.connect(lambda v: setattr(self.s, "buffer_offset", float(v)))
 
         self.cam_panel.cooling_on.connect(self.cooling_on)
         self.cam_panel.cooling_off.connect(self.cooling_off)
@@ -1347,13 +1349,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if key not in shown:
                 self.plot.remove_overlay(key)
         hidden = set()
-        for key, e in shown.items():
+        step = float(self.buffer_panel.offset.value())
+        for n, (key, e) in enumerate(shown.items()):
             x = self._x_in(e.m, unit, laser)
+            y = e.m.y + step * (n + 1) if step else e.m.y      # «лесенка»: текущий спектр — внизу
             item = self.plot.overlays.get(key)
             if item is None or item.name() != e.name:
-                self.plot.add_overlay(key, x, e.m.y, e.name, entry_color(e))
+                self.plot.add_overlay(key, x, y, e.name, entry_color(e))
             else:
-                self.plot.update_overlay(key, x, e.m.y)
+                self.plot.update_overlay(key, x, y)
             if x is None:
                 hidden.add(key)
         self.buffer_panel.mark_unavailable(

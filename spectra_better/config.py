@@ -86,6 +86,7 @@ class AppSettings:
     subtract_background: bool = True
     close_shutter_for_background: bool = True
     buffer_auto: bool = False                 # класть каждый снимок в буфер спектров
+    buffer_offset: float = 0.0                # «лесенка»: сдвиг по Y между спектрами буфера (0 — наложение)
     shutter_ttl: bool = False                 # шторку открывает сигнал экспозиции камеры (режим TTL DevCtrl)
     remove_cosmics: bool = False
     laser_nm: float = 532.0

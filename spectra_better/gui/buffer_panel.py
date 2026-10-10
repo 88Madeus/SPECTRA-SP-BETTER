@@ -83,6 +83,23 @@ class BufferPanel(QtWidgets.QWidget):
         self.auto.setToolTip("Каждый «Снимок», серия и панорама попадают в буфер автоматически "
                              "(кадры непрерывной съёмки — нет)")
         lay.addWidget(self.auto)
+        off = QtWidgets.QHBoxLayout()
+        self.offset = QtWidgets.QDoubleSpinBox()
+        self.offset.setRange(0, 1e9)
+        self.offset.setDecimals(0)
+        self.offset.setSingleStep(1000)
+        self.offset.setSpecialValueText("нет")
+        self.offset.setToolTip("Сдвиг по вертикали между отмеченными спектрами буфера — «лесенка» для "
+                               "сравнения серии (0 — спектры накладываются)")
+        self.btn_offset = QtWidgets.QToolButton()
+        self.btn_offset.setText("авто")
+        self.btn_offset.setToolTip("Сдвиг, равный размаху самого высокого из отмеченных спектров")
+        off.addWidget(QtWidgets.QLabel("Лесенка, сдвиг:"))
+        off.addWidget(self.offset, 1)
+        off.addWidget(self.btn_offset)
+        lay.addLayout(off)
+        self.offset.valueChanged.connect(lambda _: self.changed.emit())
+        self.btn_offset.clicked.connect(self._auto_offset)
 
         lay.addWidget(QtWidgets.QLabel("Свойства:"))
         self.props = QtWidgets.QTableWidget(0, 2)
@@ -178,6 +195,14 @@ class BufferPanel(QtWidgets.QWidget):
             self.buffer.remove(keys)
             self.refresh()
             self.changed.emit()
+
+    def _auto_offset(self) -> None:
+        import numpy as np
+        spans = [float(np.nanmax(e.m.y) - np.nanmin(e.m.y)) for e in self.buffer.visible()
+                 if e.m.y.size and np.isfinite(e.m.y).any()]
+        if spans:
+            self.offset.setValue(round(max(spans), -int(np.floor(np.log10(max(spans)))) + 1) if max(spans) > 0
+                                 else 0)
 
     def _ask_clear(self) -> None:
         if not len(self.buffer):

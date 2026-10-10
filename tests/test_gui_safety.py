@@ -452,3 +452,20 @@ def test_open_frame_and_restripe(win, app, tmp_path):
     win.inst.set_stripes([(90, 110), (300, 320)])            # добавили полосу — спектры пересчитаны
     win._refresh_file_frame()
     assert win.current.n_tracks == 2 and win.current.track(1).max() < 21 * 400
+
+
+def test_buffer_waterfall_offset(win, app):
+    win.clear_overlays()
+    _snap(win, app)
+    win.pin_current()
+    win.pin_current()
+    k1, k2 = (e.key for e in win.buffer.entries)
+    win.buffer_panel.offset.setValue(1000)
+    assert win.s.buffer_offset == 1000
+    y0 = win.buffer.get(k1).m.y
+    assert np.allclose(win.plot.overlays[k1].yData, y0 + 1000)
+    assert np.allclose(win.plot.overlays[k2].yData, y0 + 2000)
+    win.buffer_panel._auto_offset()
+    assert win.buffer_panel.offset.value() > 0
+    win.buffer_panel.offset.setValue(0)
+    assert np.allclose(win.plot.overlays[k2].yData, y0)
