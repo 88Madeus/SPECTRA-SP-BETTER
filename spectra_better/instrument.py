@@ -80,6 +80,7 @@ class Measurement:
     track_rows: Tuple[Tuple[int, int], ...] = ()
     defects_fixed: int = 0                # исправлено дефектных пикселей
     intensity_corrected: str = ""         # как скорректирована интенсивность ("" — нет)
+    comment: str = ""                     # комментарий пользователя (образец, условия)
 
     def meta(self) -> Dict[str, object]:
         m: Dict[str, object] = {
@@ -103,6 +104,8 @@ class Measurement:
             m["ccd_temperature_C"] = f"{self.temperature:g}"
         if self.label:
             m["label"] = self.label
+        if self.comment:
+            m["comment"] = self.comment
         if self.track_rows and len(self.track_rows) > 1:
             m["stripes"] = ", ".join(f"{a}-{b}" for a, b in self.track_rows)
         if self.defects_fixed:
@@ -746,7 +749,7 @@ class Instrument:
             y, corrected = self._intensity_correct(y, x, unit)
         m = Measurement(x=x, x_unit=unit, y=y[0], raw=raw[0],
                         tracks=y if y.shape[0] > 1 else None, track_rows=tuple(self.stripes()[:y.shape[0]]),
-                        defects_fixed=n_fixed, intensity_corrected=corrected,
+                        defects_fixed=n_fixed, intensity_corrected=corrected, comment=s.comment.strip(),
                         image=frame if s.acq_mode == ACQ_IMAGE else None,
                         background_used=bg_used, saturated=sat,
                         exposure_ms=acq.exposure_us / 1000.0, accumulations=n, accumulate_mode=mode,
@@ -1039,8 +1042,9 @@ class Instrument:
             return False
 
     # ================================================================ панорама
-    def panorama_plan(self, start_nm: float, end_nm: float, overlap: float = 0.15) -> List[float]:
-        """Центральные длины волн для панорамы с заданным перекрытием."""
+    def panorama_plan(self, start_nm: float, end_nm: float, overlap: float = 0.15, trim: int = 0) -> List[float]:
+        """Центральные длины волн для панорамы с заданным перекрытием (trim — отбрасываемые
+        точки с каждого края кадра: рабочая ширина кадра меньше)."""
         if not self.camera_connected or self.mono_wl is None:
             raise DeviceError("Нужны подключённые камера и монохроматор")
         n_pix = self.camera.info.width
@@ -1051,7 +1055,7 @@ class Instrument:
             x, unit = self.axis.axis(n_pix, c, self.mono_grating, None)
             if unit != "nm":
                 raise DeviceError("Для панорамы нужна калибровка шкалы длин волн")
-            width = abs(x[-1] - x[0])
+            width = abs(x[-1] - x[0]) * max(0.1, 1 - 2 * trim / max(1, n_pix))
             if not centers:
                 c = lo + width / 2
                 x, _ = self.axis.axis(n_pix, c, self.mono_grating, None)

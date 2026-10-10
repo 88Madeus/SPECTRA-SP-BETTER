@@ -184,6 +184,12 @@ class AcquisitionPanel(QtWidgets.QGroupBox):
         self.estimate = QtWidgets.QLabel("")
         self.estimate.setStyleSheet("color: #555;")
         form.addRow(self.estimate)
+        self.comment = QtWidgets.QLineEdit()
+        self.comment.setPlaceholderText("образец, условия…")
+        self.comment.setToolTip("Комментарий записывается в каждый снимок: в файл, в название и свойства в буфере")
+        self.comment.setText(settings.comment)
+        self.comment.textChanged.connect(lambda t: setattr(self.s, "comment", t))
+        form.addRow("Комментарий:", self.comment)
         self.load_from_settings()
         for w in (self.exposure, self.accum, self.top, self.bottom):
             w.valueChanged.connect(self._store)

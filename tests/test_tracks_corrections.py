@@ -154,3 +154,44 @@ def test_band_integral():
     assert r.peak == 15 and 40 <= r.peak_x <= 60
     assert P.band_integral(x, y, 200, 300) is None
     assert P.band_integral(x[::-1], y[::-1], 70, 30).net == pytest.approx(21 * 5)
+
+
+# ------------------------------------------------------------------ калькулятор
+def test_spectrum_math():
+    xa = np.linspace(500, 600, 101)
+    a = np.full(101, 10.0)
+    xb = np.linspace(550, 650, 101)                           # B сдвинут: перекрытие 550…600 нм
+    b = np.full(101, 4.0)
+    d = P.spectrum_math("sub", xa, a, xb, b)
+    assert np.isnan(d[:50]).all() and np.allclose(d[50:], 6.0)  # вне диапазона B — NaN
+    t = P.spectrum_math("trans", xa, a, xa, b * 2.5)
+    assert np.allclose(t, 100.0)
+    od = P.spectrum_math("absorb", xa, a, xa, a * 10)
+    assert np.allclose(od, 1.0)                                # пропускание 10 % → D = 1
+    z = P.spectrum_math("div", xa, a, xa, np.zeros(101))
+    assert np.isnan(z).all()
+    assert np.allclose(P.spectrum_math("norm_max", xa, a * np.linspace(0, 2, 101)).max(), 1.0)
+    assert np.allclose(P.spectrum_math("scale", xa, a, k=3), 30.0)
+    with pytest.raises(ValueError):
+        P.spectrum_math("sub", xa, a, None, b[:5], same_axis=True)
+
+
+# ------------------------------------------------------------------ панорама: обрезка и выравнивание
+def test_stitch_trim_and_equalize():
+    x1 = np.linspace(500, 520, 201)
+    x2 = np.linspace(515, 535, 201)
+    truth = lambda x: 100 + 50 * np.sin(x / 3)                 # noqa: E731
+    y1 = truth(x1)
+    y2 = truth(x2) * 1.5                                     # второй кадр на 50 % ярче
+    y2[:5] = 1e5                                             # испорченный край кадра
+    x, y = P.stitch([(x1, y1), (x2, y2)], trim=5, equalize=True)
+    assert x[0] >= x1[5] - 1e-9 and x[-1] <= x2[-6] + 1e-9   # края отброшены
+    assert np.max(np.abs(y / truth(x) - 1)) < 0.03           # уровни совпали, выброса нет
+    _, y_raw = P.stitch([(x1, y1), (x2, y2)])
+    assert np.max(np.abs(y_raw / truth(np.linspace(500, 535, y_raw.size)) - 1)) > 0.2
+
+
+def test_comment_goes_into_measurement(inst):
+    inst.settings.comment = "  кристалл №3 "
+    m = inst.acquire()
+    assert m.comment == "кристалл №3" and m.meta()["comment"] == "кристалл №3"

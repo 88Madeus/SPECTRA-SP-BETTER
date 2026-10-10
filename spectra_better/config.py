@@ -70,6 +70,7 @@ class AppSettings:
     extra_stripes: List[List[float]] = field(default_factory=list)
     hardware_binning: bool = True
     flip_x: bool = False
+    comment: str = ""                         # комментарий к снимкам (образец, условия) — в файлы и в буфер
     frame_timeout_s: float = 30.0             # запас сверх ожидаемого времени кадра
 
     # охлаждение (уставка не хранится — см. COOLING_TARGET_DEFAULT_C)

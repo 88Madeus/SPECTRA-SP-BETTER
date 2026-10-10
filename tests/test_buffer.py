@@ -62,3 +62,12 @@ def test_state_roundtrip(tmp_path):
     c.clear()
     c.save_state(path)                             # пустой буфер — файл удаляется
     assert SpectrumBuffer().load_state(path) == 0
+
+
+def test_comment_in_name_and_props():
+    b = SpectrumBuffer()
+    m = meas()
+    m.comment = "образец 7, 77 K"
+    e = b.add(m)
+    assert e.name.startswith("образец 7, 77 K · ")
+    assert dict(b.properties(e.key))["Комментарий"] == "образец 7, 77 K"

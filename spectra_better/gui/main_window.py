@@ -24,6 +24,7 @@ from ..storage import load_spectrum, save_image, save_spectrum, unique_path
 from ..units import (X_DECIMALS, X_EV, X_NM, X_PX, X_RAMAN, X_SHORT, X_UNITS, X_WAVENUMBER, AxisMap, from_nm,
                      is_spectral)
 from .bands import BandHistory, BandsHistoryWindow, BandsPanel
+from .calculator import CalculatorDialog
 from .buffer_panel import BufferPanel, entry_color
 from .tools_dialogs import DefectPixelsDialog, IntensityCorrectionDialog, StripesDialog
 from .dialogs import BusyDialog, CalibrationDialog, PanoramaDialog, SeriesDialog, SettingsDialog
@@ -49,6 +50,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.buffer = SpectrumBuffer()
         self.band_history = BandHistory()
         self._hist_win: Optional[BandsHistoryWindow] = None
+        self._calc: Optional[CalculatorDialog] = None
         self._scale = None                        # (пересчёт единиц, единицы) последней перерисовки
         try:
             n = self.buffer.load_state(self._buffer_path())
@@ -128,6 +130,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_pano = act("Панорама…", SP.SP_ArrowRight, None, "Спектр широкого диапазона со сшивкой")
         self.act_save = act("Сохранить спектр…", SP.SP_DialogSaveButton, "Ctrl+S", "Сохранить текущий спектр")
         self.act_save_img = act("Сохранить кадр…", None, None, "Сохранить изображение ПЗС")
+        self.act_export = act("Сохранить график…", None, "Ctrl+Shift+S",
+                              "Картинка PNG или SVG того, что сейчас на графике (спектр или кадр ПЗС) — для отчёта")
         self.act_open = act("Открыть спектр…", SP.SP_DialogOpenButton, "Ctrl+O",
                             "Загрузить спектры из файлов в буфер для сравнения")
         self.act_pin = act("В буфер", SP.SP_DialogYesButton, "Ctrl+D",
@@ -137,6 +141,11 @@ class MainWindow(QtWidgets.QMainWindow):
                                  "Показать весь спектр по X и подобрать масштаб по Y")
         self.act_calib = act("Калибровка шкалы…", None, None, "Центральный пиксель, модель, поправка по реперным линиям")
         self.act_settings = act("Настройки…", SP.SP_FileDialogDetailedView, None, "Каталог SpectraSP, таймауты")
+        self.act_calc = act("Калькулятор спектров…", None, "Ctrl+M",
+                            "Разность, отношение, пропускание, оптическая плотность, нормировка")
+        self.act_bands_peaks = act("Участки по пикам", None, None,
+                                   "Создать участки интегрирования вокруг найденных пиков текущего спектра")
+        self.act_band_hist = act("История участков…", None, None, "Результаты участков интегрирования во времени")
         self.act_stripes = act("Полосы строк…", None, None, "Несколько полос строк ПЗС — свой спектр с каждой")
         self.act_defects = act("Дефектные пиксели…", None, None, "Список «горячих» и «мёртвых» столбцов ПЗС")
         self.act_intensity = act("Коррекция интенсивности…", None, None,
@@ -155,7 +164,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         mb = self.menuBar()
         m = mb.addMenu("&Файл")
-        for a in (self.act_open, self.act_save, self.act_save_img, None, self.act_exit):
+        for a in (self.act_open, self.act_save, self.act_save_img, self.act_export, None, self.act_exit):
             m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("&Прибор")
         for a in (self.act_connect, self.act_disconnect, self.act_reconnect_cam, None, self.act_service):
@@ -166,6 +175,9 @@ class MainWindow(QtWidgets.QMainWindow):
         m = mb.addMenu("&Вид")
         for a in (self.act_autorange, self.act_pin, self.act_clear):
             m.addAction(a)
+        m = mb.addMenu("&Анализ")
+        for a in (self.act_calc, None, self.act_bands_peaks, self.act_band_hist):
+            m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("&Настройка")
         for a in (self.act_calib, self.act_stripes, self.act_defects, self.act_intensity, self.act_settings):
             m.addAction(a)
@@ -279,6 +291,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_about.triggered.connect(self.about)
         self.act_exit.triggered.connect(self.close)
         self.bands_panel.changed.connect(self._redraw)
+        self.act_calc.triggered.connect(self.calculator)
+        self.act_export.triggered.connect(self.export_plot)
+        self.act_bands_peaks.triggered.connect(self.bands_from_peaks)
+        self.act_band_hist.triggered.connect(self.show_band_history)
         self.bands_panel.track_changed.connect(lambda _: self._redraw())
         self.bands_panel.add_requested.connect(self.add_band)
         self.bands_panel.history_requested.connect(self.show_band_history)
@@ -882,8 +898,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start("series", loop)
 
     def panorama(self) -> None:
-        def plan_fn(a, b, ov):
-            return self.inst.panorama_plan(a, b, ov)
+        def plan_fn(a, b, ov, trim=0):
+            return self.inst.panorama_plan(a, b, ov, trim)
         start, end = self.inst.setup.main.panorama if self.inst.setup and self.inst.setup.main.panorama[1] > 0 \
             else (400.0, 700.0)
         dlg = PanoramaDialog(start, end, plan_fn, self)
@@ -891,7 +907,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         p = dlg.params()
         try:
-            plan = self.inst.panorama_plan(p.start, p.end, p.overlap)
+            plan = self.inst.panorama_plan(p.start, p.end, p.overlap, p.trim)
         except DeviceError as e:
             self._error("Панорама", e)
             return
@@ -916,7 +932,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     segments.append((m.x, m.y))
                     self.emitter.measurement.emit(m)
                 if segments and not self._acq_stop.is_set():
-                    x, y = P.stitch(segments)
+                    x, y = P.stitch(segments, trim=p.trim, equalize=p.equalize)
                     mm = Measurement(x=x, x_unit="nm", y=y, raw=y, exposure_ms=m.exposure_ms,
                                      accumulations=m.accumulations, center_wl=None, grating=m.grating,
                                      grating_title=m.grating_title, label=f"Панорама {p.start:g}–{p.end:g} нм",
@@ -1073,6 +1089,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.peaks_table.setRowCount(0)
         self.peaks_table.setHorizontalHeaderLabels([f"Положение, {X_SHORT.get(unit, unit)}", "Высота",
                                                     "Ширина", "Линия"])
+        ok = np.isfinite(y) & np.isfinite(x)
+        if not ok.all():                             # результат калькулятора может содержать NaN
+            x, y = x[ok], y[ok]
         if not self.proc_panel.peaks.isChecked() or y.size < 5:
             self.plot.show_peaks([], [], [])
             return
@@ -1161,6 +1180,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.s.bands.append({"lo": lo, "hi": hi, "unit": store})
         self.analysis_tabs.setCurrentWidget(self.bands_panel)
         self._redraw()
+
+    def bands_from_peaks(self) -> None:
+        """Участки вокруг найденных пиков (±1.5 ширины на полувысоте), не больше MAX_BANDS."""
+        m = self.current
+        if m is None:
+            return
+        unit = "nm" if m.x_unit == "nm" else "px"
+        x = m.x if unit == "nm" else np.arange(m.y.size, dtype=float)
+        ok = np.isfinite(m.y)
+        peaks = sorted(P.find_peaks(x[ok], m.y[ok], max_peaks=self.MAX_BANDS), key=lambda p: -p.height)
+        if not peaks:
+            self.statusBar().showMessage("Пиков не найдено", 5000)
+            return
+        self.s.bands = [{"lo": p.x - 1.5 * max(p.fwhm, 1e-6), "hi": p.x + 1.5 * max(p.fwhm, 1e-6), "unit": unit}
+                        for p in sorted(peaks[:self.MAX_BANDS], key=lambda p: p.x)]
+        self.analysis_tabs.setCurrentWidget(self.bands_panel)
+        self._redraw()
+        log.info("Участки интегрирования по пикам: %d", len(self.s.bands))
+
+    def calculator(self) -> None:
+        def sources():
+            out = [("Текущий спектр", self.current)] if self.current is not None else []
+            return out + [(e.name, e.m) for e in self.buffer.entries]
+
+        def result(m, name, props):
+            e = self.buffer.add(m, name, props=props)
+            self.buffer_panel.refresh()
+            self.buffer_panel.select(e.key)
+            self._redraw()
+            log.info("Калькулятор: %s", props.get("formula", name))
+        if self._calc is None:
+            self._calc = CalculatorDialog(sources, result, self)
+            self.buffer_panel.changed.connect(self._calc.refresh)
+        self._calc.refresh()
+        self._calc.show()
+        self._calc.raise_()
 
     def show_band_history(self) -> None:
         if self._hist_win is None:
@@ -1362,11 +1417,41 @@ class MainWindow(QtWidgets.QMainWindow):
         save_spectrum(path, m.x if m.x_unit == "nm" else np.arange(m.y.size), m.y, meta,
                       x_name=x_name, extra=extra)
 
+    def export_plot(self) -> None:
+        """Картинка графика (PNG — растровая, SVG — векторная, для статей и отчётов)."""
+        import pyqtgraph.exporters as pex
+        image_tab = self.tabs.currentIndex() == 1
+        item = self.image.plot_item if image_tab else self.plot.plot.getPlotItem()
+        m = self.current
+        stem = ("ccd_" if image_tab else "spectrum_") + (f"{m.timestamp:%Y%m%d_%H%M%S}" if m is not None else "plot")
+        start = os.path.join(self.s.save_dir or os.path.expanduser("~"), stem + ".png")
+        path, flt = QtWidgets.QFileDialog.getSaveFileName(self, "Сохранить график", start,
+                                                          "PNG (*.png);;SVG — векторный (*.svg)")
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".svg" if "svg" in flt.lower() else ".png"
+        try:
+            if path.lower().endswith(".svg"):
+                pex.SVGExporter(item).export(path)
+            else:
+                ex = pex.ImageExporter(item)
+                ex.parameters()["width"] = 1600
+                ex.export(path)
+        except Exception as e:  # noqa: BLE001 — сообщить, а не упасть
+            self._error("Сохранение графика", e)
+            return
+        log.info("График сохранён: %s", path)
+        self.statusBar().showMessage(f"График сохранён: {path}", 6000)
+
     def save_current(self) -> None:
         m = self.current
         if m is None:
             return
         stem = f"{m.timestamp:%Y%m%d_%H%M%S}" + (f"_{m.center_wl:.0f}nm" if m.center_wl else "")
+        if m.comment:
+            safe = "".join("_" if c in '<>:"/\\|?*' else c for c in m.comment).strip()[:40]
+            stem = f"{safe}_{stem}" if safe else stem
         start = os.path.join(self.s.save_dir or os.path.expanduser("~"), stem + self.s.save_format)
         path, flt = QtWidgets.QFileDialog.getSaveFileName(
             self, "Сохранить спектр", start, "Текст, табуляция (*.txt);;CSV для Excel (*.csv)")

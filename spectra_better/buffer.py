@@ -34,6 +34,7 @@ class BufferEntry:
 
 # названия свойств для таблицы «Свойства» (ключи — из Measurement.meta())
 PROP_TITLES = {
+    "comment": "Комментарий",
     "measurement_time": "Время",
     "type": "Тип",
     "exposure_ms": "Экспозиция, мс",
@@ -77,6 +78,8 @@ class SpectrumBuffer:
     @staticmethod
     def default_name(m: Measurement) -> str:
         name = m.label or f"{m.timestamp:%H:%M:%S}"
+        if m.comment and not m.label:
+            name = f"{m.comment} · {name}"
         if m.center_wl is not None and not m.label:
             name += f"  {m.center_wl:.1f} нм"
         if m.exposure_ms and not m.label:

@@ -214,6 +214,73 @@ def build_correction(x: np.ndarray, measured: np.ndarray, reference: np.ndarray,
     return [[a, b / mean] for a, b in sorted(pts)]
 
 
+# ---------------------------------------------------------------- калькулятор спектров
+# операция: (подпись, нужен ли второй спектр, нужен ли коэффициент)
+OPERATIONS = {
+    "sub": ("A − B (разность)", True, False),
+    "add": ("A + B (сумма)", True, False),
+    "div": ("A ÷ B (отношение)", True, False),
+    "mul": ("A × B", True, False),
+    "trans": ("пропускание A ÷ B × 100 %", True, False),
+    "absorb": ("оптическая плотность −lg(A ÷ B)", True, False),
+    "scale": ("A × k", False, True),
+    "offset": ("A + k", False, True),
+    "norm_max": ("A ÷ max(A) (нормировка на максимум)", False, False),
+    "norm_area": ("A ÷ Σ|A| (нормировка на площадь)", False, False),
+}
+
+
+def spectrum_math(op: str, xa: np.ndarray, ya: np.ndarray, xb: Optional[np.ndarray] = None,
+                  yb: Optional[np.ndarray] = None, k: float = 1.0, same_axis: bool = False) -> np.ndarray:
+    """Результат операции op на сетке A. B пересчитывается на ось A линейной интерполяцией
+    (same_axis=True — оси в пикселях: длины должны совпадать). Там, где делить нельзя, — NaN."""
+    if op not in OPERATIONS:
+        raise ValueError(f"Неизвестная операция {op}")
+    a = np.asarray(ya, dtype=np.float64)
+    _title, need_b, _need_k = OPERATIONS[op]
+    if need_b:
+        if yb is None:
+            raise ValueError("Нужен второй спектр")
+        b = np.asarray(yb, dtype=np.float64)
+        if same_axis:
+            if b.size != a.size:
+                raise ValueError("Спектры в пикселях разной длины — сравнивать нельзя")
+        else:
+            xa_ = np.asarray(xa, dtype=np.float64)
+            xb_ = np.asarray(xb, dtype=np.float64)
+            order = np.argsort(xb_)
+            lo, hi = xb_[order][0], xb_[order][-1]
+            b = np.interp(xa_, xb_[order], b[order])
+            b[(xa_ < lo) | (xa_ > hi)] = np.nan               # вне диапазона B результата нет
+        with np.errstate(divide="ignore", invalid="ignore"):
+            if op == "sub":
+                return a - b
+            if op == "add":
+                return a + b
+            if op == "mul":
+                return a * b
+            tiny = 1e-12 * max(1.0, float(np.nanmax(np.abs(b))) if np.isfinite(b).any() else 1.0)
+            ratio = np.where(np.abs(b) > tiny, a / b, np.nan)
+            if op == "div":
+                return ratio
+            if op == "trans":
+                return ratio * 100.0
+            return np.where(ratio > 0, -np.log10(np.where(ratio > 0, ratio, 1.0)), np.nan)
+    if op == "scale":
+        return a * float(k)
+    if op == "offset":
+        return a + float(k)
+    if op == "norm_max":
+        m = np.nanmax(a)
+        if not np.isfinite(m) or m == 0:
+            raise ValueError("Максимум спектра равен нулю")
+        return a / m
+    area = np.nansum(np.abs(a))
+    if area == 0:
+        raise ValueError("Площадь спектра равна нулю")
+    return a / area
+
+
 # ---------------------------------------------------------------- интегрирование в полосе
 @dataclass
 class BandResult:
@@ -233,7 +300,7 @@ def band_integral(x: np.ndarray, y: np.ndarray, lo: float, hi: float) -> Optiona
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     lo, hi = min(lo, hi), max(lo, hi)
-    sel = np.flatnonzero((x >= lo) & (x <= hi))
+    sel = np.flatnonzero((x >= lo) & (x <= hi) & np.isfinite(y))
     if sel.size == 0:
         return None
     ys = y[sel]
@@ -310,10 +377,14 @@ def find_peaks(x: np.ndarray, y: np.ndarray, min_prominence: Optional[float] = N
     return peaks
 
 
-def stitch(segments: Sequence[tuple], step: Optional[float] = None) -> tuple:
+def stitch(segments: Sequence[tuple], step: Optional[float] = None, trim: int = 0,
+           equalize: bool = False) -> tuple:
     """Сшить спектры (x, y) с перекрытием в панораму с плавным переходом.
 
     Каждый сегмент — (x, y) с монотонной осью x. Результат на общей сетке.
+    trim — сколько точек отбросить с каждого края кадра (края ПЗС хуже: виньетирование,
+    расфокусировка). equalize — подогнать уровень каждого следующего сегмента к предыдущему
+    по общему участку (как «Equalization» SpectraSP); множитель ограничен 0,2…5.
     """
     segs = []
     for x, y in segments:
@@ -321,9 +392,27 @@ def stitch(segments: Sequence[tuple], step: Optional[float] = None) -> tuple:
         y = np.asarray(y, dtype=np.float64)
         if x[0] > x[-1]:
             x, y = x[::-1], y[::-1]
+        if trim > 0 and x.size > 2 * trim + 2:
+            x, y = x[trim:-trim], y[trim:-trim]
         segs.append((x, y))
     if not segs:
         raise ValueError("Нет сегментов")
+    if equalize and len(segs) > 1:
+        segs.sort(key=lambda s: s[0][0])
+        out = [segs[0]]
+        for x, y in segs[1:]:
+            px, py = out[-1]
+            lo, hi = max(x[0], px[0]), min(x[-1], px[-1])
+            k = 1.0
+            if hi > lo:
+                sel = (x >= lo) & (x <= hi)
+                cur = y[sel]
+                prev = np.interp(x[sel], px, py)
+                sc, sp = float(np.sum(cur)), float(np.sum(prev))
+                if cur.size >= 3 and sc > 0 and sp > 0 and 0.2 <= sp / sc <= 5.0:
+                    k = sp / sc
+            out.append((x, y * k))
+        segs = out
     if step is None:
         step = min(np.median(np.diff(x)) for x, _ in segs)
     lo = min(x[0] for x, _ in segs)

@@ -370,3 +370,40 @@ def test_band_integration_and_history(win, app, tmp_path):
     win.show_band_history()
     assert "снимков: 3" in win._hist_win.info.text()
     win._hist_win.close()
+
+
+def test_calculator_difference_into_buffer(win, app):
+    win.inst.camera._update_temp = lambda: None
+    win.s.warm_up_on_close = False
+    win.clear_overlays()
+    win.goto_wavelength(546.0)                                # линии ртути — есть пики
+    pump(app, 1.0)
+    _snap(win, app)
+    win.pin_current()
+    win.calculator()
+    c = win._calc
+    c.a.setCurrentIndex(0)                                    # текущий
+    c.b.setCurrentIndex(1)                                    # он же из буфера
+    c.op.setCurrentIndex(c.op.findData("sub"))
+    m = c.calculate()
+    assert m is not None and np.nanmax(np.abs(m.y)) < 1e-9     # разность с самим собой — ноль
+    assert len(win.buffer) == 2 and "−" in win.buffer.entries[-1].name
+    assert win.buffer.entries[-1].props["formula"].startswith("[Текущий спектр] −")
+    c.op.setCurrentIndex(c.op.findData("norm_max"))
+    m = c.calculate()
+    assert np.nanmax(m.y) == pytest.approx(1.0)
+    win.bands_from_peaks()
+    assert 1 <= len(win.s.bands) <= win.MAX_BANDS
+    c.close()
+
+
+def test_export_plot_png_svg(win, app, tmp_path, monkeypatch):
+    _snap(win, app)
+    QFD = QtWidgets.QFileDialog
+    for name in ("g.png", "g.svg"):
+        target = str(tmp_path / name)
+        monkeypatch.setattr(QFD, "getSaveFileName", staticmethod(lambda *a, **k: (target, "")))
+        win.export_plot()
+        assert os.path.getsize(target) > 1000
+    assert (tmp_path / "g.png").read_bytes()[:4] == b"\x89PNG"
+    assert b"<svg" in (tmp_path / "g.svg").read_bytes()[:2000]
