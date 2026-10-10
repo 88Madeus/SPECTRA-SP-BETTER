@@ -3,6 +3,7 @@ import os
 import threading
 import time
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -337,3 +338,35 @@ def test_corrections_panel_reflects_settings(win, app):
     assert p.intensity.isChecked() and "2 точ." in p.intensity.text()
     p.intensity.setChecked(False)
     assert not win.s.intensity_corr
+
+
+def test_band_integration_and_history(win, app, tmp_path):
+    win.inst.camera._update_temp = lambda: None
+    win.s.warm_up_on_close = False
+    win.s.bands = []
+    win.goto_wavelength(546.0)
+    pump(app, 1.0)
+    _snap(win, app)
+    win.add_band()
+    assert len(win.s.bands) == 1 and win.s.bands[0]["unit"] == "nm"
+    win.s.bands[0].update(lo=545.5, hi=546.6)                 # вокруг линии ртути 546.07 нм
+    win._redraw()
+    res = win._band_results(win.current)[0]
+    assert res is not None and res.net > 1000 and abs(res.centroid - 546.07) < 0.15
+    assert win.plot.band_items[0].isVisible()
+    assert win.bands_panel.table.item(0, 3).text() not in ("", "—")
+    win.plot.band_items[0].setRegion((545.0, 547.0))          # перетащили на графике
+    win.plot._band_changed(0)
+    assert win.s.bands[0]["lo"] == pytest.approx(545.0) and win.s.bands[0]["hi"] == pytest.approx(547.0)
+    win.band_history.clear()
+    for _ in range(3):
+        _snap(win, app)
+    t, v = win.band_history.series(0, "net")
+    assert len(v) == 3 and np.all(v > 0)
+    path = tmp_path / "h.csv"
+    win.band_history.save_csv(str(path), "nm")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("time;seconds;band1_net") and len(lines) == 4
+    win.show_band_history()
+    assert "снимков: 3" in win._hist_win.info.text()
+    win._hist_win.close()

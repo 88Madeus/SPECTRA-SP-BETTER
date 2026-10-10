@@ -23,6 +23,7 @@ from ..reference_lines import nearest_line
 from ..storage import load_spectrum, save_image, save_spectrum, unique_path
 from ..units import (X_DECIMALS, X_EV, X_NM, X_PX, X_RAMAN, X_SHORT, X_UNITS, X_WAVENUMBER, AxisMap, from_nm,
                      is_spectral)
+from .bands import BandHistory, BandsHistoryWindow, BandsPanel
 from .buffer_panel import BufferPanel, entry_color
 from .tools_dialogs import DefectPixelsDialog, IntensityCorrectionDialog, StripesDialog
 from .dialogs import BusyDialog, CalibrationDialog, PanoramaDialog, SeriesDialog, SettingsDialog
@@ -46,6 +47,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current: Optional[Measurement] = None
         self.background: Optional[Measurement] = None
         self.buffer = SpectrumBuffer()
+        self.band_history = BandHistory()
+        self._hist_win: Optional[BandsHistoryWindow] = None
+        self._scale = None                        # (пересчёт единиц, единицы) последней перерисовки
         try:
             n = self.buffer.load_state(self._buffer_path())
             if n:
@@ -211,10 +215,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.peaks_table.verticalHeader().setVisible(False)
         self.peaks_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         rv.addWidget(self.peaks_table, 1)
-        right.setMinimumWidth(330)
+        self.analysis_tabs = QtWidgets.QTabWidget()
+        self.analysis_tabs.addTab(right, "Пики")
+        self.bands_panel = BandsPanel(self.s)
+        self.analysis_tabs.addTab(self.bands_panel, "Интегрирование")
+        self.analysis_tabs.setMinimumWidth(330)
         rdock = QtWidgets.QDockWidget("Анализ", self)
         rdock.setObjectName("dock_analysis")
-        rdock.setWidget(right)
+        rdock.setWidget(self.analysis_tabs)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, rdock)
         self.buffer_panel = BufferPanel(self.buffer)
         self.buffer_panel.auto.setChecked(self.s.buffer_auto)
@@ -270,6 +278,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_settings.triggered.connect(self.settings_dialog)
         self.act_about.triggered.connect(self.about)
         self.act_exit.triggered.connect(self.close)
+        self.bands_panel.changed.connect(self._redraw)
+        self.bands_panel.track_changed.connect(lambda _: self._redraw())
+        self.bands_panel.add_requested.connect(self.add_band)
+        self.bands_panel.history_requested.connect(self.show_band_history)
+        self.plot.band_moved.connect(self._band_moved)
         bp = self.buffer_panel
         bp.changed.connect(self._redraw)
         bp.add_current.connect(self.pin_current)
@@ -1002,6 +1015,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._redraw()
             return
         self.current = m
+        if self.s.bands:
+            self.band_history.add(m.timestamp, self._band_results(m))
+            if self._hist_win is not None and self._hist_win.isVisible():
+                self._hist_win.refresh()
         kind = self._acq_kind
         if self.buffer_panel.auto.isChecked() and (kind in ("snap", "series") or (kind == "panorama" and m.stitched)):
             added = self._buffer_add(m)
@@ -1037,6 +1054,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plot.set_tracks([(x, m.track(i), f"Полоса {i + 1} (строки {m.track_rows[i][0]}–{m.track_rows[i][1]})")
                                   for i in range(1, m.n_tracks)] if multi else [])
             self._update_peaks(x, m.y, amap, unit)
+        self._scale = (amap, unit)
+        self._update_bands(m, amap, unit)
         bg = self.background
         if bg is not None and m is not None and bg.y.size == m.y.size:
             self.plot.set_background(self._x_in(m, unit, laser),
@@ -1080,6 +1099,75 @@ class MainWindow(QtWidgets.QMainWindow):
     def _display_settings_changed(self) -> None:
         self._redraw()
         self._update_bg_status()
+
+    # ================================================================ интегрирование в участках
+    MAX_BANDS = 8
+
+    def _band_results(self, m: Optional[Measurement]) -> list:
+        """Результаты всех участков для измерения m (по выбранной полосе строк)."""
+        if m is None:
+            return []
+        y = m.track(min(self.bands_panel.current_track(), m.n_tracks - 1))
+        out = []
+        for b in self.s.bands:
+            if b.get("unit") == "px":
+                x = np.asarray(m.x, dtype=float) if m.x_unit == X_PX and m.x.size == y.size \
+                    else np.arange(y.size, dtype=float)
+            elif m.x_unit == "nm":
+                x = m.x
+            else:
+                out.append(None)
+                continue
+            out.append(P.band_integral(x, y, b["lo"], b["hi"]))
+        return out
+
+    def _update_bands(self, m: Optional[Measurement], amap: AxisMap, unit: str) -> None:
+        disp = []
+        for b in self.s.bands:
+            bu = b.get("unit", "nm")
+            if amap.can_convert(bu, unit):
+                lo, hi = sorted(float(v) for v in amap.convert([b["lo"], b["hi"]], bu, unit))
+                disp.append((lo, hi))
+            else:
+                disp.append(None)
+        self.plot.set_bands(disp)
+        self.bands_panel.set_track_count(m.n_tracks if m is not None else 1)
+        self.bands_panel.show_results(self._band_results(m))
+
+    def _band_moved(self, i: int, lo: float, hi: float) -> None:
+        if self._scale is None or i >= len(self.s.bands):
+            return
+        amap, unit = self._scale
+        b = self.s.bands[i]
+        bu = b.get("unit", "nm")
+        if not amap.can_convert(unit, bu):
+            return
+        b["lo"], b["hi"] = sorted(float(v) for v in amap.convert([lo, hi], unit, bu))
+        self._redraw()
+
+    def add_band(self) -> None:
+        if len(self.s.bands) >= self.MAX_BANDS:
+            self.statusBar().showMessage(f"Не больше {self.MAX_BANDS} участков", 5000)
+            return
+        if self._scale is None:
+            return
+        amap, unit = self._scale
+        a, b = self.plot.vb.viewRange()[0]
+        c, w = (a + b) / 2, abs(b - a) * 0.025
+        store = "nm" if amap.calibrated else "px"
+        if not amap.can_convert(unit, store):
+            store = unit if unit in ("nm", "px") else "px"
+        lo, hi = sorted(float(v) for v in amap.convert([c - w, c + w], unit, store))
+        self.s.bands.append({"lo": lo, "hi": hi, "unit": store})
+        self.analysis_tabs.setCurrentWidget(self.bands_panel)
+        self._redraw()
+
+    def show_band_history(self) -> None:
+        if self._hist_win is None:
+            self._hist_win = BandsHistoryWindow(self.band_history, self.s, self)
+        self._hist_win.refresh()
+        self._hist_win.show()
+        self._hist_win.raise_()
 
     # ================================================================ полосы, дефекты, коррекция
     def _stripes_dragged(self, stripes: list) -> None:
@@ -1268,8 +1356,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(1, m.n_tracks):
             a, b = m.track_rows[i]
             extra[f"stripe{i + 1}_rows_{a}-{b}"] = m.track(i)
-        if m.background_used:
-            extra["raw_without_background_subtraction"] = m.raw
+        if m.background_used or m.intensity_corrected:
+            # «сырые» отсчёты: без вычета фона и без коррекции интенсивности
+            extra["raw_counts"] = m.raw
         save_spectrum(path, m.x if m.x_unit == "nm" else np.arange(m.y.size), m.y, meta,
                       x_name=x_name, extra=extra)
 

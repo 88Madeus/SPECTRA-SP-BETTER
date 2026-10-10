@@ -99,9 +99,13 @@ def _fmt_pos(v: float, unit: str) -> str:
     return f"{v:.{X_DECIMALS.get(unit, 3)}f} {X_SHORT.get(unit, unit)}"
 
 
+BAND_COLORS = ["#2ca02c", "#d62728", "#9467bd", "#ff7f0e", "#17becf", "#8c564b", "#e377c2", "#7f7f7f"]
+
+
 class SpectrumPlot(QtWidgets.QWidget):
     cursor_moved = QtCore.pyqtSignal(float, float)
     units_changed = QtCore.pyqtSignal()     # сменились единицы оси X или длина волны лазера
+    band_moved = QtCore.pyqtSignal(int, float, float)    # полосу интегрирования i перетащили (в единицах оси)
 
     def __init__(self, settings: AppSettings, parent=None):
         super().__init__(parent)
@@ -149,6 +153,9 @@ class SpectrumPlot(QtWidgets.QWidget):
         self._bg_in_legend = False
         self.overlays: Dict[str, pg.PlotDataItem] = {}
         self.track_curves: List[pg.PlotDataItem] = []       # полосы 2…8 текущего измерения
+        self.band_items: List[pg.LinearRegionItem] = []     # полосы интегрирования
+        self.band_labels: List[pg.TextItem] = []
+        self._band_suppress = False
         self.peak_items: List[pg.GraphicsObject] = []
 
         self.vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#999", width=1))
@@ -442,6 +449,40 @@ class SpectrumPlot(QtWidgets.QWidget):
         elif not visible and self._bg_in_legend:
             self.legend.removeItem(self.bg_curve)
             self._bg_in_legend = False
+
+    def set_bands(self, bands: Sequence[Optional[Tuple[float, float]]]) -> None:
+        """Полосы интегрирования [(от, до) в единицах оси или None — нельзя показать], с номерами."""
+        while len(self.band_items) > len(bands):
+            self.plot.removeItem(self.band_items.pop())
+            self.plot.removeItem(self.band_labels.pop())
+        while len(self.band_items) < len(bands):
+            i = len(self.band_items)
+            color = QtGui.QColor(BAND_COLORS[i % len(BAND_COLORS)])
+            fill = QtGui.QColor(color)
+            fill.setAlpha(35)
+            reg = pg.LinearRegionItem(brush=pg.mkBrush(fill), pen=pg.mkPen(color, width=1.2))
+            reg.setZValue(-10)
+            reg.sigRegionChangeFinished.connect(lambda r, i=i: self._band_changed(i))
+            lab = pg.TextItem(f"∫{i + 1}", color=color, anchor=(0.5, 0))
+            self.plot.addItem(reg)
+            self.plot.addItem(lab)
+            self.band_items.append(reg)
+            self.band_labels.append(lab)
+        self._band_suppress = True
+        top = self.vb.viewRange()[1][1]
+        for reg, lab, b in zip(self.band_items, self.band_labels, bands):
+            reg.setVisible(b is not None)
+            lab.setVisible(b is not None)
+            if b is not None:
+                reg.setRegion(b)
+                lab.setPos((b[0] + b[1]) / 2, top)
+        self._band_suppress = False
+
+    def _band_changed(self, i: int) -> None:
+        if self._band_suppress:
+            return
+        a, b = self.band_items[i].getRegion()
+        self.band_moved.emit(i, float(min(a, b)), float(max(a, b)))
 
     def set_tracks(self, tracks: Sequence[tuple]) -> None:
         """Спектры дополнительных полос текущего измерения: [(x, y, название), …] (полосы 2, 3, …)."""

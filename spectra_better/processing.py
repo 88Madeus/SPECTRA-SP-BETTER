@@ -225,6 +225,7 @@ class BandResult:
     mean: float
     peak: float
     peak_x: float
+    centroid: float     # центр тяжести над базовой линией — положение линии точнее одного пикселя
 
 
 def band_integral(x: np.ndarray, y: np.ndarray, lo: float, hi: float) -> Optional[BandResult]:
@@ -242,8 +243,10 @@ def band_integral(x: np.ndarray, y: np.ndarray, lo: float, hi: float) -> Optiona
     else:
         base = np.zeros_like(ys)
     i = int(np.argmax(ys))
+    w = np.clip(ys - base, 0, None)
+    centroid = float((xs * w).sum() / w.sum()) if w.sum() > 0 else float(xs[i])
     return BandResult(lo, hi, int(sel.size), float(ys.sum()), float((ys - base).sum()), float(ys.mean()),
-                      float(ys[i]), float(xs[i]))
+                      float(ys[i]), float(xs[i]), centroid)
 
 
 @dataclass
