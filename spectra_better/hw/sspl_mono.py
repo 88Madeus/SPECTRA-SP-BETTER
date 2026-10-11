@@ -216,9 +216,12 @@ class SsplMonochromator(Monochromator):
         return float(w.value)
 
     def set_slit(self, index: int, width_um: float) -> None:
+        """Как и шторка, DevCtrl.SetSlitWidth лишь ставит команду в очередь своего окна — дождаться
+        окончания движения должен вызывающий (wait_idle, см. Instrument.set_slit)."""
         self._require_open()
         if not self._fn("SetSlitWidth")(int(index), float(width_um)):
             raise DeviceError(f"Не удалось установить ширину щели {index + 1}")
+        pump_messages()                  # команда уходит в прибор из очереди сообщений этого потока
 
     def get_mirror(self, index: int) -> int:
         self._require_open()
@@ -228,9 +231,11 @@ class SsplMonochromator(Monochromator):
         return int(pos.value)
 
     def set_mirror(self, index: int, position: int) -> None:
+        """DevCtrl.SetMirror тоже асинхронный: ждать окончания — wait_idle (Instrument.set_mirror)."""
         self._require_open()
         if not self._fn("SetMirrorState")(int(index), int(position)):
             raise DeviceError("Не удалось переключить зеркало")
+        pump_messages()
 
     def get_shutter(self, index: int = 0) -> Optional[bool]:
         self._require_open()

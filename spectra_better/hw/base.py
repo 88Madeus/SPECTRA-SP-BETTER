@@ -367,6 +367,16 @@ def unit_value_to_us(unit: int, value: int) -> float:
     return UNIT_TO_US.get(unit, 1.0) * value
 
 
+MIN_EXPOSURE_US = 10        # камера сообщает dwMinExposure = 10 (мкс); SpectraSP при подключении ставит 10 мкс
+
+
+def camera_exposure_us(requested_us: float, min_us: int = MIN_EXPOSURE_US) -> int:
+    """Экспозиция, которую камера получит на самом деле: не меньше минимальной и с точностью
+    формата PSI (до 65,5 мс — 1 мкс, до 65,5 с — 1 мс, дальше — 1 с)."""
+    us = max(float(min_us or MIN_EXPOSURE_US), float(requested_us))
+    return int(round(unit_value_to_us(*exposure_to_unit_value(us))))
+
+
 def spectrum_region(width: int, height: int, top: int, bottom: int,
                     hardware_binning: bool = True) -> Region:
     """Полоса строк top..bottom по всей ширине матрицы."""

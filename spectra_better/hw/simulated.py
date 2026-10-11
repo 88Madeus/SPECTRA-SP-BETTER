@@ -57,6 +57,9 @@ class SimMonochromator(Monochromator):
         self.shutter_delay = 0.4
         self._shutter_cmd: Optional[tuple] = None      # (состояние, когда выполнится)
         self.shutter_ttl = False         # шторку открывает сигнал экспозиции камеры
+        self._pending: dict = {}         # щель/зеркало: команда → (значение, когда выполнится)
+        self.slit_delay = 0.3
+        self.mirror_delay = 0.8
         # положения шаговых двигателей (для сервисного окна)
         self.steps = {(MECH_TURRET, 0): 9528, (MECH_SLIT, 0): 20, (MECH_SLIT, 1): 600,
                       (MECH_MIRROR, 0): 2124}
@@ -90,13 +93,24 @@ class SimMonochromator(Monochromator):
         if not self._open:
             raise DeviceError("Монохроматор не подключён")
 
+    def _apply_pending(self) -> None:
+        now = time.monotonic()
+        for key, (value, when) in list(self._pending.items()):
+            if now >= when:
+                if key == "mirror":
+                    self.mirror = value
+                else:
+                    self.slits[key] = value
+                del self._pending[key]
+
     def is_busy(self) -> bool:
         self._req()
-        return time.monotonic() < self._move_end
+        self._apply_pending()
+        return time.monotonic() < self._move_end or bool(self._pending)
 
     def wait_idle(self, timeout_s: float) -> None:
         t0 = time.monotonic()
-        while self.is_busy():
+        while self.is_busy():                       # is_busy() применяет завершившиеся команды
             if time.monotonic() - t0 > timeout_s:
                 raise DeviceError("Таймаут движения (имитация)")
             time.sleep(0.02)
@@ -136,19 +150,23 @@ class SimMonochromator(Monochromator):
 
     def get_slit(self, index: int) -> float:
         self._req()
+        self._apply_pending()
         return self.slits[index]
 
     def set_slit(self, index: int, width_um: float) -> None:
+        # как DevCtrl: команда выполняется не сразу, до этого прибор «занят» и сообщает прежнее
         self._req()
-        self.slits[index] = float(max(0.0, min(2000.0, width_um)))
+        self._pending[int(index)] = (float(max(0.0, min(2000.0, width_um))),
+                                     time.monotonic() + self.slit_delay * self.time_scale)
 
     def get_mirror(self, index: int) -> int:
         self._req()
+        self._apply_pending()
         return self.mirror
 
     def set_mirror(self, index: int, position: int) -> None:
         self._req()
-        self.mirror = int(position)
+        self._pending["mirror"] = (int(position), time.monotonic() + self.mirror_delay * self.time_scale)
 
     def _apply_shutter(self) -> None:
         cmd = self._shutter_cmd
@@ -316,6 +334,7 @@ class SimCamera(Camera):
         m = self.mono
         if m is not None:
             m._apply_shutter()                 # шторка «доехала», если её команда уже выполнилась
+            m._apply_pending()                 # и щель/зеркало
         # в режиме TTL шторку на время кадра открывает импульс экспозиции с выхода камеры (режимы 0/1 — EXP)
         ttl_open = m is not None and m.shutter_ttl and any(mode in (0, 1) for mode in self._sync)
         if m is None or not m._open or not (ttl_open or (m.shutter_open and not m.shutter_ttl)) \

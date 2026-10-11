@@ -47,8 +47,16 @@ def _list_value(name: str, v) -> list:
         return [[float(a), float(b)] for a, b in v]
     if name in _INT_LISTS:
         return [int(x) for x in v]
-    if name in _DICT_LISTS:
-        return [dict(x) for x in v if isinstance(x, dict)]
+    if name in _DICT_LISTS:          # участки интегрирования: только с числовыми границами
+        out = []
+        for x in v:
+            if isinstance(x, dict):
+                try:
+                    out.append({**x, "lo": float(x["lo"]), "hi": float(x["hi"]),
+                                "unit": x.get("unit") if x.get("unit") in ("nm", "px") else "nm"})
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return out
     return [float(x) for x in v]
 
 

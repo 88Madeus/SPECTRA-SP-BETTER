@@ -58,8 +58,15 @@ class MainWindow(QtWidgets.QMainWindow):
             n = self.buffer.load_state(self._buffer_path())
             if n:
                 log.info("Буфер спектров: загружено %d спектр(ов) с прошлого сеанса", n)
-        except (OSError, ValueError, KeyError) as e:
-            log.warning("Буфер спектров прошлого сеанса не прочитан: %s", e)
+        except Exception as e:  # noqa: BLE001 — повреждённый файл (обрыв записи и т. п.) не должен мешать запуску
+            self.buffer.clear()
+            bad = self._buffer_path() + ".bad"
+            try:
+                os.replace(self._buffer_path(), bad)
+            except OSError:
+                bad = ""
+            log.warning("Буфер спектров прошлого сеанса не прочитан (%s)%s", e,
+                        f"; файл отложен как {bad}" if bad else "")
         self._acq_thread: Optional[threading.Thread] = None
         self._acq_stop = threading.Event()
         self._acq_kind = ""
@@ -361,6 +368,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return "идёт съёмка панорамы"
         if self._acquiring() and self._acq_kind == "background":
             return "снимается темновой фон (шторка закрыта программой)"
+        excl = self.inst._mono_exclusive              # например, серия по списку длин волн
+        if excl is not None:
+            return f"монохроматором управляет {excl[0]}"
         return ""
 
     def _mono_ready(self) -> bool:
@@ -803,7 +813,14 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 acq = self.inst.acq_settings()
                 t = self.inst.expected_frame_time(acq) * max(1, self.s.accumulations)
-                self.acq_panel.set_estimate(t)
+                want_us = self.s.exposure_ms * 1000
+                note = ""
+                if abs(acq.exposure_us - want_us) > max(0.5, 0.002 * want_us):
+                    real = acq.exposure_us
+                    shown = f"{real / 1e6:g} с" if real >= 1e6 else (f"{real / 1e3:g} мс" if real >= 1e3
+                                                                       else f"{real:g} мкс")
+                    note = f"камера снимет {shown} (её точность/минимум)"
+                self.acq_panel.set_estimate(t, note)
             except (DeviceError, ValueError) as e:
                 self.acq_panel.set_estimate(None)
                 log.debug("estimate: %s", e)
@@ -854,7 +871,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def take_background(self) -> None:
         if self._acquiring():
             return
-        if not self.inst.mono_connected or not self.s.close_shutter_for_background:
+        auto_close = self.inst.mono_connected and (self.s.close_shutter_for_background or self.inst.shutter_ttl)
+        if not auto_close:
             r = QtWidgets.QMessageBox.question(
                 self, "Темновой фон",
                 "Шторка монохроматора не будет закрыта автоматически.\n"
@@ -1594,6 +1612,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mono_moving = False
             self.mono_panel.set_busy(False)
             self._update_actions()
+            self._update_mono_view()
+            self._refresh_mono_misc()                 # вернуть панели фактические щель/зеркало/шторку
             self._error("Монохроматор", e)
         self.tasks.run(fn, done, fail, "mono")
 
@@ -1743,6 +1763,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._closing:
             event.accept()
             return
+        connected = self.inst.camera_connected or self.inst.mono_connected
+        if connected:
+            r = QtWidgets.QMessageBox.question(self, APP_NAME, "Отключить приборы и выйти?")
+            if r != QtWidgets.QMessageBox.Yes:
+                event.ignore()                         # съёмку не трогаем — пользователь передумал
+                return
         if self._acquiring():
             self.stop()
         self.s.window_state = bytes(self.saveState().toBase64()).decode("ascii")
@@ -1754,11 +1780,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.buffer.save_state(self._buffer_path())
         except OSError as e:
             log.warning("Буфер спектров не сохранён: %s", e)
-        if self.inst.camera_connected or self.inst.mono_connected:
-            r = QtWidgets.QMessageBox.question(self, APP_NAME, "Отключить приборы и выйти?")
-            if r != QtWidgets.QMessageBox.Yes:
-                event.ignore()
-                return
+        if connected:
             self._closing = True
             self.poll_timer.stop()
             self._stop_warm_up()

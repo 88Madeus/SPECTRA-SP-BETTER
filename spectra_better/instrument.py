@@ -25,9 +25,8 @@ from .calibration import WavelengthAxis, geometries_from_config
 from .config import ACQ_IMAGE, ACQ_SPECTRUM, AppSettings
 from .hw.base import (MECH_GRATING, MECH_MIRROR, MECH_SLIT, MECH_TITLES, MECH_TURRET, AcqSettings, Camera,
                       CameraInfo, CameraState, DeviceError, GratingInfo, Monochromator, MonoInfo,
-                      SYNC_EXPOSURE_MODES, SYNC_LOGICAL_0, SYNC_LOGICAL_1, SYNC_OUT_MODES, full_frame_region,
-                      spectrum_region,
-                      warm_up_camera)
+                      SYNC_EXPOSURE_MODES, SYNC_LOGICAL_0, SYNC_LOGICAL_1, SYNC_OUT_MODES, camera_exposure_us,
+                      full_frame_region, spectrum_region, warm_up_camera)
 from .hw.worker import DeviceThread
 from .spectrasp_config import InstalledSetup, find_spectrasp_dir, read_installation
 
@@ -503,8 +502,9 @@ class Instrument:
                 region = spectrum_region(info.width, info.height, s.rows_top, s.rows_bottom, False)
         speed = s.readout_speed or (info.readout_speeds[0] if info.readout_speeds else 0)
         sync = tuple(m if m in SYNC_OUT_MODES else -1 for m in (s.sync_out1, s.sync_out2))
-        return AcqSettings(exposure_us=int(round(s.exposure_ms * 1000)), readout_speed=speed, regions=(region,),
-                           sync_out=sync)
+        # в камеру уходит не любое число: не меньше её минимума и с точностью формата PSI
+        exposure = camera_exposure_us(s.exposure_ms * 1000, info.min_exposure)
+        return AcqSettings(exposure_us=exposure, readout_speed=speed, regions=(region,), sync_out=sync)
 
     # ---------------------------------------------------------------- выходы синхронизации, лазер
     def laser_modes(self) -> Tuple[int, int]:
@@ -579,9 +579,10 @@ class Instrument:
             except Exception:  # noqa: BLE001
                 log.exception("abort")
 
-    def _bg_key(self, acq: AcqSettings) -> tuple:
+    def _bg_key(self, acq: AcqSettings, flip: Optional[bool] = None, stripes=None) -> tuple:
         # полосы входят в ключ: фон снимается и вычитается для каждой полосы отдельно
-        return acq.exposure_us, acq.readout_speed, acq.regions, self.settings.flip_x, tuple(self.stripes())
+        flip = self.settings.flip_x if flip is None else flip
+        return acq.exposure_us, acq.readout_speed, acq.regions, bool(flip), tuple(stripes or self.stripes())
 
     def _intensity_correct(self, y: np.ndarray, x: np.ndarray, unit: str) -> Tuple[np.ndarray, str]:
         """y × K: коррекция спектральной чувствительности по таблице из настроек."""
@@ -606,11 +607,11 @@ class Instrument:
         return self.camera_connected and not self.background_problem() and \
             self._bg_key(self.acq_settings()) in self._backgrounds
 
-    def background_problem(self) -> str:
+    def background_problem(self, key: Optional[tuple] = None) -> str:
         """Почему снятый фон сейчас не подходит ("" — подходит или фона нет)."""
         if not self.camera_connected:
             return ""
-        t_bg = self._bg_temps.get(self._bg_key(self.acq_settings()))
+        t_bg = self._bg_temps.get(key if key is not None else self._bg_key(self.acq_settings()))
         st = self.last_state
         if t_bg is None or st is None or st.temperature is None:
             return ""
@@ -624,13 +625,13 @@ class Instrument:
             self._backgrounds.clear()
             self._bg_images.clear()
 
-    def _frame_to_tracks(self, frame: np.ndarray, acq: AcqSettings) -> np.ndarray:
-        """Кадр → спектры полос (T×N)."""
-        stripes = self.stripes()
+    @staticmethod
+    def _frame_to_tracks(frame: np.ndarray, acq: AcqSettings, stripes, image_mode: bool) -> np.ndarray:
+        """Кадр → спектры полос (T×N). Полосы и режим — зафиксированные в начале съёмки."""
         r = acq.regions[0]
-        if self.settings.acq_mode != ACQ_IMAGE and r.bin_y > 1:
+        if not image_mode and r.bin_y > 1:
             return np.asarray(frame, dtype=np.float64)[:1]          # аппаратное объединение: одна строка
-        offset = 0 if self.settings.acq_mode == ACQ_IMAGE else r.top
+        offset = 0 if image_mode else r.top
         return np.vstack([P.bin_rows(frame, t - offset, b - offset) for t, b in stripes])
 
     def acquire(self, n: Optional[int] = None, progress: Optional[ProgressFn] = None,
@@ -650,6 +651,13 @@ class Instrument:
             raise DeviceError(f"Идёт изменение температуры камеры ({why}). Съёмка будет доступна, "
                               "когда температура установится.")
         self._abort.clear()
+        # всё, что можно поменять в интерфейсе во время непрерывной съёмки (перетащить полосу,
+        # сменить режим, развернуть спектр), фиксируется на всю съёмку: кадр, полосы и фон
+        # должны соответствовать друг другу
+        image_mode = s.acq_mode == ACQ_IMAGE
+        flip = bool(s.flip_x)
+        mode = "average" if background else s.accumulate_mode
+        stripes = self.stripes()
         acq = self.acq_settings()
         t0 = time.monotonic()
         if not background and self.mono_connected and not self.shutter_ttl and self.shutter_state is False:
@@ -697,10 +705,10 @@ class Instrument:
                 if progress:
                     progress(i, n, "фон" if background else "экспозиция")
                 frame = self._frame(acq)
-                if s.flip_x:
+                if flip:
                     frame = frame[:, ::-1]
                 sat = sat or P.saturated(frame)
-                spectra.append(self._frame_to_tracks(frame, acq))
+                spectra.append(self._frame_to_tracks(frame, acq, stripes, image_mode))
         finally:
             if ttl_restore:
                 try:
@@ -715,15 +723,14 @@ class Instrument:
                     log.warning("Не удалось вернуть шторку: %s", e)
         if progress:
             progress(n, n, "обработка")
-        mode = "average" if background else s.accumulate_mode
         raw = P.combine_frames(spectra, mode=mode, reject_cosmics=s.remove_cosmics)     # T×N
         if s.remove_cosmics and n < 3:
             raw = np.vstack([P.remove_spikes(t) for t in raw])
         n_fixed = 0
         if s.defect_correction and s.defect_pixels:
-            raw = P.fix_defects(raw, s.defect_pixels, flip=s.flip_x)
+            raw = P.fix_defects(raw, s.defect_pixels, flip=flip)
             n_fixed = len(s.defect_pixels)
-        key = self._bg_key(acq)
+        key = self._bg_key(acq, flip, stripes)
         y = raw
         bg_used = False
         t_now = self.last_state.temperature if self.last_state else None
@@ -732,12 +739,12 @@ class Instrument:
                 self._backgrounds[key] = raw.copy()
                 if t_now is not None:
                     self._bg_temps[key] = float(t_now)
-                if frame is not None and s.acq_mode == ACQ_IMAGE:
+                if frame is not None and image_mode:
                     self._bg_images[key] = frame.astype(np.float64)
         elif s.subtract_background:
             with self._lock:
                 bg = self._backgrounds.get(key)
-            problem = self.background_problem()
+            problem = self.background_problem(key)
             if bg is not None and problem:
                 log.warning("Фон не вычтен: %s", problem)
                 bg = None
@@ -749,12 +756,12 @@ class Instrument:
         if s.intensity_corr and not background:
             y, corrected = self._intensity_correct(y, x, unit)
         m = Measurement(x=x, x_unit=unit, y=y[0], raw=raw[0],
-                        tracks=y if y.shape[0] > 1 else None, track_rows=tuple(self.stripes()[:y.shape[0]]),
+                        tracks=y if y.shape[0] > 1 else None, track_rows=tuple(stripes[:y.shape[0]]),
                         defects_fixed=n_fixed, intensity_corrected=corrected, comment=s.comment.strip(),
-                        image=frame if s.acq_mode == ACQ_IMAGE else None,
+                        image=frame if image_mode else None,
                         background_used=bg_used, saturated=sat,
                         exposure_ms=acq.exposure_us / 1000.0, accumulations=n, accumulate_mode=mode,
-                        acq_mode=s.acq_mode, rows=(max(0, s.rows_top), s.rows_bottom),
+                        acq_mode=ACQ_IMAGE if image_mode else s.acq_mode, rows=stripes[0],
                         hardware_binning=acq.regions[0].bin_y > 1,
                         center_wl=self.mono_wl, grating=self.mono_grating,
                         grating_title=self.grating_title(self.mono_grating),
@@ -866,10 +873,19 @@ class Instrument:
         self.refresh_mono()
 
     def set_slit(self, index: int, width_um: float) -> float:
+        """Установить ширину щели и дождаться окончания движения (DevCtrl выполняет команду
+        асинхронно: сразу после неё прибор сообщает ещё прежнюю ширину)."""
         self._require_mono(control=True)
         self._check_slit(int(index), float(width_um))
-        self.mono_thread.call(self.mono.set_slit, int(index), float(width_um), timeout=120)
-        w = self.mono_thread.call(self.mono.get_slit, int(index), timeout=60)
+        t = self.settings.mono_timeout_s
+
+        def work():
+            self.mono.set_slit(int(index), float(width_um))
+            self.mono.wait_idle(t)
+            return self.mono.get_slit(int(index))
+        w = self.mono_thread.call(work, timeout=t + 30)
+        if abs(w - float(width_um)) > max(1.0, 0.01 * float(width_um)):
+            log.warning("Щель %d: запрошено %.1f мкм, прибор сообщает %.1f мкм", index + 1, width_um, w)
         if index == 0:
             self.mono_slit = w
         return w
@@ -879,9 +895,18 @@ class Instrument:
         return self.mono_thread.call(self.mono.get_slit, int(index), timeout=60)
 
     def set_mirror(self, position: int, index: int = 0) -> None:
+        """Переключить выходное зеркало и дождаться окончания (команда DevCtrl асинхронная)."""
         self._require_mono(control=True)
         self._check_mirror(int(position))
-        self.mono_thread.call(self.mono.set_mirror, index, int(position), timeout=120)
+        t = self.settings.mono_timeout_s
+
+        def work():
+            self.mono.set_mirror(index, int(position))
+            self.mono.wait_idle(t)
+            return self.mono.get_mirror(index)
+        got = self.mono_thread.call(work, timeout=t + 30)
+        if got != int(position):
+            raise DeviceError(f"Зеркало не переключилось: прибор сообщает положение {got} вместо {position}")
 
     def get_mirror(self, index: int = 0) -> int:
         self._require_mono()
@@ -1057,6 +1082,8 @@ class Instrument:
             if unit != "nm":
                 raise DeviceError("Для панорамы нужна калибровка шкалы длин волн")
             width = abs(x[-1] - x[0]) * max(0.1, 1 - 2 * trim / max(1, n_pix))
+            if not np.isfinite(width) or width <= 1e-6:
+                raise DeviceError("Шкала длин волн вырождена (кадр нулевой ширины) — проверьте калибровку")
             if not centers:
                 c = lo + width / 2
                 x, _ = self.axis.axis(n_pix, c, self.mono_grating, None)

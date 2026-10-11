@@ -204,3 +204,38 @@ def test_comment_goes_into_measurement(inst):
     inst.settings.comment = "  кристалл №3 "
     m = inst.acquire()
     assert m.comment == "кристалл №3" and m.meta()["comment"] == "кристалл №3"
+
+
+# ------------------------------------------------------------------ экспозиция: точность и минимум камеры
+def test_camera_exposure_quantization():
+    from spectra_better.hw.base import camera_exposure_us
+    assert camera_exposure_us(1) == 10                         # минимум камеры — 10 мкс
+    assert camera_exposure_us(12345) == 12345                  # до 65,5 мс — с точностью 1 мкс
+    assert camera_exposure_us(100_400) == 100_000              # дальше — целые миллисекунды
+    assert camera_exposure_us(90_400_000) == 90_000_000        # больше 65,5 с — целые секунды
+    assert camera_exposure_us(5, min_us=0) == 10
+
+
+def test_measurement_reports_real_exposure(inst):
+    inst.settings.exposure_ms = 100.4
+    assert inst.acq_settings().exposure_us == 100_000
+    assert inst.acquire().exposure_ms == pytest.approx(100.0)
+
+
+def test_stripes_changed_during_acquisition_are_ignored(inst, monkeypatch):
+    inst.camera.fibers = [(150, 3, 1.0), (350, 3, 0.3)]
+    inst.set_stripes([(140, 160), (340, 360)])
+    orig = inst._frame
+    calls = []
+
+    def frame(acq):
+        calls.append(1)
+        if len(calls) == 1:                                    # пользователь перетащил полосу в живом режиме
+            inst.set_stripes([(10, 20), (480, 500), (200, 210)])
+            inst.settings.flip_x = True
+        return orig(acq)
+    monkeypatch.setattr(inst, "_frame", frame)
+    m = inst.acquire(n=3)
+    assert m.track_rows == ((140, 160), (340, 360)) and m.n_tracks == 2
+    i = int(np.argmax(m.track(0)))
+    assert 0.2 < _sig(m.track(1), i) / _sig(m.track(0), i) < 0.4    # данные — с тех полос, что были в начале

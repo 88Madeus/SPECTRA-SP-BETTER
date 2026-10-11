@@ -276,8 +276,9 @@ class AcquisitionPanel(QtWidgets.QGroupBox):
         self.bottom.blockSignals(False)
         self._store()
 
-    def set_estimate(self, seconds: Optional[float]) -> None:
-        self.estimate.setText("" if seconds is None else f"≈ {seconds:.2f} с на кадр")
+    def set_estimate(self, seconds: Optional[float], note: str = "") -> None:
+        text = "" if seconds is None else f"≈ {seconds:.2f} с на кадр"
+        self.estimate.setText(text + (f"<br><span style='color:#a15c00'>{note}</span>" if note else ""))
 
 
 class MonoPanel(QtWidgets.QGroupBox):
