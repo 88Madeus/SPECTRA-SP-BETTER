@@ -281,6 +281,43 @@ def spectrum_math(op: str, xa: np.ndarray, ya: np.ndarray, xb: Optional[np.ndarr
     return a / area
 
 
+# ---------------------------------------------------------------- линейность по экспозиции
+@dataclass
+class LinearityResult:
+    rate: float                  # отсчётов на миллисекунду экспозиции
+    t0_ms: float                 # «лишнее» время: сигнал ≈ rate·(t + t0); < 0 — шторка открывается с опозданием
+    deviation: List[float]       # S/(rate·(t + t0)) − 1 по каждой точке (NaN — не использована)
+    min_ok_ms: float             # наименьшая экспозиция, с которой отклонение от пропорциональности ≤ tol
+
+
+def linearity_fit(exposures_ms: Sequence[float], signals: Sequence[float], fit_from_ms: float = 20.0,
+                  tol: float = 0.05) -> LinearityResult:
+    """Подогнать S = rate·(t + t0) по экспозициям ≥ fit_from_ms и найти, с какой экспозиции сигнал
+    пропорционален t (без поправки t0) с точностью tol. Нужны хотя бы две точки для подгонки."""
+    t = np.asarray(exposures_ms, dtype=np.float64)
+    sig = np.asarray(signals, dtype=np.float64)
+    use = (t >= fit_from_ms) & np.isfinite(sig)
+    if use.sum() < 2:
+        raise ValueError("Мало точек для подгонки (нужны экспозиции от 20 мс и без насыщения)")
+    # дробовой шум ∝ √S: без весов длинные экспозиции «перетягивают» подгонку и t0 выходит шумным
+    a, b = np.polyfit(t[use], sig[use], 1, w=1.0 / np.sqrt(np.maximum(sig[use], 1.0)))
+    if a <= 0:
+        raise ValueError("Сигнал не растёт с экспозицией — свет не попадает на ПЗС?")
+    t0 = b / a
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dev_prop = sig / (a * t) - 1                        # насколько S отличается от пропорционального rate·t
+    dev = [float(d) if np.isfinite(d) else float("nan") for d in sig / (a * (t + t0)) - 1]
+    ok = [float(ti) for ti, d in sorted(zip(t, dev_prop)) if np.isfinite(d) and abs(d) <= tol]
+    # наименьшая экспозиция, начиная с которой все бо́льшие тоже в допуске
+    good_from = float("nan")
+    for ti in sorted(set(t[np.isfinite(dev_prop)]), reverse=True):
+        if ti in ok:
+            good_from = ti
+        else:
+            break
+    return LinearityResult(float(a), float(t0), dev, good_from)
+
+
 # ---------------------------------------------------------------- интегрирование в полосе
 @dataclass
 class BandResult:

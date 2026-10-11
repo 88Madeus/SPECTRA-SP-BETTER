@@ -1,4 +1,6 @@
 """Несколько полос строк, дефектные пиксели, коррекция интенсивности, интегрирование в полосе."""
+import re
+
 import numpy as np
 import pytest
 
@@ -239,3 +241,46 @@ def test_stripes_changed_during_acquisition_are_ignored(inst, monkeypatch):
     assert m.track_rows == ((140, 160), (340, 360)) and m.n_tracks == 2
     i = int(np.argmax(m.track(0)))
     assert 0.2 < _sig(m.track(1), i) / _sig(m.track(0), i) < 0.4    # данные — с тех полос, что были в начале
+
+
+# ------------------------------------------------------------------ линейность по экспозиции
+def test_linearity_fit_shutter_delay_and_readout_light():
+    t = np.array([0.01, 0.1, 1, 2, 5, 10, 20, 50, 100, 200, 500])
+    # шторка по TTL открывается на 4 мс позже начала экспозиции: S = 100·(t − 4), не меньше 0
+    late = np.clip(100 * (t - 4.0), 0, None)
+    r = P.linearity_fit(t, late)
+    assert r.rate == pytest.approx(100, rel=1e-6) and r.t0_ms == pytest.approx(-4.0, abs=1e-6)
+    assert r.min_ok_ms == 100                                  # с 100 мс ошибка ≤ 5 % (4/100)
+    # без шторки: свет копится и во время считывания (≈3 мс)
+    extra = 100 * (t + 3.0)
+    r = P.linearity_fit(t, extra)
+    assert r.t0_ms == pytest.approx(3.0, abs=1e-6) and r.min_ok_ms == 100
+    with pytest.raises(ValueError):
+        P.linearity_fit([1, 2, 5], [1, 2, 5])                  # нет точек от 20 мс
+
+
+@pytest.mark.parametrize("ttl", [False, True])
+def test_probe_linearity_sweep_measures_shutter_lag(inst, tmp_path, ttl):
+    from spectra_better.hw.base import spectrum_region
+    from spectra_better.tools import probe
+    cam, mono = inst.camera, inst.mono
+    cam.ttl_lag_s, cam.readout_light_s = 0.004, 0.003      # шторка «съедает» 4 мс, считывание добавляет 3 мс
+    inst.set_slit(0, 10)                                   # узкая щель — линия не насыщается и при 500 мс
+    if ttl:
+        mono.set_shutter_ttl(True)
+    else:
+        probe.open_shutter(mono)
+    rep = probe.Report(str(tmp_path / "probe.txt"))
+    info = cam.info
+    region = spectrum_region(info.width, info.height, 280, 314, True)
+    csv = tmp_path / "lin.csv"
+    probe.linearity_sweep(rep, cam, info, region, 250, ttl, str(csv))
+    text = "\n".join(rep.lines)
+    t0 = float(re.search(r"× \(t ([+-][\d.]+) мс\)", text).group(1))
+    if ttl:
+        assert cam.sync_out[0] in (0, 1)                   # шторку открывал импульс экспозиции камеры
+        assert "шторка «съедает»" in text and t0 == pytest.approx(-4.0, abs=1.0)
+    else:
+        assert "свет добавляется" in text and t0 == pytest.approx(3.0, abs=1.0)
+    assert "начиная с" in text
+    assert csv.read_text(encoding="utf-8").startswith("exposure_ms;signal;")

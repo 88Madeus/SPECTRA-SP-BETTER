@@ -24,10 +24,79 @@ import traceback
 import numpy as np
 
 from ..calibration import geometries_from_config
-from ..hw.base import DeviceError, spectrum_region, full_frame_region, AcqSettings
+from .. import processing as P
+from ..hw.base import AcqSettings, DeviceError, camera_exposure_us, full_frame_region, spectrum_region
 from ..hw.winutil import IS_WINDOWS, PYTHON_BITS, present_as_spectrasp, pump_messages, spectrasp_is_running
 from ..spectrasp_config import find_spectrasp_dir, read_installation
 from ..storage import save_image, save_spectrum
+
+
+def open_shutter(mono) -> float:
+    """Открыть шторку и дождаться подтверждения (DevCtrl выполняет команду не сразу). Возвращает, за
+    сколько секунд прибор подтвердил открытие."""
+    mono.set_shutter(True, 0)
+    t0 = time.monotonic()
+    state = None
+    while time.monotonic() - t0 < 6:
+        pump_messages()
+        time.sleep(0.02)
+        state = mono.get_shutter(0)
+        if state:
+            return time.monotonic() - t0
+    raise DeviceError("прибор не подтвердил открытие шторки за 6 с (сообщает: "
+                      + {False: "закрыта", None: "неизвестно"}[state] + ")")
+
+
+LINEARITY_MS = (0.01, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500)
+LINEARITY_FRAMES = 3
+LINE_HALF_WIDTH = 5         # сигнал — сумма ±5 пикселей вокруг линии над медианой спектра
+
+
+def linearity_sweep(R, cam, info, region, speed: int, ttl: bool, out_path: str) -> None:
+    """Снимки линии при экспозициях LINEARITY_MS (по LINEARITY_FRAMES кадров) и разбор пропорциональности.
+
+    Сигнал — сумма отсчётов в окне вокруг самой яркой линии за вычетом медианы спектра (темновой ток,
+    смещение, фон): какая доля линии попала в окно, неважно — она одна и та же при всех экспозициях."""
+    sync = (0, -1) if ttl else (-1, -1)        # TTL: выход 1 камеры — импульс экспозиции («EXP», как в SpectraSP)
+    rows = []
+    for e in LINEARITY_MS:
+        us = camera_exposure_us(e * 1000, info.min_exposure)
+        cam.configure(AcqSettings(us, speed, (region,), sync_out=sync))
+        frames, times = [], []
+        for _ in range(LINEARITY_FRAMES):
+            t0 = time.monotonic()
+            frames.append(cam.acquire()[0].astype(float))
+            times.append(time.monotonic() - t0)
+        sat = max(float(f.max()) for f in frames) >= 65535
+        # медиана по кадрам: космическая частица в окне линии не испортит точку
+        rows.append((us / 1000.0, np.median(frames, axis=0), sat, float(np.mean(times))))
+    ref = next((y for _, y, sat, _ in reversed(rows) if not sat), rows[-1][1])
+    i = int(np.argmax(ref))
+    w = slice(max(0, i - LINE_HALF_WIDTH), i + LINE_HALF_WIDTH + 1)
+    sig = [float("nan") if sat else float(np.sum(y[w] - np.median(y))) for _, y, sat, _ in rows]
+    exps = [r[0] for r in rows]
+    R(f"    линия: пиксель {i}; шторка {'по экспозиции (TTL)' if ttl else 'открыта вручную'}")
+    R("    экспозиция, мс | сигнал, отсч. | отсч./мс | время кадра, с")
+    for (e, _, sat, t), s_ in zip(rows, sig):
+        R(f"    {e:>12g} | {('НАСЫЩЕНИЕ' if sat else f'{s_:.0f}'):>12} | "
+          f"{(s_ / e if np.isfinite(s_) else float('nan')):>8.1f} | {t:.3f}")
+    try:
+        res = P.linearity_fit(exps, sig)
+    except ValueError as e:
+        R(f"    не удалось оценить: {e}")
+        return
+    R(f"    подгонка по экспозициям ≥ 20 мс: сигнал ≈ {res.rate:.1f} отсч./мс × (t {res.t0_ms:+.2f} мс)")
+    if ttl and res.t0_ms < 0:
+        R(f"    шторка «съедает» ≈ {-res.t0_ms:.1f} мс каждой экспозиции (открывается позже/закрывается раньше)")
+    elif res.t0_ms > 0:
+        R(f"    свет добавляется ≈ {res.t0_ms:.1f} мс сверх экспозиции (пока идёт сдвиг строк при считывании)")
+    if np.isfinite(res.min_ok_ms):
+        R(f"    сигнал пропорционален экспозиции с точностью 5 % начиная с {res.min_ok_ms:g} мс")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("exposure_ms;signal;saturated;frame_time_s\n")
+        for (e, _, sat, t), s_ in zip(rows, sig):
+            f.write(f"{e:g};{s_:.1f};{int(sat)};{t:.4f}\n")
+    R(f"    таблица: {out_path}")
 
 
 class Report:
@@ -73,6 +142,11 @@ def main(argv=None) -> int:
     ap.add_argument("--goto", type=float, metavar="НМ", help="установить длину волны монохроматора")
     ap.add_argument("--open-shutter", action="store_true",
                     help="открыть входную шторку монохроматора (с подтверждением от прибора)")
+    ap.add_argument("--linearity", action="store_true",
+                    help="проверка линейности: снимки линии лампы при экспозициях 0,01…500 мс — с какой "
+                         "экспозиции сигнал пропорционален времени и сколько «съедает» шторка/считывание")
+    ap.add_argument("--ttl", action="store_true",
+                    help="с --linearity: шторка по экспозиции (TTL) — измерить её запаздывание")
     ap.add_argument("--cooling", type=int, metavar="°C", help="включить охлаждение с уставкой")
     ap.add_argument("--warm-up", action="store_true",
                     help="не требуется: охлаждённая ниже 0 °C ПЗС отогревается до +2 °C при отключении всегда")
@@ -125,22 +199,14 @@ def main(argv=None) -> int:
             R.step("Выходное зеркало", lambda: R(f"    положение {mono.get_mirror(0)}"))
             R.step("Шторка", lambda: R("    " + {True: "открыта", False: "закрыта"}.get(mono.get_shutter(0),
                                                                               "прибор не сообщает")))
-            if args.open_shutter:
-                def open_shutter():
-                    # DevCtrl выполняет команду не сразу — ждём, пока прибор подтвердит
-                    mono.set_shutter(True, 0)
-                    t0 = time.monotonic()
-                    state = None
-                    while time.monotonic() - t0 < 6:
-                        pump_messages()
-                        time.sleep(0.05)
-                        state = mono.get_shutter(0)
-                        if state:
-                            R(f"    открыта (подтверждено через {time.monotonic() - t0:.1f} с)")
-                            return
-                    raise DeviceError("прибор не подтвердил открытие шторки за 6 с (сообщает: "
-                                      + {False: "закрыта", None: "неизвестно"}[state] + ")")
-                R.step("Открыть шторку", open_shutter)
+            if args.open_shutter or (args.linearity and not args.ttl):
+                def manual_open():
+                    try:
+                        mono.set_shutter_ttl(False, 0)   # шторка могла остаться «по экспозиции» с прошлого сеанса
+                    except DeviceError:
+                        pass
+                    R(f"    открыта (подтверждено через {open_shutter(mono):.2f} с)")
+                R.step("Открыть шторку", manual_open)
             if args.goto is not None:
                 R.step(f"Переход на {args.goto} нм", lambda: mono.set_wavelength(args.goto, True, 600))
                 R.step("Длина волны после перехода", lambda: R(f"    {mono.get_wavelength():.4f} нм"))
@@ -210,6 +276,24 @@ def main(argv=None) -> int:
                             save_image(path, img)
                             R(f"    кадр сохранён: {path}")
                         R.step("Полный кадр", full)
+                if args.linearity:
+                    top, bottom = args.rows or (inst.stripe or (info.height // 2 - 15, info.height // 2 + 14))
+                    speed = args.speed or (inst.sensor.readout_speed or cam.current_readout_speed)
+                    region = spectrum_region(info.width, info.height, top, bottom, True)
+                    ttl_on = False
+                    if args.ttl:
+                        if mono is not None and mono.is_open:
+                            ttl_on = R.step("Шторка по экспозиции (TTL)",
+                                            lambda: mono.set_shutter_ttl(True, 0) or True) is True
+                        else:
+                            R("--ttl: монохроматор не подключён — шторкой по TTL управлять нельзя")
+                    try:
+                        R.step("Линейность по экспозиции", lambda: linearity_sweep(
+                            R, cam, info, region, speed, args.ttl,
+                            os.path.join(out_dir, f"probe_{stamp}_linearity.csv")))
+                    finally:
+                        if ttl_on:
+                            R.step("Шторка: ручное управление", lambda: mono.set_shutter_ttl(False, 0))
                 # холодную ПЗС (например, после --cooling) не оставляем: плавный отогрев до +2 °C
                 R.step("Камера: отключение", lambda: cam.close(warm_up=True))
     if mono is not None and mono.is_open:

@@ -267,6 +267,10 @@ class SimCamera(Camera):
                      **{wl: i * 12000 for wl, i in LINES["Ar (аргон)"]},
                      **{wl: i * 9000 for wl, i in LINES["Ne (неон)"]}}
         self.continuum = 40.0          # фон лампы, отсчётов/с на пиксель полосы
+        # для проверки замера линейности (probe --linearity): механика шторки в режиме TTL «съедает» часть
+        # экспозиции, а при открытой вручную шторке свет идёт и во время считывания (затвора у камеры нет)
+        self.ttl_lag_s = 0.0
+        self.readout_light_s = 0.0
 
     @property
     def is_open(self) -> bool:
@@ -328,6 +332,13 @@ class SimCamera(Camera):
         r = s.regions[0]
         return r.out_pixels / speed_hz + r.height * 20e-6
 
+    def _light_time(self, exp_s: float) -> float:
+        """Сколько секунд кадр реально освещён при экспозиции exp_s."""
+        m = self.mono
+        if m is not None and m.shutter_ttl:
+            return max(0.0, exp_s - self.ttl_lag_s)
+        return exp_s + self.readout_light_s
+
     def _photon_rate(self) -> np.ndarray:
         """Поток на столбец (отсчётов/с) для одной строки в центре полосы."""
         cols = np.arange(self.WIDTH, dtype=float)
@@ -371,7 +382,7 @@ class SimCamera(Camera):
         sources = self.fibers or [(self.stripe_center, self.stripe_sigma, 1.0)]
         profile = sum(k * np.exp(-0.5 * ((rows - c) / sg) ** 2) for c, sg, k in sources)
         rate = self._photon_rate()[r.left:r.right + 1]
-        signal = np.outer(profile, rate) * exp_s
+        signal = np.outer(profile, rate) * self._light_time(exp_s)
         dark = np.full(r.width, 0.5 * 2 ** ((self._temp - 20.0) / 6.5) * exp_s)
         for col, extra in self.hot_columns.items():
             if r.left <= col <= r.right:
