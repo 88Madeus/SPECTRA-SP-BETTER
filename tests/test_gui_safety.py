@@ -44,6 +44,7 @@ def win(app, spectrasp_dir, monkeypatch, tmp_path):
     w._closing = True
     w.poll_timer.stop()
     w.inst.shutdown()
+    w.release_graphics()
     w.deleteLater()
 
 
@@ -223,7 +224,7 @@ def test_shutter_button_shows_confirmed_state(win, app):
     assert btn.text().startswith("открыта")
     btn.click()                                              # закрыть
     t0 = time.monotonic()
-    while win._shutter_task and time.monotonic() - t0 < 10:
+    while win._mono_moving and time.monotonic() - t0 < 10:
         pump(app, 0.05)
     assert btn.text().startswith("закрыта") and not btn.isChecked()
     # шторку открыли в штатном окне DevCtrl — опрос показывает это на кнопке
@@ -240,7 +241,7 @@ def test_shutter_mode_selector(win, app):
     panel.shutter_mode.setCurrentIndex(1)
     panel.shutter_mode.activated.emit(1)                     # «по экспозиции»
     t0 = time.monotonic()
-    while (win._shutter_task or not win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
+    while (win._mono_moving or not win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
         pump(app, 0.05)
     assert win.inst.shutter_ttl and not panel.btn_shutter.isEnabled()
     assert "время кадра" in panel.btn_shutter.text()
@@ -249,7 +250,7 @@ def test_shutter_mode_selector(win, app):
     panel.shutter_mode.setCurrentIndex(0)
     panel.shutter_mode.activated.emit(0)
     t0 = time.monotonic()
-    while (win._shutter_task or win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
+    while (win._mono_moving or win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
         pump(app, 0.05)
     pump(app, 0.5)
     assert not win.inst.shutter_ttl and panel.btn_shutter.isEnabled()
@@ -469,3 +470,72 @@ def test_buffer_waterfall_offset(win, app):
     assert win.buffer_panel.offset.value() > 0
     win.buffer_panel.offset.setValue(0)
     assert np.allclose(win.plot.overlays[k2].yData, y0)
+
+
+def test_corrupt_buffer_file_does_not_block_start(app, spectrasp_dir, tmp_path):
+    from spectra_better.gui import main_window as mw
+    from spectra_better.gui.log_widget import QtLogHandler
+    (tmp_path / "buffer.npz").write_bytes(b"PK\x03\x04 not really a zip")
+    s = AppSettings()
+    s.spectrasp_dir = spectrasp_dir
+    s._path = str(tmp_path / "settings.json")
+    w = mw.MainWindow(s, True, QtLogHandler())
+    try:
+        assert len(w.buffer) == 0 and (tmp_path / "buffer.npz.bad").exists()
+    finally:
+        w._closing = True
+        w.poll_timer.stop()
+        w.inst.shutdown()
+        w.release_graphics()
+        w.deleteLater()
+
+
+def test_bad_bands_in_settings_are_dropped(tmp_path):
+    import json
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"bands": [{"lo": 500, "hi": 510, "unit": "nm"}, {"lo": "x"}, 5,
+                                       {"lo": 1, "hi": 2, "unit": "??"}]}), encoding="utf-8")
+    s = AppSettings.load(str(p))
+    assert s.bands == [{"lo": 500.0, "hi": 510.0, "unit": "nm"}, {"lo": 1.0, "hi": 2.0, "unit": "nm"}]
+
+
+def test_mono_panel_locked_while_series_holds_monochromator(win):
+    with win.inst.mono_exclusive("серия"):
+        assert "серия" in win._mono_lock_reason() and not win._mono_ready()
+        win._update_actions()
+        assert not win.mono_panel.btn_go.isEnabled()
+    win._update_actions()
+    assert win.mono_panel.btn_go.isEnabled()
+
+
+def test_background_in_ttl_mode_asks_nothing(win, app, monkeypatch):
+    win.inst.camera._update_temp = lambda: None
+    win.s.warm_up_on_close = False
+    win.s.close_shutter_for_background = False
+    win.inst.set_shutter_ttl(True)
+    asked = []
+    QMB = QtWidgets.QMessageBox
+    monkeypatch.setattr(QMB, "question", staticmethod(lambda *a, **k: asked.append(a[1]) or QMB.No))
+    win.take_background()
+    t0 = time.monotonic()
+    while win._acquiring() and time.monotonic() - t0 < 20:
+        pump(app, 0.05)
+    pump(app, 0.3)
+    assert not [m for m in win.msgs if m[0] != "question"], win.msgs
+    assert not asked and win.background is not None        # шторку закрыла программа — вопрос не нужен
+    win.inst.set_shutter_ttl(False)
+
+
+def test_close_no_keeps_acquisition(win, app, monkeypatch):
+    QMB = QtWidgets.QMessageBox
+    monkeypatch.setattr(QMB, "question", staticmethod(lambda *a, **k: QMB.No))
+    win.live()
+    pump(app, 0.3)
+    assert win._acquiring()
+    win.close()                                               # «Отключить приборы и выйти?» — «Нет»
+    pump(app, 0.3)
+    assert win._acquiring() and not win._closing              # непрерывная съёмка продолжается
+    win.stop()
+    t0 = time.monotonic()
+    while win._acquiring() and time.monotonic() - t0 < 20:
+        pump(app, 0.05)

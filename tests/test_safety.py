@@ -384,3 +384,21 @@ def test_ttl_mode_warns_without_exposure_output(inst, caplog):
     with caplog.at_level(logging.WARNING, logger="spectra_better.instrument"):
         inst.set_shutter_ttl(True)
     assert any("сигнал экспозиции" in r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------------------------------ щель и зеркало (DevCtrl — асинхронно)
+def test_slit_and_mirror_wait_for_completion(inst):
+    assert inst.mono.slit_delay > 0 and inst.mono.mirror_delay > 0     # имитатор, как DevCtrl, не сразу
+    w = inst.set_slit(0, 120.0)
+    assert w == pytest.approx(120.0)                         # уже новая ширина, а не прежняя
+    assert inst.get_slit(0) == pytest.approx(120.0) and not inst.mono.is_busy()
+    inst.set_mirror(1)
+    assert inst.get_mirror() == 1 and not inst.mono.is_busy()  # снимок после — уже в новом положении
+    inst.set_mirror(0)
+    assert inst.get_mirror() == 0
+
+
+def test_mirror_not_switched_is_an_error(inst, monkeypatch):
+    monkeypatch.setattr(inst.mono, "set_mirror", lambda index, position: None)    # «не поехало»
+    with pytest.raises(DeviceError, match="Зеркало не переключилось"):
+        inst.set_mirror(1)

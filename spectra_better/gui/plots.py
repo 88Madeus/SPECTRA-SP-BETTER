@@ -607,6 +607,7 @@ class ImagePanel(QtWidgets.QWidget):
         self.region.sigRegionChangeFinished.connect(self._region_changed)
         self.extra_regions: List[pg.LinearRegionItem] = []
         self.labels: List[pg.TextItem] = []
+        self._movable = True
         self._first = True
         self._suppress = False
         self.set_x_scale(AxisMap(None), X_PX, 0)
@@ -660,6 +661,7 @@ class ImagePanel(QtWidgets.QWidget):
             reg = pg.LinearRegionItem(orientation="horizontal", brush=pg.mkBrush(fill),
                                       pen=pg.mkPen(color, width=1.5))
             reg.sigRegionChangeFinished.connect(self._region_changed)
+            reg.setMovable(self._movable)
             view.addItem(reg)
             self.extra_regions.append(reg)
         for reg, (t, b) in zip(self.extra_regions, stripes[1:]):
@@ -674,6 +676,12 @@ class ImagePanel(QtWidgets.QWidget):
                 view.addItem(lab)
                 self.labels.append(lab)
         self._suppress = False
+
+    def set_stripes_movable(self, on: bool) -> None:
+        """Во время серии и панорамы полосы не перетаскиваются (строки ПЗС не должны меняться на ходу)."""
+        self._movable = bool(on)
+        for reg in [self.region] + self.extra_regions:
+            reg.setMovable(self._movable)
 
     def stripes(self) -> List[tuple]:
         out = []

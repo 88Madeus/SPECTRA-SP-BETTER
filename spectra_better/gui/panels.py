@@ -190,6 +190,13 @@ class AcquisitionPanel(QtWidgets.QGroupBox):
         self.comment.setText(settings.comment)
         self.comment.textChanged.connect(lambda t: setattr(self.s, "comment", t))
         form.addRow("Комментарий:", self.comment)
+        self.lock_note = QtWidgets.QLabel("")
+        self.lock_note.setWordWrap(True)
+        self.lock_note.setStyleSheet("color: #a15c00;")
+        self.lock_note.setVisible(False)
+        form.addRow(self.lock_note)
+        self._locked = ""
+        self._stripes_locked = False
         self.load_from_settings()
         for w in (self.exposure, self.accum, self.top, self.bottom):
             w.valueChanged.connect(self._store)
@@ -234,8 +241,26 @@ class AcquisitionPanel(QtWidgets.QGroupBox):
         self._store()
 
     def _update_enabled(self) -> None:
+        on = not getattr(self, "_locked", "")
+        for w in (self.exposure, self.accum, self.accum_mode, self.mode, self.top, self.bottom, self.speed,
+                  self.flip):
+            w.setEnabled(on)
+        self.btn_stripes.setEnabled(on and not getattr(self, "_stripes_locked", False))
         spectrum = self.mode.currentData() == ACQ_SPECTRUM
-        self.hw_bin.setEnabled(spectrum and self._n_stripes == 1)
+        self.hw_bin.setEnabled(on and spectrum and self._n_stripes == 1)
+
+    def set_locked(self, reason: str, stripes_locked: bool = False) -> None:
+        """Параметры, от которых зависят данные, не меняются, пока идёт серия или панорама
+        (иначе в одной серии — разные экспозиции, а панорама сшивается из несовместимых кадров).
+        Полосы через «Полосы…» не меняются и во время непрерывной съёмки (stripes_locked)."""
+        self._locked = reason
+        self._stripes_locked = stripes_locked
+        self.lock_note.setText(f"Параметры не меняются: {reason}" if reason else "")
+        self.lock_note.setVisible(bool(reason))
+        self.btn_stripes.setToolTip("Полосы меняются, когда съёмка остановлена" if stripes_locked and not reason
+                                    else "Несколько полос строк — свой спектр с каждой (например, несколько "
+                                         "волокон). Как «Stripe 1…8» в SpectraSP.")
+        self._update_enabled()
 
     def set_stripes_count(self, n: int) -> None:
         """Число полос: при нескольких камера читает строки построчно, полосы суммируются программно."""
@@ -276,8 +301,9 @@ class AcquisitionPanel(QtWidgets.QGroupBox):
         self.bottom.blockSignals(False)
         self._store()
 
-    def set_estimate(self, seconds: Optional[float]) -> None:
-        self.estimate.setText("" if seconds is None else f"≈ {seconds:.2f} с на кадр")
+    def set_estimate(self, seconds: Optional[float], note: str = "") -> None:
+        text = "" if seconds is None else f"≈ {seconds:.2f} с на кадр"
+        self.estimate.setText(text + (f"<br><span style='color:#a15c00'>{note}</span>" if note else ""))
 
 
 class MonoPanel(QtWidgets.QGroupBox):
@@ -307,6 +333,11 @@ class MonoPanel(QtWidgets.QGroupBox):
         top.addWidget(self.status, 1)
         top.addWidget(self.btn_service, 0, QtCore.Qt.AlignTop)
         form.addRow(top)
+        self.lock_note = QtWidgets.QLabel("")
+        self.lock_note.setWordWrap(True)
+        self.lock_note.setStyleSheet("color: #a15c00;")
+        self.lock_note.setVisible(False)
+        form.addRow(self.lock_note)
         self.wl = _big(QtWidgets.QLabel("— нм"), 16)
         self.busy = QtWidgets.QLabel("")
         self.busy.setStyleSheet("color: #a15c00;")
@@ -418,6 +449,11 @@ class MonoPanel(QtWidgets.QGroupBox):
     def set_busy(self, busy: bool, text: str = "движение…") -> None:
         self.busy.setText(text if busy else "")
 
+    def set_lock_reason(self, reason: str) -> None:
+        """Почему ручное управление сейчас недоступно ("" — доступно)."""
+        self.lock_note.setText(f"Управление недоступно: {reason}" if reason else "")
+        self.lock_note.setVisible(bool(reason))
+
     def set_slit_value(self, width: Optional[float]) -> None:
         if width is not None and not self.slit_w.hasFocus():
             self.slit_w.setValue(width)
@@ -499,6 +535,12 @@ class ProcessingPanel(QtWidgets.QGroupBox):
         note.setStyleSheet("color: #666;")
         note.setWordWrap(True)
         form.addRow(note)
+        self.lock_note = QtWidgets.QLabel("")
+        self.lock_note.setWordWrap(True)
+        self.lock_note.setStyleSheet("color: #a15c00;")
+        self.lock_note.setVisible(False)
+        form.addRow(self.lock_note)
+        self._locked = ""
         self.subtract.setChecked(settings.subtract_background)
         self.close_shutter.setChecked(settings.close_shutter_for_background)
         self.cosmics.setChecked(settings.remove_cosmics)
@@ -518,12 +560,13 @@ class ProcessingPanel(QtWidgets.QGroupBox):
         for w in (self.defects, self.intensity):
             w.blockSignals(True)
         n = len(s.defect_pixels)
+        on = not getattr(self, "_locked", "")
         self.defects.setChecked(s.defect_correction and n > 0)
-        self.defects.setEnabled(n > 0)
+        self.defects.setEnabled(n > 0 and on)
         self.defects.setText(f"исправлять дефектные пиксели ({n})" if n else "дефектные пиксели: список пуст")
         k = len(s.intensity_corr_points)
         self.intensity.setChecked(s.intensity_corr and k >= 2)
-        self.intensity.setEnabled(k >= 2)
+        self.intensity.setEnabled(k >= 2 and on)
         by = "по длинам волн" if s.intensity_corr_by == "wl" else "по пикселям"
         self.intensity.setText(f"коррекция интенсивности ({by}, {k} точ.)" if k >= 2
                                else "коррекция интенсивности: таблица пуста")
@@ -535,11 +578,21 @@ class ProcessingPanel(QtWidgets.QGroupBox):
         s.subtract_background = self.subtract.isChecked()
         s.close_shutter_for_background = self.close_shutter.isChecked()
         s.remove_cosmics = self.cosmics.isChecked()
-        if self.defects.isEnabled():
+        if len(s.defect_pixels) > 0:
             s.defect_correction = self.defects.isChecked()
-        if self.intensity.isEnabled():
+        if len(s.intensity_corr_points) >= 2:
             s.intensity_corr = self.intensity.isChecked()
         self.changed.emit()
+
+    def set_locked(self, reason: str) -> None:
+        """Обработка, от которой зависят данные (фон, коррекции), не меняется во время серии и панорамы."""
+        self._locked = reason
+        for w in (self.subtract, self.close_shutter, self.cosmics, self.btn_defects, self.btn_intensity,
+                  self.btn_bg_reset):
+            w.setEnabled(not reason)
+        self.lock_note.setText(f"Обработка не меняется: {reason}" if reason else "")
+        self.lock_note.setVisible(bool(reason))
+        self.load_corrections()
 
     def set_background_status(self, has: bool, text: str = "") -> None:
         self.bg_status.setText(text or ("фон снят" if has else "фон не снят"))

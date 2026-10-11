@@ -58,17 +58,28 @@ class MainWindow(QtWidgets.QMainWindow):
             n = self.buffer.load_state(self._buffer_path())
             if n:
                 log.info("Буфер спектров: загружено %d спектр(ов) с прошлого сеанса", n)
-        except (OSError, ValueError, KeyError) as e:
-            log.warning("Буфер спектров прошлого сеанса не прочитан: %s", e)
+        except Exception as e:  # noqa: BLE001 — повреждённый файл (обрыв записи и т. п.) не должен мешать запуску
+            self.buffer.clear()
+            bad = self._buffer_path() + ".bad"
+            try:
+                os.replace(self._buffer_path(), bad)
+            except OSError:
+                bad = ""
+            log.warning("Буфер спектров прошлого сеанса не прочитан (%s)%s", e,
+                        f"; файл отложен как {bad}" if bad else "")
         self._acq_thread: Optional[threading.Thread] = None
         self._acq_stop = threading.Event()
         self._acq_kind = ""
         self._poll_cam = False
         self._poll_mono = False
         self._mono_was_busy = False
-        self._shutter_task = False     # идёт переключение шторки (опрос её не трогает)
         self._poll_shutter = False
-        self._mono_moving = False
+        self._mono_moving = False         # выполняется команда с панели «Монохроматор» (движение, шторка)
+        self._service_cmd = False         # выполняется команда из окна «Сервис монохроматора»
+        self._dev_task = ""               # идёт подключение/отключение приборов — что именно ("" — нет)
+        self._dev_cam = False             # … и затрагивает ли оно камеру
+        self._dev_mono = False            # … и монохроматор
+        self._series_moves_mono = False   # текущая серия сама переставляет монохроматор (список длин волн)
         self._closing = False
         self._service_dlg = None
         # защита ПЗС
@@ -353,15 +364,41 @@ class MainWindow(QtWidgets.QMainWindow):
     def _acquiring(self) -> bool:
         return self._acq_thread is not None and self._acq_thread.is_alive()
 
-    def _mono_lock_reason(self) -> str:
-        """Почему ручное управление монохроматором сейчас недоступно ("" — доступно)."""
+    def _mono_lock_reason(self, for_service: bool = False) -> str:
+        """Почему ручное управление монохроматором сейчас недоступно ("" — доступно).
+        for_service — для окна «Сервис монохроматора» (у него и у панели — общая очередь команд)."""
+        if self._dev_mono:
+            return self._dev_task
         if self._foreign:
             return "запущена SpectraSP или DevCtrl — закройте её"
-        if self._acquiring() and self._acq_kind == "panorama":
+        acq = self._acquiring()
+        if acq and self._acq_kind == "panorama":
             return "идёт съёмка панорамы"
-        if self._acquiring() and self._acq_kind == "background":
+        if acq and self._acq_kind == "background":
             return "снимается темновой фон (шторка закрыта программой)"
+        if acq and self._acq_kind == "series" and self._series_moves_mono:
+            return "идёт серия по списку длин волн"
+        excl = self.inst._mono_exclusive
+        if excl is not None:
+            return f"монохроматором управляет {excl[0]}"
+        if for_service and self._mono_moving:
+            return "выполняется команда с панели «Монохроматор»"
+        if not for_service and self._service_cmd:
+            return "выполняется команда в окне «Сервис монохроматора»"
         return ""
+
+    def _data_lock_reason(self) -> str:
+        """Почему нельзя менять параметры, от которых зависят данные ("" — можно): серия и панорама
+        снимаются с одними и теми же экспозицией, полосами, фоном и коррекциями."""
+        if self._acquiring() and self._acq_kind in ("series", "panorama"):
+            return "идёт серия" if self._acq_kind == "series" else "идёт панорама"
+        return ""
+
+    def _refuse_during_run(self, what: str) -> bool:
+        reason = self._data_lock_reason()
+        if reason:
+            self.statusBar().showMessage(f"{what}: недоступно, {reason}", 5000)
+        return bool(reason)
 
     def _mono_ready(self) -> bool:
         """Можно ли сейчас отправить ручную команду монохроматору (иначе — объяснить почему)."""
@@ -380,25 +417,40 @@ class MainWindow(QtWidgets.QMainWindow):
         cam = self.inst.camera_connected
         mono = self.inst.mono_connected
         acq = self._acquiring()
-        self.act_connect.setEnabled(not (cam and mono) and not acq)
-        self.act_disconnect.setEnabled((cam or mono) and not acq)
-        self.act_reconnect_cam.setEnabled(not acq)
+        dev = bool(self._dev_task)
+        # подключение и отключение — только одно за раз и не во время съёмки
+        self.act_connect.setEnabled(not (cam and mono) and not acq and not dev)
+        self.act_disconnect.setEnabled((cam or mono) and not acq and not dev)
+        self.act_reconnect_cam.setEnabled(not acq and not dev)
+        self.act_settings.setEnabled(not dev)
         self._temp_block = self.inst.temperature_changing()
-        free = not acq and not self._foreign and not self._temp_block
+        free = not acq and not self._foreign and not self._temp_block and not self._dev_cam
         for a in (self.act_snap, self.act_live, self.act_bg, self.act_series):
             a.setEnabled(cam and free)
-        self.act_pano.setEnabled(cam and mono and free)
+        # панорама планируется по текущей решётке — не пока монохроматор выполняет команду
+        self.act_pano.setEnabled(cam and mono and free and not self._dev_mono and not self._mono_moving
+                                 and not self._service_cmd)
         self.act_stop.setEnabled(acq)
         self.act_save.setEnabled(self.current is not None)
         self.act_save_img.setEnabled(self.current is not None and self.current.image is not None)
         self.act_pin.setEnabled(self.current is not None)
-        self.cam_panel.set_connected(cam)
+        self.act_open_frame.setEnabled(not acq)
+        self.act_stripes.setEnabled(not acq)
+        run = self._data_lock_reason()
+        for a in (self.act_defects, self.act_intensity, self.act_calib):
+            a.setEnabled(not run)
+        self.acq_panel.set_locked(run, stripes_locked=acq)
+        self.proc_panel.set_locked(run)
+        self.image.set_stripes_movable(not run)
+        self.cam_panel.set_connected(cam and not self._dev_cam)
         lock = self._mono_lock_reason()
         self.mono_panel.set_connected(mono and not self._mono_moving and not lock)
-        self.act_service.setEnabled(mono)
-        self.mono_panel.set_service_enabled(mono)
+        self.mono_panel.set_lock_reason(lock if mono or self._dev_mono else "")
+        self.act_service.setEnabled(mono and not self._dev_mono)
+        self.mono_panel.set_service_enabled(mono and not self._dev_mono)
         if self._service_dlg is not None:
-            self._service_dlg.set_locked(lock)
+            self._service_dlg.set_locked(self._mono_lock_reason(for_service=True) if mono
+                                         else "монохроматор не подключён")
         self.proc_panel.btn_bg.setEnabled(cam and free)
         self.lbl_cam.setText("Камера: подключена" if cam else "Камера: —")
         self._update_bg_status()
@@ -435,17 +487,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.Retry | QtWidgets.QMessageBox.Cancel)
             if r != QtWidgets.QMessageBox.Retry:
                 return
+        if self._dev_task:
+            return
         self._foreign = False
-        if not self.inst.camera_connected:
+        cam, mono = not self.inst.camera_connected, not self.inst.mono_connected
+        if not (cam or mono):
+            return
+        # пока драйверы открываются, повторное «Подключить» (и отключение) недоступно: двойной вызов
+        # открытия драйвера камеры или монохроматора недопустим
+        self._dev_task = "идёт подключение приборов"
+        self._dev_cam, self._dev_mono = cam, mono
+        self._update_actions()
+
+        def finished(which: str):
+            setattr(self, which, False)
+            if not (self._dev_cam or self._dev_mono):
+                self._dev_task = ""
+            self._update_actions()
+        if cam:
             self.lbl_cam.setText("Камера: подключение…")
             log.info("Подключение камеры (%s)…", self.inst.camera_ip() or "?")
-            self.tasks.run(self.inst.connect_camera, self._camera_connected,
-                           lambda e: (self._error("Камера", e), self._update_actions()), "connect-camera")
-        if not self.inst.mono_connected:
+            self.tasks.run(self.inst.connect_camera,
+                           lambda info: (finished("_dev_cam"), self._camera_connected(info)),
+                           lambda e: (finished("_dev_cam"), self._error("Камера", e)), "connect-camera")
+        if mono:
             self.lbl_mono.setText("Монохроматор: подключение…")
             log.info("Подключение монохроматора (%s)…", self.inst.mono_address() or "?")
-            self.tasks.run(self.inst.connect_mono, self._mono_connected,
-                           lambda e: (self._error("Монохроматор", e), self.lbl_mono.setText("Монохроматор: —")),
+            self.tasks.run(self.inst.connect_mono,
+                           lambda info: (finished("_dev_mono"), self._mono_connected(info)),
+                           lambda e: (finished("_dev_mono"), self._error("Монохроматор", e),
+                                      self.lbl_mono.setText("Монохроматор: —")),
                            "connect-mono")
 
     def _camera_connected(self, info) -> None:
@@ -496,18 +567,29 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.inst.mono_connected:
             QtWidgets.QMessageBox.information(self, "Сервис прибора", "Сначала подключите монохроматор.")
             return
-        if self._service_dlg is not None and self._service_dlg.isVisible():
-            self._service_dlg.raise_()
-            self._service_dlg.activateWindow()
+        dlg = self._service_dlg
+        # окно одно: у второго была бы своя очередь команд, и они шли бы вперемешку
+        if dlg is not None and (dlg.mono is self.inst.mono or dlg.command_running):
+            dlg.set_locked(self._mono_lock_reason(for_service=True))
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            if not dlg.command_running:
+                dlg.refresh()
             return
         from .service_dialog import MonoServiceDialog
 
         def changed():
             self._update_mono_view()
             self._refresh_mono_misc()
-        self._service_dlg = MonoServiceDialog(self.inst, self.tasks, changed, self)
-        self._service_dlg.set_locked(self._mono_lock_reason())
+        self._service_dlg = MonoServiceDialog(self.inst, self.tasks, changed, self,
+                                              on_command=self._service_command)
+        self._service_dlg.set_locked(self._mono_lock_reason(for_service=True))
         self._service_dlg.show()
+
+    def _service_command(self, running: bool) -> None:
+        self._service_cmd = running
+        self._update_actions()
 
     def _update_mono_view(self) -> None:
         self.mono_panel.set_wavelength(self.inst.mono_wl, self.inst.mono_grating)
@@ -530,15 +612,22 @@ class MainWindow(QtWidgets.QMainWindow):
         return dlg, cancel
 
     def disconnect_devices(self) -> None:
-        if self._acquiring():
+        if self._acquiring() or self._dev_task:
             return
         self._stop_warm_up()
+        self._dev_task = "идёт отключение приборов"
+        self._dev_cam = self._dev_mono = True
+        self._update_actions()
+        if self._service_dlg is not None and not self._service_dlg.command_running:
+            self._service_dlg.close()
         dlg, cancel = self._shutdown_dialog()
         self.tasks.run(lambda: self.inst.disconnect(say=dlg.text_changed.emit, cancel_warm_up=cancel),
                        lambda _: self._disconnected(dlg),
                        lambda e: (self._disconnected(dlg), self._error("Отключение", e)), "disconnect")
 
     def _disconnected(self, dlg) -> None:
+        self._dev_task = ""
+        self._dev_cam = self._dev_mono = False
         dlg.finish()
         self._show_sync()
         log.info("Приборы отключены")
@@ -548,8 +637,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_actions()
 
     def reconnect_camera(self) -> None:
-        if self._acquiring():
+        if self._acquiring() or self._dev_task:
             return
+        self._dev_task = "идёт переподключение камеры"
+        self._dev_cam = True
+        self._update_actions()
+
+        def finished():
+            self._dev_task = ""
+            self._dev_cam = False
+            self._update_actions()
 
         def work():
             if self.inst.camera is not None:
@@ -558,8 +655,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception as e:  # noqa: BLE001
                     log.warning("Закрытие камеры: %s", e)
             return self.inst.connect_camera()
-        self.tasks.run(work, self._camera_connected, lambda e: (self._error("Камера", e), self._update_actions()),
-                       "reconnect-camera")
+        self.tasks.run(work, lambda info: (finished(), self._camera_connected(info)),
+                       lambda e: (finished(), self._error("Камера", e)), "reconnect-camera")
 
     # ================================================================ опрос
     def _check_foreign(self) -> None:
@@ -625,7 +722,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._mono_moving:
             t = self.inst.mono_thread.busy_for
             self.mono_panel.set_busy(True, f"движение… {t:.0f} с" if t else "движение…")
-        elif self.inst.mono_connected and self._poll_ticks % 2 == 0 and not self._shutter_task \
+        elif self.inst.mono_connected and self._poll_ticks % 2 == 0 and not self._service_cmd \
                 and not self.inst.shutter_ttl \
                 and not self._poll_shutter and not self._acquiring():
             # шторку могут переключить и в штатном окне DevCtrl — кнопка должна показывать факт
@@ -633,7 +730,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             def done_s(state):
                 self._poll_shutter = False
-                if not self._shutter_task:
+                if not self._mono_moving:          # иначе это состояние до команды, которая ещё идёт
                     self.mono_panel.set_shutter_value(state)
             self.tasks.run(self.inst.get_shutter, done_s, lambda e: setattr(self, "_poll_shutter", False),
                            "poll-shutter")
@@ -803,7 +900,14 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 acq = self.inst.acq_settings()
                 t = self.inst.expected_frame_time(acq) * max(1, self.s.accumulations)
-                self.acq_panel.set_estimate(t)
+                want_us = self.s.exposure_ms * 1000
+                note = ""
+                if abs(acq.exposure_us - want_us) > max(0.5, 0.002 * want_us):
+                    real = acq.exposure_us
+                    shown = f"{real / 1e6:g} с" if real >= 1e6 else (f"{real / 1e3:g} мс" if real >= 1e3
+                                                                       else f"{real:g} мкс")
+                    note = f"камера снимет {shown} (её точность/минимум)"
+                self.acq_panel.set_estimate(t, note)
             except (DeviceError, ValueError) as e:
                 self.acq_panel.set_estimate(None)
                 log.debug("estimate: %s", e)
@@ -811,7 +915,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ================================================================ съёмка
     def _start(self, kind: str, fn: Callable[[], None]) -> None:
-        if self._acquiring() or self._foreign:
+        if self._acquiring() or self._foreign or self._dev_task:
             return
         block = self.inst.temperature_changing()
         if block:
@@ -854,7 +958,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def take_background(self) -> None:
         if self._acquiring():
             return
-        if not self.inst.mono_connected or not self.s.close_shutter_for_background:
+        auto_close = self.inst.mono_connected and (self.s.close_shutter_for_background or self.inst.shutter_ttl)
+        if not auto_close:
             r = QtWidgets.QMessageBox.question(
                 self, "Темновой фон",
                 "Шторка монохроматора не будет закрыта автоматически.\n"
@@ -886,6 +991,11 @@ class MainWindow(QtWidgets.QMainWindow):
         p = dlg.params()
         if p.wavelengths and not self.inst.mono_connected:
             self._error("Серия", DeviceError("Для списка длин волн нужен подключённый монохроматор"))
+            return
+        if p.wavelengths and (self._mono_moving or self._service_cmd):
+            self._error("Серия", DeviceError("Монохроматор ещё выполняет команду — запустите серию после неё"))
+            return
+        if self._acquiring():
             return
         self.s.autosave_series = p.save
         if p.save:
@@ -937,6 +1047,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.emitter.progress.emit(done, total, f"серия: переход на {wl:g} нм")
                     self.inst.goto_wavelength(wl)
                     done = run_at(wl, done)
+        self._series_moves_mono = bool(p.wavelengths)
         self._start("series", loop)
 
     def panorama(self) -> None:
@@ -948,6 +1059,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
         p = dlg.params()
+        if self._mono_moving or self._service_cmd or self._acquiring():
+            self._error("Панорама", DeviceError("Монохроматор или камера заняты — запустите панораму, когда "
+                                                "закончится текущая команда"))
+            return
         try:
             plan = self.inst.panorama_plan(p.start, p.end, p.overlap, p.trim)
         except DeviceError as e:
@@ -1004,6 +1119,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # сигнал приходит с задержкой: к этому моменту могла начаться новая съёмка
         if thread is self._acq_thread:
             self._acq_thread = None
+            self._series_moves_mono = False
         self.progress.setVisible(False)
         self._update_actions()
         if kind in ("panorama", "series"):
@@ -1068,6 +1184,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.image.set_x_scale(amap, unit, im.image.shape[1])
 
     def _on_measurement(self, m: Measurement) -> None:
+        if self._closing:
+            return                     # кадр, дошедший во время выхода: графики уже закрыты
+        if self._acquiring() and self._acq_kind in ("series", "panorama"):
+            self._update_mono_view()   # серия и панорама сами переставляют монохроматор
         if m.is_background:
             self.background = m
             log.info("Фон снят: %d кадр(ов) по %.0f мс, среднее %.1f отсч.", m.accumulations, m.exposure_ms,
@@ -1272,6 +1392,9 @@ class MainWindow(QtWidgets.QMainWindow):
     # ================================================================ полосы, дефекты, коррекция
     def _stripes_dragged(self, stripes: list) -> None:
         """Полосу перетащили на изображении ПЗС."""
+        if self._refuse_during_run("Полосы строк"):
+            self.image.set_stripes(self.inst.stripes())
+            return
         try:
             self.inst.set_stripes(stripes)
         except DeviceError as e:
@@ -1315,6 +1438,8 @@ class MainWindow(QtWidgets.QMainWindow):
             log.info("Несколько полос: камера читает строки построчно; фон нужно снять заново")
 
     def edit_defects(self) -> None:
+        if self._refuse_during_run("Дефектные пиксели"):
+            return
         cam = self.inst.camera
         width = cam.info.width if cam is not None and cam.info.width else 2048
         dark = self.background.raw if self.background is not None else None
@@ -1325,6 +1450,8 @@ class MainWindow(QtWidgets.QMainWindow):
                      "включено" if self.s.defect_correction else "выключено")
 
     def edit_intensity(self) -> None:
+        if self._refuse_during_run("Коррекция интенсивности"):
+            return
         m = self.current
         x_nm = measured = None
         if m is not None and m.x_unit == "nm" and not m.intensity_corrected and not m.stitched:
@@ -1391,7 +1518,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def buffer_to_current(self, key: str) -> None:
         """Сделать спектр из буфера текущим (пики, сохранение, «В буфер» под другим именем)."""
         e = self.buffer.get(key)
-        if e is None or self._acquiring():
+        if e is None:
+            return
+        if self._acquiring():
+            self.statusBar().showMessage("Во время съёмки текущим остаётся снятый спектр — остановите съёмку", 5000)
             return
         self.current = e.m
         self._redraw()
@@ -1577,7 +1707,8 @@ class MainWindow(QtWidgets.QMainWindow):
         log.info("Кадр сохранён: %s", path)
 
     # ================================================================ монохроматор
-    def _mono_task(self, text: str, fn, after=None) -> None:
+    def _mono_task(self, text: str, fn, after=None, on_fail=None) -> None:
+        """Команда с панели «Монохроматор»: одна за раз, панель и окно «Сервис» на это время заблокированы."""
         self._mono_moving = True
         self.mono_panel.set_busy(True, text)
         self._update_actions()
@@ -1594,7 +1725,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mono_moving = False
             self.mono_panel.set_busy(False)
             self._update_actions()
-            self._error("Монохроматор", e)
+            self._update_mono_view()
+            self._refresh_mono_misc()                 # вернуть панели фактические щель/зеркало/шторку
+            if on_fail:
+                on_fail(e)
+            else:
+                self._error("Монохроматор", e)
         self.tasks.run(fn, done, fail, "mono")
 
     def goto_wavelength(self, wl: float) -> None:
@@ -1637,17 +1773,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         def done(_):
-            self._shutter_task = False
             self._show_shutter_mode()
             if not on:
                 self._refresh_mono_misc()
 
         def failed(e):
-            self._shutter_task = False
             self._error("Режим шторки", e)
             self._show_shutter_mode()
-        self._shutter_task = True
-        self.tasks.run(lambda: self.inst.set_shutter_ttl(on), done, failed)
+        self._mono_task("режим шторки…", lambda: self.inst.set_shutter_ttl(on), done, failed)
 
     def set_shutter(self, is_open: bool) -> None:
         if not self._mono_ready():
@@ -1657,21 +1790,13 @@ class MainWindow(QtWidgets.QMainWindow):
         def work():
             self.inst.set_shutter(is_open)         # ждёт, пока прибор подтвердит новое состояние
             return self.inst.get_shutter()
-
-        def done(state):
-            self._shutter_task = False
-            self.mono_panel.set_shutter_value(state)
-
-        def failed(e):
-            self._shutter_task = False
-            self._error("Шторка", e)
-            self._refresh_mono_misc()
-        self._shutter_task = True
         self.mono_panel.btn_shutter.setText("шторка: открывается…" if is_open else "шторка: закрывается…")
-        self.tasks.run(work, done, failed)
+        self._mono_task("шторка…", work, self.mono_panel.set_shutter_value, lambda e: self._error("Шторка", e))
 
     # ================================================================ настройки
     def calibration(self) -> None:
+        if self._refuse_during_run("Калибровка шкалы"):
+            return
         cur = self.current
         spectrum = cur.raw if cur is not None else None
         n = spectrum.size if spectrum is not None else (self.inst.camera.info.width if self.inst.camera_connected else 2048)
@@ -1705,11 +1830,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.s.save()
 
     def settings_dialog(self) -> None:
+        if self._dev_task:
+            return
         old_dir = self.s.spectrasp_dir
+        old_laser = (self.s.laser_output, self.s.laser_active_high)
         dlg = SettingsDialog(self.s, self.inst.camera_ip(), self.inst.mono_address(), self,
                              laser_on=self.inst.laser_on and self.inst.camera_connected)
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
+        if (self.s.laser_output, self.s.laser_active_high) != old_laser and self.s.laser_output in (1, 2) \
+                and self.inst.camera_connected:
+            # лазер перенесён на другой выход или сменилась полярность: прежний уровень на выходе может
+            # теперь означать «включён» (а режим «экспозиция» — вспышки на каждом кадре) — сразу выключаем
+            log.info("Лазер перенастроен (синхровыход %d) — выход переводится в «выключен»", self.s.laser_output)
+            if self._acquiring():
+                self.stop()
+            self.tasks.run(lambda: self.inst.set_laser(False), lambda _: self._show_sync(),
+                           lambda e: (self._error("Лазер", e), self._show_sync()), "laser")
         self._show_sync()
         if self.s.spectrasp_dir != old_dir:
             if self.inst.camera_connected or self.inst.mono_connected:
@@ -1739,10 +1876,26 @@ class MainWindow(QtWidgets.QMainWindow):
             "</ul><p>Журнал работы: папка logs в каталоге настроек.</p>")
 
     # ================================================================ закрытие
+    def release_graphics(self) -> None:
+        """Закрыть графики pyqtgraph: он держит их в общем списке, и окно, созданное следом в том же
+        процессе (так бывает в тестах), обращалось бы к меню графиков уже удалённого окна."""
+        for close in (self.image.view.close, self.plot.plot.close):
+            try:
+                close()
+            except Exception as e:  # noqa: BLE001 — при выходе не мешаем закрытию
+                log.debug("Закрытие графика: %s", e)
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self._closing:
+            self.release_graphics()
             event.accept()
             return
+        connected = self.inst.camera_connected or self.inst.mono_connected
+        if connected:
+            r = QtWidgets.QMessageBox.question(self, APP_NAME, "Отключить приборы и выйти?")
+            if r != QtWidgets.QMessageBox.Yes:
+                event.ignore()                         # съёмку не трогаем — пользователь передумал
+                return
         if self._acquiring():
             self.stop()
         self.s.window_state = bytes(self.saveState().toBase64()).decode("ascii")
@@ -1754,11 +1907,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.buffer.save_state(self._buffer_path())
         except OSError as e:
             log.warning("Буфер спектров не сохранён: %s", e)
-        if self.inst.camera_connected or self.inst.mono_connected:
-            r = QtWidgets.QMessageBox.question(self, APP_NAME, "Отключить приборы и выйти?")
-            if r != QtWidgets.QMessageBox.Yes:
-                event.ignore()
-                return
+        if connected:
             self._closing = True
             self.poll_timer.stop()
             self._stop_warm_up()
@@ -1774,4 +1923,5 @@ class MainWindow(QtWidgets.QMainWindow):
             self.inst.shutdown()
         except Exception:  # noqa: BLE001
             pass
+        self.release_graphics()
         event.accept()

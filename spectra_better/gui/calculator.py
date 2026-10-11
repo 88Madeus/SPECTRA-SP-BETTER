@@ -83,7 +83,7 @@ class CalculatorDialog(QtWidgets.QDialog):
 
     def calculate(self) -> Optional[Measurement]:
         op = self.op.currentData()
-        title, need_b, need_k = P.OPERATIONS[op]
+        _title, need_b, _need_k = P.OPERATIONS[op]
         sa = self._get(self.a)
         sb = self._get(self.b) if need_b else None
         if sa is None or (need_b and sb is None):
