@@ -124,6 +124,54 @@ def save_image(path: str, image: np.ndarray, meta: Optional[Dict[str, object]] =
             f.write(sep.join(str(int(v)) for v in row) + "\n")
 
 
+def load_image(path: str) -> Tuple[np.ndarray, Dict[str, str]]:
+    """Кадр ПЗС из файла: .npy (+ _info.txt), .txt/.csv (матрица, «# ключ: значение» в начале)
+    или 16-битный TIFF (как сохраняет SpectraSP). Возвращает (кадр float64, сведения)."""
+    ext = os.path.splitext(path)[1].lower()
+    meta: Dict[str, str] = {}
+    if ext == ".npy":
+        img = np.load(path, allow_pickle=False)
+        info = os.path.splitext(path)[0] + "_info.txt"
+        if os.path.isfile(info):
+            with open(info, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        meta[k.strip()] = v.strip()
+    elif ext in (".tif", ".tiff"):
+        from PyQt5 import QtGui
+        q = QtGui.QImage(path)
+        if q.isNull():
+            raise ValueError("Не удалось прочитать TIFF")
+        if q.format() != QtGui.QImage.Format_Grayscale16:
+            q = q.convertToFormat(QtGui.QImage.Format_Grayscale16)
+        ptr = q.constBits()
+        ptr.setsize(q.bytesPerLine() * q.height())
+        rows = np.frombuffer(ptr, dtype=np.uint16).reshape(q.height(), q.bytesPerLine() // 2)
+        img = rows[:, :q.width()].copy()
+    else:
+        data = []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    if ":" in line:
+                        k, v = line[1:].split(":", 1)
+                        meta[k.strip()] = v.strip()
+                    continue
+                sep = ";" if ";" in line else None
+                data.append([float(v.replace(",", ".")) for v in line.split(sep)])
+        if not data or len({len(r) for r in data}) != 1:
+            raise ValueError("Файл не похож на кадр: строки разной длины или нет данных")
+        img = np.asarray(data)
+    img = np.asarray(img, dtype=np.float64)
+    if img.ndim != 2 or min(img.shape) < 1:
+        raise ValueError("В файле не двумерный кадр")
+    return img, meta
+
+
 def unique_path(directory: str, stem: str, ext: str) -> str:
     """Имя файла без перезаписи: stem_001.ext, stem_002.ext, ..."""
     os.makedirs(directory, exist_ok=True)

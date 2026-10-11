@@ -68,6 +68,8 @@ PROTOTYPES = {
 
 STATUS_IDLE, STATUS_BUSY, STATUS_NOT_INIT = 0, 1, 2
 SSS_UNKNOWN, SSS_ON, SSS_OFF = 0, 1, 2     # TSignalSrcState: ON — шторка открыта
+# Маска шторки n в DevCtrl (так SSPL_IM переводит номер шторки 0 → 0x1000, 1 → 0x2000)
+SHUTTER_MASKS = (0x1000, 0x2000, 0x4000, 0x8000, 0x9000)
 TURRET = 0
 
 
@@ -239,6 +241,34 @@ class SsplMonochromator(Monochromator):
         self._require_open()
         if not self._fn("SetSignalSourceState")(int(index), SSS_ON if is_open else SSS_OFF):
             raise DeviceError("Не удалось переключить шторку")
+
+    def _devctrl_function(self, name: str, restype, *argtypes):
+        """Функция самого DevCtrl.dll (его загрузила SSPL_IM.Init; в SSPL_IM её обёртки нет)."""
+        if not hasattr(ctypes, "WINFUNCTYPE"):
+            raise DeviceError("Работа с DevCtrl возможна только в Windows")
+        k32 = ctypes.WinDLL("kernel32")
+        k32.GetModuleHandleW.restype = c_void_p
+        k32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        k32.GetProcAddress.restype = c_void_p
+        k32.GetProcAddress.argtypes = [c_void_p, ctypes.c_char_p]
+        h = k32.GetModuleHandleW(os.path.join(self.dir, "DevCtrl.dll")) or k32.GetModuleHandleW("DevCtrl.dll")
+        addr = k32.GetProcAddress(h, name.encode("ascii")) if h else None
+        if not addr:
+            raise DeviceError(f"В DevCtrl.dll нет функции {name}")
+        return ctypes.WINFUNCTYPE(restype, *argtypes)(addr)
+
+    def set_shutter_ttl(self, on: bool, index: int = 0) -> None:
+        """То же, что кнопки «TTL»/«Internal» шторки в штатном окне DevCtrl:
+        DevCtrl.SetShutterMode(маска шторки, 1/0), stdcall, `ret 8`, результат — Boolean."""
+        self._require_open()
+        if not 0 <= index < len(SHUTTER_MASKS):
+            raise DeviceError(f"Нет шторки №{index + 1}")
+        fn = self._devctrl_function("SetShutterMode", ctypes.c_ubyte, c_int32, c_int32)
+        ok = fn(SHUTTER_MASKS[index], 1 if on else 0)
+        pump_messages()
+        if not ok:
+            raise DeviceError("Монохроматор не переключил режим шторки "
+                              + ("на TTL (по экспозиции)" if on else "на ручное управление"))
 
     # ------------------------------------------------------------ калибровка
     def pixel_wavelengths(self, center_wl: float, center_pixel: float,

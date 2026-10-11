@@ -259,3 +259,128 @@ def test_disconnect_forgets_setpoint(inst):
     inst.set_cooling(True, 5)
     inst.disconnect(warm_up=False)
     assert inst.cooling_target is None
+
+
+# ------------------------------------------------------------------ шторка (DevCtrl выполняет команду не сразу)
+def test_shutter_state_confirmed_after_command(inst):
+    assert inst.mono.shutter_delay > 0                     # имитатор, как DevCtrl, отвечает с задержкой
+    inst.set_shutter(False)
+    assert inst.get_shutter() is False                     # сразу после команды — уже новое состояние
+    inst.set_shutter(True)
+    assert inst.get_shutter() is True
+
+
+def test_background_taken_only_with_closed_shutter(inst, monkeypatch):
+    inst.settings.close_shutter_for_background = True
+    assert inst.get_shutter() is True
+    seen = []
+    orig = inst._frame
+
+    def frame(acq):
+        inst.mono._apply_shutter()
+        seen.append(inst.mono.shutter_open)
+        return orig(acq)
+    monkeypatch.setattr(inst, "_frame", frame)
+    inst.acquire(background=True)
+    assert seen and not any(seen)                          # ни одного кадра фона при открытой шторке
+    assert inst.get_shutter() is True                      # после фона шторка снова открыта
+
+
+def test_background_refused_if_shutter_does_not_close(inst, monkeypatch):
+    import spectra_better.instrument as I
+    monkeypatch.setattr(I, "SHUTTER_CONFIRM_S", 0.5)
+    inst.settings.close_shutter_for_background = True
+    monkeypatch.setattr(inst.mono, "set_shutter", lambda is_open, index=0: None)     # «заела»
+    shots = []
+    monkeypatch.setattr(inst, "_frame", lambda acq: shots.append(1))
+    with pytest.raises(DeviceError, match="Шторка не закрылась"):
+        inst.acquire(background=True)
+    assert not shots and not inst.has_background()
+
+
+def test_warns_once_when_shooting_with_closed_shutter(inst, caplog):
+    import logging
+    inst.set_shutter(False)
+    with caplog.at_level(logging.WARNING, logger="spectra_better.instrument"):
+        inst.acquire()
+        inst.acquire()
+        inst.acquire(background=True)                      # фон при закрытой шторке — норма
+    warns = [r for r in caplog.records if "шторка монохроматора закрыта" in r.getMessage()]
+    assert len(warns) == 1
+    inst.set_shutter(True)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="spectra_better.instrument"):
+        inst.acquire()
+    assert not [r for r in caplog.records if "шторка" in r.getMessage()]
+
+
+# ------------------------------------------------------------------ шторка по экспозиции (TTL)
+def _signal(m, at=None):
+    """Сигнал над уровнем смещения камеры в точке линии at (±2 пикселя).
+
+    Не максимум по всему спектру: имитатор, как настоящая ПЗС, иногда ловит
+    космическую частицу (до 20 000 отсчётов) — в тёмном кадре она дала бы «свет».
+    """
+    import numpy as np
+    y = m.raw
+    i = int(np.argmax(y)) if at is None else at
+    return float(y[max(0, i - 2):i + 3].max() - np.median(y))
+
+
+def _line(m):
+    import numpy as np
+    return int(np.argmax(m.raw))
+
+
+def _bright(inst):
+    inst.settings.exposure_ms = 200
+    inst.goto_wavelength(546.0)                            # линия ртути в спектре лампы имитатора
+
+
+def test_shutter_ttl_mode_light_only_during_exposure(inst):
+    assert inst.mono.info.shutter_ttl                      # в MS7504_20126.cfg: [Shutter1] TTL=1
+    assert inst.shutter_ttl is False                       # после подключения — ручной режим (настройка)
+    _bright(inst)
+    inst.set_shutter(False)
+    dark_m = inst.acquire()
+    inst.set_shutter_ttl(True)
+    assert inst.mono.shutter_ttl and inst.settings.shutter_ttl
+    lit_m = inst.acquire()
+    i = _line(lit_m)                                       # линия ртути 546 нм
+    assert _signal(lit_m, i) > _signal(dark_m, i) * 20     # шторку открыл импульс экспозиции камеры
+    with pytest.raises(DeviceError, match="по экспозиции"):
+        inst.set_shutter(True)                             # вручную — только после смены режима
+    inst.set_shutter_ttl(False)
+    assert not inst.mono.shutter_ttl
+    inst.set_shutter(True)
+
+
+def test_background_in_ttl_mode_is_dark_and_mode_restored(inst):
+    inst.settings.close_shutter_for_background = False    # даже так: по TTL шторка открылась бы на фон
+    _bright(inst)
+    inst.set_shutter_ttl(True)
+    lit_m = inst.acquire()
+    i = _line(lit_m)
+    bg = _signal(inst.acquire(background=True), i)
+    assert bg < _signal(lit_m, i) / 20                     # фон тёмный (в точке линии)
+    assert inst.shutter_ttl and inst.mono.shutter_ttl     # режим по экспозиции вернулся
+
+
+def test_ttl_mode_applied_on_connect(spectrasp_dir):
+    s = AppSettings()
+    s.spectrasp_dir = spectrasp_dir
+    s.shutter_ttl = True
+    i = Instrument(s, simulate=True)
+    try:
+        i.connect_mono()
+        assert i.shutter_ttl and i.mono.shutter_ttl
+    finally:
+        i.shutdown()
+
+
+def test_ttl_mode_warns_without_exposure_output(inst, caplog):
+    import logging
+    inst.set_sync_out(1, 6)                                 # оба выхода — постоянный уровень
+    with caplog.at_level(logging.WARNING, logger="spectra_better.instrument"):
+        inst.set_shutter_ttl(True)
+    assert any("сигнал экспозиции" in r.getMessage() for r in caplog.records)

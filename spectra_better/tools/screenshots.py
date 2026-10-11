@@ -151,7 +151,35 @@ def main(argv=None) -> int:
     pump(0.8)
     save(w, "image.png")
     w.tabs.setCurrentIndex(0)
+
+    # несколько полос строк (два «волокна») и интегрирование в участке
+    inst.camera.fibers = [(150, 4, 1.0), (350, 4, 0.45)]
+    inst.set_stripes([(140, 160), (338, 362)])
+    w.acq_panel.load_from_settings()
+    w._acq_settings_changed()
+    w.snap()
+    wait(lambda: not w._acquiring())
+    w.tabs.setCurrentIndex(1)
+    pump(0.8)
+    save(w, "stripes.png")
+    w.tabs.setCurrentIndex(0)
     w.acq_panel.mode.setCurrentIndex(w.acq_panel.mode.findData("spectrum"))
+    s.remove_cosmics = True                   # космическая частица в кадре фона дала бы провал
+    w.take_background()                       # фон для новой раскладки полос
+    wait(lambda: not w._acquiring())
+    snap()
+    s.bands = [{"lo": 545.6, "hi": 546.6, "unit": "nm"}, {"lo": 576.5, "hi": 577.5, "unit": "nm"}]
+    w.analysis_tabs.setCurrentWidget(w.bands_panel)
+    w._redraw()
+    pump(0.6)
+    save(w, "analysis.png")
+    s.bands = []
+    s.remove_cosmics = False
+    w.analysis_tabs.setCurrentIndex(0)
+    inst.camera.fibers = []
+    inst.set_stripes([(282, 311)])
+    w.acq_panel.load_from_settings()
+    w._acq_settings_changed()
     snap()
 
     # сервисное окно монохроматора

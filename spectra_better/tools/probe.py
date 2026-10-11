@@ -3,10 +3,12 @@
     py -3.12-32 -m spectra_better.tools.probe
     py -3.12-32 -m spectra_better.tools.probe --expose 100
     py -3.12-32 -m spectra_better.tools.probe --mono-only
+    py -3.12-32 -m spectra_better.tools.probe --open-shutter --expose 200
 
 По умолчанию выполняются только безопасные операции чтения: подключение,
 чтение параметров, температуры, длины волны и т. п. Экспозиция (--expose),
-перемещение монохроматора (--goto) и охлаждение (--cooling) — только по ключам.
+перемещение монохроматора (--goto), открытие шторки (--open-shutter) и охлаждение
+(--cooling) — только по ключам.
 Отчёт сохраняется в текстовый файл — его удобно приложить к сообщению об ошибке.
 """
 from __future__ import annotations
@@ -23,7 +25,7 @@ import numpy as np
 
 from ..calibration import geometries_from_config
 from ..hw.base import DeviceError, spectrum_region, full_frame_region, AcqSettings
-from ..hw.winutil import IS_WINDOWS, PYTHON_BITS, present_as_spectrasp, spectrasp_is_running
+from ..hw.winutil import IS_WINDOWS, PYTHON_BITS, present_as_spectrasp, pump_messages, spectrasp_is_running
 from ..spectrasp_config import find_spectrasp_dir, read_installation
 from ..storage import save_image, save_spectrum
 
@@ -69,6 +71,8 @@ def main(argv=None) -> int:
     ap.add_argument("--speed", type=int, help="скорость считывания, кГц")
     ap.add_argument("--dll", default="auto", help="библиотека камеры (psi_ccd2_ver0.dll …)")
     ap.add_argument("--goto", type=float, metavar="НМ", help="установить длину волны монохроматора")
+    ap.add_argument("--open-shutter", action="store_true",
+                    help="открыть входную шторку монохроматора (с подтверждением от прибора)")
     ap.add_argument("--cooling", type=int, metavar="°C", help="включить охлаждение с уставкой")
     ap.add_argument("--warm-up", action="store_true",
                     help="не требуется: охлаждённая ниже 0 °C ПЗС отогревается до +2 °C при отключении всегда")
@@ -119,7 +123,24 @@ def main(argv=None) -> int:
             for i in range(max(1, len(inst.mono.slits))):
                 R.step(f"Щель {i + 1}", lambda i=i: R(f"    {mono.get_slit(i):g} мкм"))
             R.step("Выходное зеркало", lambda: R(f"    положение {mono.get_mirror(0)}"))
-            R.step("Шторка", lambda: R(f"    {'открыта' if mono.get_shutter(0) else 'закрыта / неизвестно'}"))
+            R.step("Шторка", lambda: R("    " + {True: "открыта", False: "закрыта"}.get(mono.get_shutter(0),
+                                                                              "прибор не сообщает")))
+            if args.open_shutter:
+                def open_shutter():
+                    # DevCtrl выполняет команду не сразу — ждём, пока прибор подтвердит
+                    mono.set_shutter(True, 0)
+                    t0 = time.monotonic()
+                    state = None
+                    while time.monotonic() - t0 < 6:
+                        pump_messages()
+                        time.sleep(0.05)
+                        state = mono.get_shutter(0)
+                        if state:
+                            R(f"    открыта (подтверждено через {time.monotonic() - t0:.1f} с)")
+                            return
+                    raise DeviceError("прибор не подтвердил открытие шторки за 6 с (сообщает: "
+                                      + {False: "закрыта", None: "неизвестно"}[state] + ")")
+                R.step("Открыть шторку", open_shutter)
             if args.goto is not None:
                 R.step(f"Переход на {args.goto} нм", lambda: mono.set_wavelength(args.goto, True, 600))
                 R.step("Длина волны после перехода", lambda: R(f"    {mono.get_wavelength():.4f} нм"))

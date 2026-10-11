@@ -26,8 +26,25 @@
 | `GetSlitWidth` / `SetSlitWidth` | `int slit, double* мкм` / `int slit, double мкм` | 8 / 12 | Boolean |
 | `GetMirrorState` / `SetMirrorState` | `int mirror, int* pos` / `int mirror, int pos` | 8 / 8 | Boolean; pos 0 — «Top (CCD)», 1 — «Lateral (Slit)» |
 | `GetSignalSourceState` | `int shutter` | 4 | 0 — неизвестно, 1 — открыта (SSS_ON), 2 — закрыта (SSS_OFF) |
-| `SetSignalSourceState` | `int shutter, int state` | 8 | ≠0 — успех |
+| `SetSignalSourceState` | `int shutter, int state` | 8 | ≠0 — команда принята (не выполнена!), см. ниже |
 | `GetCalibrationByTurret` | `int turret, double centerWL, int centerPx, double pxWidth, int n, double* out` | 32 | ≠0 — успех; длины волн n пикселей по модели DevCtrl |
+
+**Шторка.** `SetSignalSourceState(0, 1)` вызывает `DevCtrl.OpenShutter`, `(0, 2)` — `CloseShutter`
+(SpectraSP перед фоном вызывает именно `(0, 2)`). `GetSignalSourceState` берёт `DevCtrl.GetShutterState`:
+внутреннее состояние `shOpen` → 1, `shClose` → 2; окно DevCtrl подписывает их «Shutter is opened» /
+«is closed». `OpenShutter`/`CloseShutter` лишь ставят команду в очередь окна DevCtrl, и состояние
+меняется после ответа прибора (время переключения — `SwitchTimeout` в `MS7504_*.cfg`, 2 с). Сразу
+после команды `GetSignalSourceState` возвращает ещё прежнее состояние, поэтому программа ждёт
+подтверждения (до 6 с), а фон без подтверждённо закрытой шторки не снимает.
+
+**Шторка по экспозиции (TTL).** В SSPL_IM обёртки нет, программа вызывает сам DevCtrl.dll
+(он уже загружен SSPL_IM.Init): `SetShutterMode(int mask, int ttl)`, stdcall, `ret 8`, результат —
+Boolean; маска шторки 0 — `0x1000`. Это ровно то, что делают кнопки «TTL» (`ttl=1`) и «Internal»
+(`ttl=0`) шторки в штатном окне DevCtrl. В режиме TTL шторку открывает внешний сигнал — импульс
+экспозиции с выхода синхронизации камеры (в SpectraSP выход 1 в режиме 0 «EXP»), кнопки Open/Close
+окна DevCtrl блокируются, состояние — «state unknown». Режим хранится в приборе (DevCtrl при
+запуске читает его по линии `TTLID`, `ExternalTTL` в cfg — запасное значение); `TTL=1` в секции
+`[Shutter1]` означает, что шторка так умеет.
 
 ### Сервисные функции (шаговые двигатели и окно DevCtrl)
 

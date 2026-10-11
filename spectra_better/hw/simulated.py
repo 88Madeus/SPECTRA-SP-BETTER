@@ -40,6 +40,8 @@ class SimMonochromator(Monochromator):
             self.info.mirror_positions = ["Верх (ПЗС)", "Боковой (щель)"]
         self.info.model = self.info.model or "MS7504i (имитация)"
         self.info.serial = self.info.serial or "SIM"
+        if info is None:
+            self.info.shutter_ttl = True
         self.speed = speed_nm_s
         self.time_scale = time_scale
         self._lock = threading.Lock()
@@ -51,6 +53,10 @@ class SimMonochromator(Monochromator):
         self.slits = [50.0, 50.0]
         self.mirror = 0
         self.shutter_open = True
+        # как DevCtrl: команда шторки выполняется не сразу, до этого прибор сообщает прежнее состояние
+        self.shutter_delay = 0.4
+        self._shutter_cmd: Optional[tuple] = None      # (состояние, когда выполнится)
+        self.shutter_ttl = False         # шторку открывает сигнал экспозиции камеры
         # положения шаговых двигателей (для сервисного окна)
         self.steps = {(MECH_TURRET, 0): 9528, (MECH_SLIT, 0): 20, (MECH_SLIT, 1): 600,
                       (MECH_MIRROR, 0): 2124}
@@ -144,13 +150,26 @@ class SimMonochromator(Monochromator):
         self._req()
         self.mirror = int(position)
 
+    def _apply_shutter(self) -> None:
+        cmd = self._shutter_cmd
+        if cmd is not None and time.monotonic() >= cmd[1]:
+            self.shutter_open = cmd[0]
+            self._shutter_cmd = None
+
     def get_shutter(self, index: int = 0) -> Optional[bool]:
         self._req()
+        self._apply_shutter()
         return self.shutter_open
 
     def set_shutter(self, is_open: bool, index: int = 0) -> None:
         self._req()
-        self.shutter_open = bool(is_open)
+        self._shutter_cmd = (bool(is_open), time.monotonic() + self.shutter_delay * self.time_scale)
+
+    def set_shutter_ttl(self, on: bool, index: int = 0) -> None:
+        self._req()
+        if not self.info.shutter_ttl:
+            raise DeviceError("Шторка не поддерживает управление по TTL")
+        self.shutter_ttl = bool(on)
 
     def pixel_wavelengths(self, center_wl, center_pixel, pixel_width_um, n_pixels):
         g = self.geometries.get(self._grating)
@@ -222,6 +241,10 @@ class SimCamera(Camera):
         self.overheat = False          # и «перегреть» камеру
         self._t_last = time.monotonic()
         self.stripe_center, self.stripe_sigma = 297.0, 9.0
+        # несколько источников по высоте щели (например, волокна): [(центр, σ, доля), …]; пусто — один
+        self.fibers: list = []
+        # «горячие» столбцы ПЗС: столбец → темновой ток, отсч./с на строку
+        self.hot_columns: dict = {}
         self.lamp = {**{wl: i * 30000 for wl, i in LINES["Hg (ртуть)"]},
                      **{wl: i * 12000 for wl, i in LINES["Ar (аргон)"]},
                      **{wl: i * 9000 for wl, i in LINES["Ne (неон)"]}}
@@ -291,7 +314,12 @@ class SimCamera(Camera):
         """Поток на столбец (отсчётов/с) для одной строки в центре полосы."""
         cols = np.arange(self.WIDTH, dtype=float)
         m = self.mono
-        if m is None or not m._open or not m.shutter_open or m.mirror != 0:
+        if m is not None:
+            m._apply_shutter()                 # шторка «доехала», если её команда уже выполнилась
+        # в режиме TTL шторку на время кадра открывает импульс экспозиции с выхода камеры (режимы 0/1 — EXP)
+        ttl_open = m is not None and m.shutter_ttl and any(mode in (0, 1) for mode in self._sync)
+        if m is None or not m._open or not (ttl_open or (m.shutter_open and not m.shutter_ttl)) \
+                or m.mirror != 0:
             return np.zeros(self.WIDTH)
         wl = m.geometries[m._grating].wavelengths(m._wl, self.true_center_pixel, self.PIXEL_UM, self.WIDTH)
         disp = abs(wl[-1] - wl[0]) / (self.WIDTH - 1)
@@ -321,10 +349,14 @@ class SimCamera(Camera):
         self._update_temp()
         r = s.regions[0]
         rows = np.arange(r.top, r.bottom + 1, dtype=float)
-        profile = np.exp(-0.5 * ((rows - self.stripe_center) / self.stripe_sigma) ** 2)
+        sources = self.fibers or [(self.stripe_center, self.stripe_sigma, 1.0)]
+        profile = sum(k * np.exp(-0.5 * ((rows - c) / sg) ** 2) for c, sg, k in sources)
         rate = self._photon_rate()[r.left:r.right + 1]
         signal = np.outer(profile, rate) * exp_s
-        dark = 0.5 * 2 ** ((self._temp - 20.0) / 6.5) * exp_s
+        dark = np.full(r.width, 0.5 * 2 ** ((self._temp - 20.0) / 6.5) * exp_s)
+        for col, extra in self.hot_columns.items():
+            if r.left <= col <= r.right:
+                dark[col - r.left] += extra * exp_s
         img = self.rng.poisson(np.clip(signal + dark, 0, None)).astype(float)
         # космические частицы
         n_cr = self.rng.poisson(0.02 * exp_s * r.width * r.height / 1e4)

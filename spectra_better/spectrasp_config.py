@@ -237,6 +237,7 @@ class MonoConfig:
     slits: List[str] = field(default_factory=list)
     mirror_positions: List[str] = field(default_factory=list)
     has_shutter: bool = False
+    shutter_ttl: bool = False          # [Shutter1] TTL=1 — шторку можно вести сигналом экспозиции
     current_grating: int = -1
     step_limits: Dict[Tuple[str, int], int] = field(default_factory=dict)
     slit_max_um: List[float] = field(default_factory=list)
@@ -280,6 +281,8 @@ def read_mono_cfg(directory: str) -> MonoConfig:
         # SSPL: положение 0 = DevCtrl-позиция 2, положение 1 = DevCtrl-позиция 1
         mc.mirror_positions = [m.get("PosCaption2", "Положение 2").strip(), m.get("PosCaption1", "Положение 1").strip()]
     mc.has_shutter = int(_num(dev.get("ShutterCount"), 0)) > 0
+    if mc.has_shutter and cp.has_section("Shutter1"):
+        mc.shutter_ttl = int(_num(cp["Shutter1"].get("TTL"), 0)) == 1
     # пределы шаговых двигателей для сервисного окна
     if cp.has_section("Grating1"):
         mc.step_limits[("grating", 0)] = int(_num(cp["Grating1"].get("MaxMayStepCount"), 0))

@@ -1,11 +1,13 @@
 """Главное окно программы."""
 from __future__ import annotations
 
+import dataclasses
+import datetime as _dt
 import logging
 import os
 import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Optional
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -16,11 +18,16 @@ from ..calibration import WavelengthAxis
 from ..config import COOLING_TARGET_DEFAULT_C, AppSettings
 from ..hw.base import SYNC_LOGICAL_1, WARM_UP_TARGET_C, DeviceError
 from ..hw.winutil import spectrasp_is_running
+from ..buffer import SpectrumBuffer
 from ..instrument import Instrument, Measurement
 from ..reference_lines import nearest_line
-from ..storage import load_spectrum, save_image, save_spectrum, unique_path
+from ..storage import load_image, load_spectrum, save_image, save_spectrum, unique_path
 from ..units import (X_DECIMALS, X_EV, X_NM, X_PX, X_RAMAN, X_SHORT, X_UNITS, X_WAVENUMBER, AxisMap, from_nm,
                      is_spectral)
+from .bands import BandHistory, BandsHistoryWindow, BandsPanel
+from .calculator import CalculatorDialog
+from .buffer_panel import BufferPanel, entry_color
+from .tools_dialogs import DefectPixelsDialog, IntensityCorrectionDialog, StripesDialog
 from .dialogs import BusyDialog, CalibrationDialog, PanoramaDialog, SeriesDialog, SettingsDialog
 from .icons import gear_icon
 from .log_widget import LogView, QtLogHandler
@@ -41,14 +48,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.emitter = Emitter()
         self.current: Optional[Measurement] = None
         self.background: Optional[Measurement] = None
-        self.overlays: Dict[str, Measurement] = {}
-        self._overlay_seq = 0
+        self.buffer = SpectrumBuffer()
+        self.band_history = BandHistory()
+        self._hist_win: Optional[BandsHistoryWindow] = None
+        self._calc: Optional[CalculatorDialog] = None
+        self._series_beep = False
+        self._scale = None                        # (пересчёт единиц, единицы) последней перерисовки
+        try:
+            n = self.buffer.load_state(self._buffer_path())
+            if n:
+                log.info("Буфер спектров: загружено %d спектр(ов) с прошлого сеанса", n)
+        except (OSError, ValueError, KeyError) as e:
+            log.warning("Буфер спектров прошлого сеанса не прочитан: %s", e)
         self._acq_thread: Optional[threading.Thread] = None
         self._acq_stop = threading.Event()
         self._acq_kind = ""
         self._poll_cam = False
         self._poll_mono = False
         self._mono_was_busy = False
+        self._shutter_task = False     # идёт переключение шторки (опрос её не трогает)
+        self._poll_shutter = False
         self._mono_moving = False
         self._closing = False
         self._service_dlg = None
@@ -113,13 +132,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_pano = act("Панорама…", SP.SP_ArrowRight, None, "Спектр широкого диапазона со сшивкой")
         self.act_save = act("Сохранить спектр…", SP.SP_DialogSaveButton, "Ctrl+S", "Сохранить текущий спектр")
         self.act_save_img = act("Сохранить кадр…", None, None, "Сохранить изображение ПЗС")
-        self.act_open = act("Открыть спектр…", SP.SP_DialogOpenButton, "Ctrl+O", "Загрузить спектр для наложения")
-        self.act_pin = act("Закрепить", SP.SP_DialogYesButton, "Ctrl+D", "Оставить текущий спектр на графике для сравнения")
-        self.act_clear = act("Очистить наложения", SP.SP_TrashIcon, None, "Убрать все наложенные спектры")
+        self.act_open_frame = act("Открыть кадр ПЗС…", None, None,
+                                  "Посмотреть сохранённый кадр (.npy, .txt, .csv, 16-битный TIFF SpectraSP) "
+                                  "и построить спектры полос по нему")
+        self.act_export = act("Сохранить график…", None, "Ctrl+Shift+S",
+                              "Картинка PNG или SVG того, что сейчас на графике (спектр или кадр ПЗС) — для отчёта")
+        self.act_open = act("Открыть спектр…", SP.SP_DialogOpenButton, "Ctrl+O",
+                            "Загрузить спектры из файлов в буфер для сравнения")
+        self.act_pin = act("В буфер", SP.SP_DialogYesButton, "Ctrl+D",
+                           "Положить текущий спектр в буфер спектров — для сравнения с другими")
+        self.act_clear = act("Очистить буфер", SP.SP_TrashIcon, None, "Удалить все спектры из буфера")
         self.act_autorange = act("Весь спектр", SP.SP_TitleBarMaxButton, "Ctrl+A",
                                  "Показать весь спектр по X и подобрать масштаб по Y")
         self.act_calib = act("Калибровка шкалы…", None, None, "Центральный пиксель, модель, поправка по реперным линиям")
         self.act_settings = act("Настройки…", SP.SP_FileDialogDetailedView, None, "Каталог SpectraSP, таймауты")
+        self.act_calc = act("Калькулятор спектров…", None, "Ctrl+M",
+                            "Разность, отношение, пропускание, оптическая плотность, нормировка")
+        self.act_bands_peaks = act("Участки по пикам", None, None,
+                                   "Создать участки интегрирования вокруг найденных пиков текущего спектра")
+        self.act_band_hist = act("История участков…", None, None, "Результаты участков интегрирования во времени")
+        self.act_stripes = act("Полосы строк…", None, None, "Несколько полос строк ПЗС — свой спектр с каждой")
+        self.act_defects = act("Дефектные пиксели…", None, None, "Список «горячих» и «мёртвых» столбцов ПЗС")
+        self.act_intensity = act("Коррекция интенсивности…", None, None,
+                                 "Поправка на спектральную чувствительность, расчёт по эталонной лампе")
         self.act_about = act("О программе", SP.SP_MessageBoxInformation)
         self.act_exit = act("Выход", None, "Alt+F4")
 
@@ -134,7 +169,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         mb = self.menuBar()
         m = mb.addMenu("&Файл")
-        for a in (self.act_open, self.act_save, self.act_save_img, None, self.act_exit):
+        for a in (self.act_open, self.act_open_frame, self.act_save, self.act_save_img, self.act_export, None,
+                  self.act_exit):
             m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("&Прибор")
         for a in (self.act_connect, self.act_disconnect, self.act_reconnect_cam, None, self.act_service):
@@ -145,8 +181,11 @@ class MainWindow(QtWidgets.QMainWindow):
         m = mb.addMenu("&Вид")
         for a in (self.act_autorange, self.act_pin, self.act_clear):
             m.addAction(a)
+        m = mb.addMenu("&Анализ")
+        for a in (self.act_calc, None, self.act_bands_peaks, self.act_band_hist):
+            m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("&Настройка")
-        for a in (self.act_calib, self.act_settings):
+        for a in (self.act_calib, self.act_stripes, self.act_defects, self.act_intensity, self.act_settings):
             m.addAction(a)
         m = mb.addMenu("&Справка")
         m.addAction(self.act_about)
@@ -193,18 +232,24 @@ class MainWindow(QtWidgets.QMainWindow):
         hh.setStretchLastSection(True)
         self.peaks_table.verticalHeader().setVisible(False)
         self.peaks_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        rv.addWidget(self.peaks_table, 2)
-        rv.addWidget(QtWidgets.QLabel("Наложенные спектры:"))
-        self.overlay_list = QtWidgets.QListWidget()
-        self.overlay_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        rv.addWidget(self.overlay_list, 1)
-        self.btn_overlay_del = QtWidgets.QPushButton("Убрать выбранные")
-        rv.addWidget(self.btn_overlay_del)
-        right.setMinimumWidth(330)
+        rv.addWidget(self.peaks_table, 1)
+        self.analysis_tabs = QtWidgets.QTabWidget()
+        self.analysis_tabs.addTab(right, "Пики")
+        self.bands_panel = BandsPanel(self.s)
+        self.analysis_tabs.addTab(self.bands_panel, "Интегрирование")
+        self.analysis_tabs.setMinimumWidth(330)
         rdock = QtWidgets.QDockWidget("Анализ", self)
         rdock.setObjectName("dock_analysis")
-        rdock.setWidget(right)
+        rdock.setWidget(self.analysis_tabs)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, rdock)
+        self.buffer_panel = BufferPanel(self.buffer)
+        self.buffer_panel.auto.setChecked(self.s.buffer_auto)
+        self.buffer_panel.offset.setValue(self.s.buffer_offset)
+        bdock = QtWidgets.QDockWidget("Буфер спектров", self)
+        bdock.setObjectName("dock_buffer")
+        bdock.setWidget(self.buffer_panel)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, bdock)
+        self.splitDockWidget(rdock, bdock, QtCore.Qt.Vertical)
 
         # снизу — журнал
         self.log_view = LogView(log_handler)
@@ -245,26 +290,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_save_img.triggered.connect(self.save_frame)
         self.act_open.triggered.connect(self.open_spectrum)
         self.act_pin.triggered.connect(self.pin_current)
-        self.act_clear.triggered.connect(self.clear_overlays)
+        self.act_clear.triggered.connect(self.buffer_panel._ask_clear)
         self.act_autorange.triggered.connect(self.plot.show_all)
         self.plot.units_changed.connect(self._display_settings_changed)
         self.act_calib.triggered.connect(self.calibration)
         self.act_settings.triggered.connect(self.settings_dialog)
         self.act_about.triggered.connect(self.about)
         self.act_exit.triggered.connect(self.close)
-        self.btn_overlay_del.clicked.connect(self.remove_selected_overlays)
+        self.bands_panel.changed.connect(self._redraw)
+        self.act_calc.triggered.connect(self.calculator)
+        self.act_export.triggered.connect(self.export_plot)
+        self.act_open_frame.triggered.connect(self.open_frame)
+        self.act_bands_peaks.triggered.connect(self.bands_from_peaks)
+        self.act_band_hist.triggered.connect(self.show_band_history)
+        self.bands_panel.track_changed.connect(lambda _: self._redraw())
+        self.bands_panel.add_requested.connect(self.add_band)
+        self.bands_panel.history_requested.connect(self.show_band_history)
+        self.plot.band_moved.connect(self._band_moved)
+        bp = self.buffer_panel
+        bp.changed.connect(self._redraw)
+        bp.add_current.connect(self.pin_current)
+        bp.load_files.connect(self.open_spectrum)
+        bp.save_entries.connect(self.save_buffer_entries)
+        bp.make_current.connect(self.buffer_to_current)
+        bp.auto.toggled.connect(lambda on: setattr(self.s, "buffer_auto", on))
+        bp.offset.valueChanged.connect(lambda v: setattr(self.s, "buffer_offset", float(v)))
 
         self.cam_panel.cooling_on.connect(self.cooling_on)
         self.cam_panel.cooling_off.connect(self.cooling_off)
         self.cam_panel.laser.connect(self.set_laser)
         self.cam_panel.sync_out.connect(self.set_sync_out)
         self.acq_panel.changed.connect(self._acq_settings_changed)
-        self.image.rows_changed.connect(self.acq_panel.set_rows)
+        self.image.stripes_changed.connect(self._stripes_dragged)
+        self.acq_panel.stripes_requested.connect(self.edit_stripes)
+        self.act_stripes.triggered.connect(self.edit_stripes)
+        self.proc_panel.defects_requested.connect(self.edit_defects)
+        self.act_defects.triggered.connect(self.edit_defects)
+        self.proc_panel.intensity_requested.connect(self.edit_intensity)
+        self.act_intensity.triggered.connect(self.edit_intensity)
         self.mono_panel.goto.connect(self.goto_wavelength)
         self.mono_panel.grating.connect(self.change_grating)
         self.mono_panel.slit.connect(self.set_slit)
         self.mono_panel.mirror.connect(self.set_mirror)
         self.mono_panel.shutter.connect(self.set_shutter)
+        self.mono_panel.shutter_ttl.connect(self.set_shutter_ttl)
         self.proc_panel.changed.connect(self._display_settings_changed)
         self.proc_panel.take_background.connect(self.take_background)
         self.proc_panel.reset_background.connect(self.reset_background)
@@ -279,7 +348,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_static_info(self) -> None:
         self.cam_panel.set_info(self.inst.camera.info if self.inst.camera_connected else None, self.inst.camera_ip())
         self.mono_panel.set_info(self.inst.mono.info if self.inst.mono_connected else None, self.inst.mono_address())
-        self.image.set_rows(max(0, self.s.rows_top), max(0, self.s.rows_bottom))
+        self.image.set_stripes(self.inst.stripes())
 
     def _acquiring(self) -> bool:
         return self._acq_thread is not None and self._acq_thread.is_alive()
@@ -385,7 +454,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cam_panel.set_info(info, self.inst.camera_ip())
         self.acq_panel.set_camera(info)
         self.acq_panel.load_from_settings()
-        self.image.set_rows(self.s.rows_top, self.s.rows_bottom)
+        self.image.set_stripes(self.inst.stripes())
         self.cam_panel.set_state(self.inst.last_state)
         self._show_sync()
         self._acq_settings_changed()
@@ -394,9 +463,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _mono_connected(self, info) -> None:
         log.info("Монохроматор подключён: %s № %s", info.model, info.serial)
         self.mono_panel.set_info(info, self.inst.mono_address())
+        self._show_shutter_mode()
         self._update_mono_view()
         self._update_actions()
         self._refresh_mono_misc()
+
+    def _show_shutter_mode(self) -> None:
+        m = self.inst.mono
+        available = bool(m is not None and m.info.has_shutter and m.info.shutter_ttl)
+        self.mono_panel.set_shutter_mode(self.inst.shutter_ttl, available)
 
     def _refresh_mono_misc(self) -> None:
         """Прочитать положение зеркала, шторки и ширину щели для панели монохроматора."""
@@ -550,6 +625,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._mono_moving:
             t = self.inst.mono_thread.busy_for
             self.mono_panel.set_busy(True, f"движение… {t:.0f} с" if t else "движение…")
+        elif self.inst.mono_connected and self._poll_ticks % 2 == 0 and not self._shutter_task \
+                and not self.inst.shutter_ttl \
+                and not self._poll_shutter and not self._acquiring():
+            # шторку могут переключить и в штатном окне DevCtrl — кнопка должна показывать факт
+            self._poll_shutter = True
+
+            def done_s(state):
+                self._poll_shutter = False
+                if not self._shutter_task:
+                    self.mono_panel.set_shutter_value(state)
+            self.tasks.run(self.inst.get_shutter, done_s, lambda e: setattr(self, "_poll_shutter", False),
+                           "poll-shutter")
 
     # ================================================================ камера
     def cooling_on(self, target: int) -> None:
@@ -709,7 +796,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._fan_warned = False
 
     def _acq_settings_changed(self) -> None:
-        self.image.set_rows(self.s.rows_top, self.s.rows_bottom)
+        stripes = self.inst.stripes()
+        self.image.set_stripes(stripes)
+        self.acq_panel.set_stripes_count(len(stripes))
         if self.inst.camera_connected:
             try:
                 acq = self.inst.acq_settings()
@@ -795,31 +884,64 @@ class MainWindow(QtWidgets.QMainWindow):
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
         p = dlg.params()
+        if p.wavelengths and not self.inst.mono_connected:
+            self._error("Серия", DeviceError("Для списка длин волн нужен подключённый монохроматор"))
+            return
         self.s.autosave_series = p.save
         if p.save:
             self.s.save_dir = p.directory
-        log.info("Серия: %d спектров, интервал %.1f с%s", p.count, p.interval_s,
+        log.info("Серия: %d спектров, интервал %.1f с%s%s%s", p.count, p.interval_s,
+                 f", длины волн {', '.join(f'{w:g}' for w in p.wavelengths)} нм" if p.wavelengths else "",
+                 f", старт в {p.start_at:%H:%M}" if p.start_at else "",
                  f", сохранение в {p.directory}" if p.save else "")
+        self._series_beep = p.beep
+        total = p.count * max(1, len(p.wavelengths))
 
-        def loop():
+        def wait_start():
+            while p.start_at and not self._acq_stop.is_set():
+                left = (p.start_at - _dt.datetime.now()).total_seconds()
+                if left <= 0:
+                    break
+                self.emitter.progress.emit(0, 0, f"ожидание старта в {p.start_at:%H:%M} ({left / 60:.0f} мин)")
+                time.sleep(min(1.0, left))
+
+        def run_at(wl, done):
             for i in range(p.count):
                 if self._acq_stop.is_set():
-                    break
+                    return done
                 t0 = time.monotonic()
-                m = self.inst.acquire(progress=lambda a, b, t: None, label=f"серия {i + 1}/{p.count}")
-                self.emitter.progress.emit(i + 1, p.count, "серия")
+                tag = f" {wl:g} нм" if wl is not None else ""
+                m = self.inst.acquire(progress=lambda a, b, t: None, label=f"серия{tag} {i + 1}/{p.count}")
+                done += 1
+                self.emitter.progress.emit(done, total, "серия")
                 if p.save:
-                    path = unique_path(p.directory, p.prefix, p.ext)
+                    prefix = p.prefix + (f"_{wl:g}nm" if wl is not None else "")
+                    path = unique_path(p.directory, prefix, p.ext)
                     self._save_measurement(path, m)
                     self.emitter.message.emit(f"Сохранено: {path}")
                 self.emitter.measurement.emit(m)
                 while not self._acq_stop.is_set() and time.monotonic() - t0 < p.interval_s:
                     time.sleep(0.05)
+            return done
+
+        def loop():
+            wait_start()
+            if not p.wavelengths:
+                run_at(None, 0)
+                return
+            done = 0
+            with self.inst.mono_exclusive("серия"):
+                for wl in p.wavelengths:
+                    if self._acq_stop.is_set():
+                        break
+                    self.emitter.progress.emit(done, total, f"серия: переход на {wl:g} нм")
+                    self.inst.goto_wavelength(wl)
+                    done = run_at(wl, done)
         self._start("series", loop)
 
     def panorama(self) -> None:
-        def plan_fn(a, b, ov):
-            return self.inst.panorama_plan(a, b, ov)
+        def plan_fn(a, b, ov, trim=0):
+            return self.inst.panorama_plan(a, b, ov, trim)
         start, end = self.inst.setup.main.panorama if self.inst.setup and self.inst.setup.main.panorama[1] > 0 \
             else (400.0, 700.0)
         dlg = PanoramaDialog(start, end, plan_fn, self)
@@ -827,7 +949,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         p = dlg.params()
         try:
-            plan = self.inst.panorama_plan(p.start, p.end, p.overlap)
+            plan = self.inst.panorama_plan(p.start, p.end, p.overlap, p.trim)
         except DeviceError as e:
             self._error("Панорама", e)
             return
@@ -852,7 +974,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     segments.append((m.x, m.y))
                     self.emitter.measurement.emit(m)
                 if segments and not self._acq_stop.is_set():
-                    x, y = P.stitch(segments)
+                    x, y = P.stitch(segments, trim=p.trim, equalize=p.equalize)
                     mm = Measurement(x=x, x_unit="nm", y=y, raw=y, exposure_ms=m.exposure_ms,
                                      accumulations=m.accumulations, center_wl=None, grating=m.grating,
                                      grating_title=m.grating_title, label=f"Панорама {p.start:g}–{p.end:g} нм",
@@ -884,8 +1006,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._acq_thread = None
         self.progress.setVisible(False)
         self._update_actions()
-        if kind == "panorama":
+        if kind in ("panorama", "series"):
             self._update_mono_view()
+        if kind == "series" and self._series_beep:
+            QtWidgets.QApplication.beep()
+            self.statusBar().showMessage("Серия завершена", 15000)
 
     # ================================================================ отображение
     @staticmethod
@@ -951,6 +1076,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._redraw()
             return
         self.current = m
+        if self.s.bands:
+            self.band_history.add(m.timestamp, self._band_results(m))
+            if self._hist_win is not None and self._hist_win.isVisible():
+                self._hist_win.refresh()
+        kind = self._acq_kind
+        if self.buffer_panel.auto.isChecked() and (kind in ("snap", "series") or (kind == "panorama" and m.stitched)):
+            added = self._buffer_add(m)
+            self.buffer_panel.refresh()
+            self.buffer_panel.select(added[-1].key)
         if m.image is not None:
             self._image_meas = m
             self.image.set_image(m.image)
@@ -965,15 +1099,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _redraw(self) -> None:
         m = self.current
-        ref = m if m is not None else next(iter(self.overlays.values()), None)
+        ref = m if m is not None else next((e.m for e in self.buffer.visible()), None)
         amap, unit = self._scale_for(ref)
         laser = self.s.laser_nm
         # у сшитой панорамы «пиксель» — это номер точки, а не пиксель ПЗС
         self.plot.set_scale(amap, unit, pixels_ok=not (ref is not None and ref.stitched))
         if m is not None:
             x = self._x_in(m, unit, laser)
-            self.plot.set_data(x, m.y, m.label or "Текущий")
+            multi = m.n_tracks > 1
+            name = m.label or "Текущий"
+            if multi:
+                a, b = m.track_rows[0]
+                name = f"Полоса 1 (строки {a}–{b})"
+            self.plot.set_data(x, m.y, name)
+            self.plot.set_tracks([(x, m.track(i), f"Полоса {i + 1} (строки {m.track_rows[i][0]}–{m.track_rows[i][1]})")
+                                  for i in range(1, m.n_tracks)] if multi else [])
             self._update_peaks(x, m.y, amap, unit)
+        self._scale = (amap, unit)
+        self._update_bands(m, amap, unit)
         bg = self.background
         if bg is not None and m is not None and bg.y.size == m.y.size:
             self.plot.set_background(self._x_in(m, unit, laser),
@@ -981,18 +1124,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                      self.proc_panel.show_bg.isChecked())
         else:
             self.plot.set_background(None, None, False)
-        hidden = set()
-        for key, om in self.overlays.items():
-            ox = self._x_in(om, unit, laser)
-            self.plot.update_overlay(key, ox, om.y)
-            if ox is None:
-                hidden.add(key)
-        for i in range(self.overlay_list.count()):
-            item = self.overlay_list.item(i)
-            off = item.data(QtCore.Qt.UserRole) in hidden
-            item.setForeground(QtGui.QColor("#999" if off else "#000"))
-            item.setToolTip(f"Спектр только в пикселях — в единицах «{X_UNITS.get(unit, unit)}» не показывается"
-                            if off else "")
+        self._draw_buffer(unit, laser)
         if ref is not None:
             self.plot.set_info(*self._coverage_text(ref, amap, unit))
         self.plot.refresh_view()
@@ -1002,6 +1134,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.peaks_table.setRowCount(0)
         self.peaks_table.setHorizontalHeaderLabels([f"Положение, {X_SHORT.get(unit, unit)}", "Высота",
                                                     "Ширина", "Линия"])
+        ok = np.isfinite(y) & np.isfinite(x)
+        if not ok.all():                             # результат калькулятора может содержать NaN
+            x, y = x[ok], y[ok]
         if not self.proc_panel.peaks.isChecked() or y.size < 5:
             self.plot.show_peaks([], [], [])
             return
@@ -1029,35 +1164,263 @@ class MainWindow(QtWidgets.QMainWindow):
         self._redraw()
         self._update_bg_status()
 
-    # ================================================================ наложения
+    # ================================================================ интегрирование в участках
+    MAX_BANDS = 8
+
+    def _band_results(self, m: Optional[Measurement]) -> list:
+        """Результаты всех участков для измерения m (по выбранной полосе строк)."""
+        if m is None:
+            return []
+        y = m.track(min(self.bands_panel.current_track(), m.n_tracks - 1))
+        out = []
+        for b in self.s.bands:
+            if b.get("unit") == "px":
+                x = np.asarray(m.x, dtype=float) if m.x_unit == X_PX and m.x.size == y.size \
+                    else np.arange(y.size, dtype=float)
+            elif m.x_unit == "nm":
+                x = m.x
+            else:
+                out.append(None)
+                continue
+            out.append(P.band_integral(x, y, b["lo"], b["hi"]))
+        return out
+
+    def _update_bands(self, m: Optional[Measurement], amap: AxisMap, unit: str) -> None:
+        disp = []
+        for b in self.s.bands:
+            bu = b.get("unit", "nm")
+            if amap.can_convert(bu, unit):
+                lo, hi = sorted(float(v) for v in amap.convert([b["lo"], b["hi"]], bu, unit))
+                disp.append((lo, hi))
+            else:
+                disp.append(None)
+        self.plot.set_bands(disp)
+        self.bands_panel.set_track_count(m.n_tracks if m is not None else 1)
+        self.bands_panel.show_results(self._band_results(m))
+
+    def _band_moved(self, i: int, lo: float, hi: float) -> None:
+        if self._scale is None or i >= len(self.s.bands):
+            return
+        amap, unit = self._scale
+        b = self.s.bands[i]
+        bu = b.get("unit", "nm")
+        if not amap.can_convert(unit, bu):
+            return
+        b["lo"], b["hi"] = sorted(float(v) for v in amap.convert([lo, hi], unit, bu))
+        self._redraw()
+
+    def add_band(self) -> None:
+        if len(self.s.bands) >= self.MAX_BANDS:
+            self.statusBar().showMessage(f"Не больше {self.MAX_BANDS} участков", 5000)
+            return
+        if self._scale is None:
+            return
+        amap, unit = self._scale
+        a, b = self.plot.vb.viewRange()[0]
+        c, w = (a + b) / 2, abs(b - a) * 0.025
+        store = "nm" if amap.calibrated else "px"
+        if not amap.can_convert(unit, store):
+            store = unit if unit in ("nm", "px") else "px"
+        lo, hi = sorted(float(v) for v in amap.convert([c - w, c + w], unit, store))
+        self.s.bands.append({"lo": lo, "hi": hi, "unit": store})
+        self.analysis_tabs.setCurrentWidget(self.bands_panel)
+        self._redraw()
+
+    def bands_from_peaks(self) -> None:
+        """Участки вокруг найденных пиков (±1.5 ширины на полувысоте), не больше MAX_BANDS."""
+        m = self.current
+        if m is None:
+            return
+        unit = "nm" if m.x_unit == "nm" else "px"
+        x = m.x if unit == "nm" else np.arange(m.y.size, dtype=float)
+        ok = np.isfinite(m.y)
+        peaks = sorted(P.find_peaks(x[ok], m.y[ok], max_peaks=self.MAX_BANDS), key=lambda p: -p.height)
+        if not peaks:
+            self.statusBar().showMessage("Пиков не найдено", 5000)
+            return
+        self.s.bands = [{"lo": p.x - 1.5 * max(p.fwhm, 1e-6), "hi": p.x + 1.5 * max(p.fwhm, 1e-6), "unit": unit}
+                        for p in sorted(peaks[:self.MAX_BANDS], key=lambda p: p.x)]
+        self.analysis_tabs.setCurrentWidget(self.bands_panel)
+        self._redraw()
+        log.info("Участки интегрирования по пикам: %d", len(self.s.bands))
+
+    def calculator(self) -> None:
+        def sources():
+            out = [("Текущий спектр", self.current)] if self.current is not None else []
+            return out + [(e.name, e.m) for e in self.buffer.entries]
+
+        def result(m, name, props):
+            e = self.buffer.add(m, name, props=props)
+            self.buffer_panel.refresh()
+            self.buffer_panel.select(e.key)
+            self._redraw()
+            log.info("Калькулятор: %s", props.get("formula", name))
+        if self._calc is None:
+            self._calc = CalculatorDialog(sources, result, self)
+            self.buffer_panel.changed.connect(self._calc.refresh)
+        self._calc.refresh()
+        self._calc.show()
+        self._calc.raise_()
+
+    def show_band_history(self) -> None:
+        if self._hist_win is None:
+            self._hist_win = BandsHistoryWindow(self.band_history, self.s, self)
+        self._hist_win.refresh()
+        self._hist_win.show()
+        self._hist_win.raise_()
+
+    # ================================================================ полосы, дефекты, коррекция
+    def _stripes_dragged(self, stripes: list) -> None:
+        """Полосу перетащили на изображении ПЗС."""
+        try:
+            self.inst.set_stripes(stripes)
+        except DeviceError as e:
+            self._error("Полосы строк", e)
+        self.acq_panel.set_rows(*self.inst.stripes()[0])          # → _acq_settings_changed
+        self._refresh_file_frame()
+
+    def edit_stripes(self) -> None:
+        if self._acquiring():
+            self.statusBar().showMessage("Полосы меняются, когда съёмка остановлена", 5000)
+            return
+        cam = self.inst.camera
+        height = cam.info.height if cam is not None and cam.info.height else 506
+        img = self._image_meas.image if self._image_meas is not None else None
+
+        def estimate(stripes):
+            if not self.inst.camera_connected:
+                return None
+            old = self.inst.stripes()
+            try:
+                self.inst.set_stripes(stripes)
+                return self.inst.expected_frame_time(self.inst.acq_settings())
+            except DeviceError:
+                return None
+            finally:
+                self.inst.set_stripes(old)
+        dlg = StripesDialog(self.inst.stripes(), height, img, estimate, self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        try:
+            self.inst.set_stripes(dlg.stripes())
+        except DeviceError as e:
+            self._error("Полосы строк", e)
+            return
+        self.acq_panel.load_from_settings()
+        self._acq_settings_changed()
+        self._refresh_file_frame()
+        n = len(self.inst.stripes())
+        log.info("Полосы строк: %s", ", ".join(f"{a}–{b}" for a, b in self.inst.stripes()))
+        if n > 1:
+            log.info("Несколько полос: камера читает строки построчно; фон нужно снять заново")
+
+    def edit_defects(self) -> None:
+        cam = self.inst.camera
+        width = cam.info.width if cam is not None and cam.info.width else 2048
+        dark = self.background.raw if self.background is not None else None
+        dlg = DefectPixelsDialog(self.s, width, dark, self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self.proc_panel.load_corrections()
+            log.info("Дефектные пиксели: %d, исправление %s", len(self.s.defect_pixels),
+                     "включено" if self.s.defect_correction else "выключено")
+
+    def edit_intensity(self) -> None:
+        m = self.current
+        x_nm = measured = None
+        if m is not None and m.x_unit == "nm" and not m.intensity_corrected and not m.stitched:
+            x_nm, measured = m.x, m.y
+        dlg = IntensityCorrectionDialog(self.s, x_nm, measured, self)
+        if m is not None and m.intensity_corrected:
+            dlg.btn_planck.setToolTip("Текущий спектр уже скорректирован — снимите эталон с выключенной коррекцией")
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self.proc_panel.load_corrections()
+            log.info("Коррекция интенсивности: %s, %d точек", "включена" if self.s.intensity_corr else "выключена",
+                     len(self.s.intensity_corr_points))
+
+    # ================================================================ буфер спектров
+    def _buffer_path(self) -> str:
+        base = getattr(self.s, "_path", None) or AppSettings.default_path()
+        return os.path.join(os.path.dirname(os.path.abspath(base)), "buffer.npz")
+
+    def _draw_buffer(self, unit: str, laser: float) -> None:
+        """Отмеченные спектры буфера — поверх текущего, каждый своим постоянным цветом."""
+        shown = {e.key: e for e in self.buffer.visible()}
+        for key in list(self.plot.overlays):
+            if key not in shown:
+                self.plot.remove_overlay(key)
+        hidden = set()
+        step = float(self.buffer_panel.offset.value())
+        for n, (key, e) in enumerate(shown.items()):
+            x = self._x_in(e.m, unit, laser)
+            y = e.m.y + step * (n + 1) if step else e.m.y      # «лесенка»: текущий спектр — внизу
+            item = self.plot.overlays.get(key)
+            if item is None or item.name() != e.name:
+                self.plot.add_overlay(key, x, y, e.name, entry_color(e))
+            else:
+                self.plot.update_overlay(key, x, y)
+            if x is None:
+                hidden.add(key)
+        self.buffer_panel.mark_unavailable(
+            hidden, f"Спектр только в пикселях — в единицах «{X_UNITS.get(unit, unit)}» не показывается")
+
     def pin_current(self) -> None:
+        """Положить текущий спектр в буфер."""
         if self.current is None:
             return
-        self._add_overlay(self.current, self.current.label or f"{self.current.timestamp:%H:%M:%S}")
-
-    def _add_overlay(self, m: Measurement, name: str) -> None:
-        self._overlay_seq += 1
-        key = f"ov{self._overlay_seq}"
-        self.overlays[key] = m
-        self.plot.add_overlay(key, None, m.y, name)
-        item = QtWidgets.QListWidgetItem(name)
-        item.setData(QtCore.Qt.UserRole, key)
-        self.overlay_list.addItem(item)
+        e = None
+        for e in self._buffer_add(self.current):
+            pass
+        self.buffer_panel.refresh()
+        self.buffer_panel.select(e.key)
         self._redraw()
+        log.info("В буфер: %s", e.name)
 
-    def remove_selected_overlays(self) -> None:
-        for item in self.overlay_list.selectedItems():
-            key = item.data(QtCore.Qt.UserRole)
-            self.plot.remove_overlay(key)
-            self.overlays.pop(key, None)
-            self.overlay_list.takeItem(self.overlay_list.row(item))
+    def _buffer_add(self, m: Measurement):
+        """В буфер — каждую полосу отдельным спектром (у одной полосы — как есть)."""
+        if m.n_tracks <= 1:
+            return [self.buffer.add(m)]
+        base = SpectrumBuffer.default_name(m)
+        out = []
+        for i in range(m.n_tracks):
+            a, b = m.track_rows[i]
+            part = dataclasses.replace(m, y=m.track(i), raw=m.track(i) if i else m.raw, tracks=None,
+                                       track_rows=(m.track_rows[i],))
+            out.append(self.buffer.add(part, f"{base} · полоса {i + 1} ({a}–{b})"))
+        return out
+
+    def buffer_to_current(self, key: str) -> None:
+        """Сделать спектр из буфера текущим (пики, сохранение, «В буфер» под другим именем)."""
+        e = self.buffer.get(key)
+        if e is None or self._acquiring():
+            return
+        self.current = e.m
         self._redraw()
+        self.lbl_meas.setText(f"Из буфера: {e.name}")
+        self._update_actions()
+
+    def save_buffer_entries(self, keys: list) -> None:
+        entries = [e for e in (self.buffer.get(k) for k in keys) if e is not None]
+        if not entries:
+            return
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, f"Папка для {len(entries)} спектр(ов) из буфера",
+                                                       self.s.save_dir or os.path.expanduser("~"))
+        if not d:
+            return
+        bad = '<>:"/\\|?*'
+        for e in entries:
+            stem = "".join("_" if c in bad else c for c in e.name).strip() or e.key
+            path = unique_path(d, stem, self.s.save_format)
+            try:
+                self._save_measurement(path, e.m)
+            except OSError as err:
+                self._error("Сохранение буфера", err)
+                return
+        log.info("Сохранено спектров из буфера: %d → %s", len(entries), d)
+        self.statusBar().showMessage(f"Сохранено {len(entries)} спектр(ов) в {d}", 6000)
 
     def clear_overlays(self) -> None:
-        self.plot.clear_overlays()
-        self.overlays.clear()
-        self.overlay_list.clear()
-        self._redraw()
+        """Очистить буфер (без вопроса — для программного вызова)."""
+        self.buffer_panel.clear()
 
     def open_spectrum(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -1071,7 +1434,11 @@ class MainWindow(QtWidgets.QMainWindow):
             first = header[0].lower() if header else ""
             is_px = "pixel" in first or "пиксел" in first or not (100 < float(np.median(x)) < 5000)
             m = Measurement(x=x, x_unit=X_PX if is_px else X_NM, y=y, raw=y, label=os.path.basename(path))
-            self._add_overlay(m, os.path.basename(path))
+            props = {str(k): str(v) for k, v in meta.items()}
+            props["source_file"] = path
+            self.buffer.add(m, os.path.basename(path), props=props)
+            self.buffer_panel.refresh()
+            self._redraw()
             log.info("Загружен спектр %s (%d точек)", path, x.size)
 
     # ================================================================ сохранение
@@ -1090,16 +1457,94 @@ class MainWindow(QtWidgets.QMainWindow):
                 meta["laser_nm"] = self.s.laser_nm
         else:
             x_name = "pixel"
-        if m.background_used:
-            extra["raw_without_background_subtraction"] = m.raw
+        for i in range(1, m.n_tracks):
+            a, b = m.track_rows[i]
+            extra[f"stripe{i + 1}_rows_{a}-{b}"] = m.track(i)
+        if m.background_used or m.intensity_corrected:
+            # «сырые» отсчёты: без вычета фона и без коррекции интенсивности
+            extra["raw_counts"] = m.raw
         save_spectrum(path, m.x if m.x_unit == "nm" else np.arange(m.y.size), m.y, meta,
                       x_name=x_name, extra=extra)
+
+    def open_frame(self, path: str = "") -> None:
+        """Сохранённый кадр ПЗС: показать и построить спектры по текущим полосам строк."""
+        if self._acquiring():
+            return
+        if not path:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Открыть кадр ПЗС", self.s.save_dir or "",
+                "Кадры (*.npy *.txt *.csv *.tif *.tiff);;Все файлы (*)")
+            if not path:
+                return
+        try:
+            img, meta = load_image(path)
+        except (OSError, ValueError) as e:
+            self._error("Открытие кадра", e)
+            return
+        m = Measurement(x=np.arange(img.shape[1], dtype=float), x_unit=X_PX, y=np.zeros(img.shape[1]),
+                        raw=np.zeros(img.shape[1]), image=img, acq_mode="image", label=os.path.basename(path),
+                        comment=meta.get("comment", ""), source_file=path)
+        self._frame_tracks(m)
+        self.current = m
+        self._image_meas = m
+        self.image._first = True
+        self.image.set_image(img)
+        self.tabs.setCurrentIndex(1)
+        self._redraw()
+        self._update_actions()
+        log.info("Открыт кадр %s (%d×%d)", path, img.shape[1], img.shape[0])
+
+    def _frame_tracks(self, m: Measurement) -> None:
+        """Спектры полос по кадру из файла (программное суммирование строк, без фона)."""
+        h = m.image.shape[0]
+        stripes = [(min(t, h - 1), min(b, h - 1)) for t, b in self.inst.stripes()]
+        tracks = np.vstack([P.bin_rows(m.image, t, b) for t, b in stripes])
+        m.y, m.raw = tracks[0], tracks[0]
+        m.tracks = tracks if tracks.shape[0] > 1 else None
+        m.track_rows = tuple(stripes)
+        m.rows = stripes[0]
+
+    def _refresh_file_frame(self) -> None:
+        m = self.current
+        if m is not None and m.source_file and m.image is not None:
+            self._frame_tracks(m)
+            self._redraw()
+
+    def export_plot(self) -> None:
+        """Картинка графика (PNG — растровая, SVG — векторная, для статей и отчётов)."""
+        import pyqtgraph.exporters as pex
+        image_tab = self.tabs.currentIndex() == 1
+        item = self.image.plot_item if image_tab else self.plot.plot.getPlotItem()
+        m = self.current
+        stem = ("ccd_" if image_tab else "spectrum_") + (f"{m.timestamp:%Y%m%d_%H%M%S}" if m is not None else "plot")
+        start = os.path.join(self.s.save_dir or os.path.expanduser("~"), stem + ".png")
+        path, flt = QtWidgets.QFileDialog.getSaveFileName(self, "Сохранить график", start,
+                                                          "PNG (*.png);;SVG — векторный (*.svg)")
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".svg" if "svg" in flt.lower() else ".png"
+        try:
+            if path.lower().endswith(".svg"):
+                pex.SVGExporter(item).export(path)
+            else:
+                ex = pex.ImageExporter(item)
+                ex.parameters()["width"] = 1600
+                ex.export(path)
+        except Exception as e:  # noqa: BLE001 — сообщить, а не упасть
+            self._error("Сохранение графика", e)
+            return
+        log.info("График сохранён: %s", path)
+        self.statusBar().showMessage(f"График сохранён: {path}", 6000)
 
     def save_current(self) -> None:
         m = self.current
         if m is None:
             return
         stem = f"{m.timestamp:%Y%m%d_%H%M%S}" + (f"_{m.center_wl:.0f}nm" if m.center_wl else "")
+        if m.comment:
+            safe = "".join("_" if c in '<>:"/\\|?*' else c for c in m.comment).strip()[:40]
+            stem = f"{safe}_{stem}" if safe else stem
         start = os.path.join(self.s.save_dir or os.path.expanduser("~"), stem + self.s.save_format)
         path, flt = QtWidgets.QFileDialog.getSaveFileName(
             self, "Сохранить спектр", start, "Текст, табуляция (*.txt);;CSV для Excel (*.csv)")
@@ -1186,16 +1631,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mono_task("зеркало…", lambda: self.inst.set_mirror(pos),
                         lambda _: log.info("Выходное зеркало: положение %d", pos))
 
+    def set_shutter_ttl(self, on: bool) -> None:
+        if not self._mono_ready():
+            self._show_shutter_mode()
+            return
+
+        def done(_):
+            self._shutter_task = False
+            self._show_shutter_mode()
+            if not on:
+                self._refresh_mono_misc()
+
+        def failed(e):
+            self._shutter_task = False
+            self._error("Режим шторки", e)
+            self._show_shutter_mode()
+        self._shutter_task = True
+        self.tasks.run(lambda: self.inst.set_shutter_ttl(on), done, failed)
+
     def set_shutter(self, is_open: bool) -> None:
         if not self._mono_ready():
             self._refresh_mono_misc()          # вернуть кнопке шторки фактическое состояние
             return
 
         def work():
-            self.inst.set_shutter(is_open)
+            self.inst.set_shutter(is_open)         # ждёт, пока прибор подтвердит новое состояние
             return self.inst.get_shutter()
-        self.tasks.run(work, self.mono_panel.set_shutter_value,
-                       lambda e: (self._error("Шторка", e), self.mono_panel.set_shutter_value(None)))
+
+        def done(state):
+            self._shutter_task = False
+            self.mono_panel.set_shutter_value(state)
+
+        def failed(e):
+            self._shutter_task = False
+            self._error("Шторка", e)
+            self._refresh_mono_misc()
+        self._shutter_task = True
+        self.mono_panel.btn_shutter.setText("шторка: открывается…" if is_open else "шторка: закрывается…")
+        self.tasks.run(work, done, failed)
 
     # ================================================================ настройки
     def calibration(self) -> None:
@@ -1277,6 +1750,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.s.save()
         except OSError as e:
             log.warning("Настройки не сохранены: %s", e)
+        try:
+            self.buffer.save_state(self._buffer_path())
+        except OSError as e:
+            log.warning("Буфер спектров не сохранён: %s", e)
         if self.inst.camera_connected or self.inst.mono_connected:
             r = QtWidgets.QMessageBox.question(self, APP_NAME, "Отключить приборы и выйти?")
             if r != QtWidgets.QMessageBox.Yes:

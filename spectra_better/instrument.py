@@ -25,7 +25,8 @@ from .calibration import WavelengthAxis, geometries_from_config
 from .config import ACQ_IMAGE, ACQ_SPECTRUM, AppSettings
 from .hw.base import (MECH_GRATING, MECH_MIRROR, MECH_SLIT, MECH_TITLES, MECH_TURRET, AcqSettings, Camera,
                       CameraInfo, CameraState, DeviceError, GratingInfo, Monochromator, MonoInfo,
-                      SYNC_LOGICAL_0, SYNC_LOGICAL_1, SYNC_OUT_MODES, full_frame_region, spectrum_region,
+                      SYNC_EXPOSURE_MODES, SYNC_LOGICAL_0, SYNC_LOGICAL_1, SYNC_OUT_MODES, full_frame_region,
+                      spectrum_region,
                       warm_up_camera)
 from .hw.worker import DeviceThread
 from .spectrasp_config import InstalledSetup, find_spectrasp_dir, read_installation
@@ -41,6 +42,11 @@ TEMP_TOLERANCE_C = 1.0
 TEMP_STALL_S = 120.0
 # фон, снятый при другой температуре, не вычитается (темновой ток ~×2 на каждые 6–7 °C)
 BG_TEMP_TOLERANCE_C = 2.0
+# DevCtrl выполняет OpenShutter/CloseShutter асинхронно: команда уходит в очередь, а состояние
+# меняется, когда прибор ответит. Поэтому после команды ждём подтверждения (SwitchTimeout шторки
+# в MS7504_*.cfg — 2 с, плюс обмен по сети) и даём шторке доехать.
+SHUTTER_CONFIRM_S = 6.0
+SHUTTER_SETTLE_S = 0.3
 
 
 @dataclass
@@ -69,6 +75,13 @@ class Measurement:
     is_background: bool = False
     label: str = ""
     stitched: bool = False                # сшит из нескольких кадров (панорама): «пиксель» не имеет смысла
+    # несколько полос строк: спектр каждой (T×N, полоса 1 = y) и их строки ПЗС
+    tracks: Optional[np.ndarray] = None
+    track_rows: Tuple[Tuple[int, int], ...] = ()
+    defects_fixed: int = 0                # исправлено дефектных пикселей
+    intensity_corrected: str = ""         # как скорректирована интенсивность ("" — нет)
+    comment: str = ""                     # комментарий пользователя (образец, условия)
+    source_file: str = ""                 # кадр открыт из файла (не снят сейчас)
 
     def meta(self) -> Dict[str, object]:
         m: Dict[str, object] = {
@@ -92,7 +105,23 @@ class Measurement:
             m["ccd_temperature_C"] = f"{self.temperature:g}"
         if self.label:
             m["label"] = self.label
+        if self.comment:
+            m["comment"] = self.comment
+        if self.track_rows and len(self.track_rows) > 1:
+            m["stripes"] = ", ".join(f"{a}-{b}" for a, b in self.track_rows)
+        if self.defects_fixed:
+            m["defect_pixels_fixed"] = str(self.defects_fixed)
+        if self.intensity_corrected:
+            m["intensity_correction"] = self.intensity_corrected
         return m
+
+    @property
+    def n_tracks(self) -> int:
+        return 1 if self.tracks is None else int(self.tracks.shape[0])
+
+    def track(self, i: int) -> np.ndarray:
+        """Спектр полосы i (0 — основная)."""
+        return self.y if i == 0 or self.tracks is None else self.tracks[i]
 
 
 class Instrument:
@@ -114,6 +143,10 @@ class Instrument:
         self.camera_stuck = False
         self.last_state: Optional[CameraState] = None
         self._mono_exclusive: Optional[Tuple[str, int]] = None     # (кто, поток) — см. mono_exclusive()
+        self.shutter_state: Optional[bool] = None     # последнее известное состояние шторки (True — открыта)
+        self.shutter_ttl: Optional[bool] = None       # режим шторки в приборе: True — по экспозиции (TTL)
+        self._corr_warned = False
+        self._shutter_warned = False
         self.cooling_target: Optional[int] = None    # уставка, заданная в этом сеансе (None — выкл./неизвестна)
         self._temp_hist: deque = deque(maxlen=400)   # (время, температура ПЗС) — для «уставка недостижима»
         self._state_time = 0.0
@@ -215,6 +248,7 @@ class Instrument:
             info.slits = list(mc.slits)
             info.mirror_positions = list(mc.mirror_positions)
             info.has_shutter = mc.has_shutter
+            info.shutter_ttl = mc.shutter_ttl
             info.step_limits = dict(mc.step_limits)
             info.slit_max_um = list(mc.slit_max_um)
         return info
@@ -256,7 +290,23 @@ class Instrument:
         except FutureTimeout:
             raise DeviceError("Монохроматор не ответил при подключении") from None
         self.refresh_mono()
+        self._apply_shutter_mode()
         return info
+
+    def _apply_shutter_mode(self) -> None:
+        """Режим шторки (ручной / по экспозиции) хранится в самом приборе — после подключения
+        выставляем выбранный в программе, чтобы он был известен наверняка."""
+        self.shutter_ttl = None
+        if not (self.mono.info.has_shutter and self.mono.info.shutter_ttl):
+            self.shutter_ttl = False
+            return
+        want = bool(self.settings.shutter_ttl)
+        try:
+            self.mono_thread.call(self.mono.set_shutter_ttl, want, 0, timeout=60)
+            self.shutter_ttl = want
+            log.info("Шторка: %s", "по экспозиции (TTL)" if want else "ручное управление")
+        except (DeviceError, FutureTimeout) as e:
+            log.warning("Не удалось выставить режим шторки: %s", e)
 
     def refresh_mono(self) -> None:
         if not self.mono_connected:
@@ -339,6 +389,8 @@ class Instrument:
     def _close_mono_safely(self, timeout_s: float) -> None:
         """В потоке монохроматора: дождаться конца движения и штатно закрыть DevCtrl."""
         m = self.mono
+        self.shutter_state = None
+        self.shutter_ttl = None
         if m.is_open:
             try:
                 if m.is_busy():
@@ -408,11 +460,43 @@ class Instrument:
         if self.camera_stuck:
             raise DeviceError("Камера не отвечает. Нажмите «Переподключить».")
 
+    MAX_STRIPES = 8
+
+    def stripes(self) -> List[Tuple[int, int]]:
+        """Полосы строк ПЗС: [(верх, низ), …], первая — основная (rows_top…rows_bottom)."""
+        s = self.settings
+        h = self.camera.info.height if self.camera is not None and self.camera.info.height else 0
+        out = []
+        for t, b in [(s.rows_top, s.rows_bottom)] + [tuple(p) for p in s.extra_stripes]:
+            t, b = int(round(t)), int(round(b))
+            t = max(0, t)
+            if h:
+                t, b = min(t, h - 1), min(b, h - 1)
+            out.append((t, max(t, b)))
+        return out[:self.MAX_STRIPES]
+
+    def set_stripes(self, stripes: List[Tuple[int, int]]) -> None:
+        """Задать полосы (первая — основная). Не больше MAX_STRIPES."""
+        if not stripes:
+            raise DeviceError("Нужна хотя бы одна полоса строк")
+        if len(stripes) > self.MAX_STRIPES:
+            raise DeviceError(f"Не больше {self.MAX_STRIPES} полос")
+        clean = [(int(min(a, b)), int(max(a, b))) for a, b in stripes]
+        s = self.settings
+        s.rows_top, s.rows_bottom = clean[0]
+        s.extra_stripes = [[a, b] for a, b in clean[1:]]
+
     def acq_settings(self) -> AcqSettings:
         s = self.settings
         info = self.camera.info
+        stripes = self.stripes()
         if s.acq_mode == ACQ_IMAGE:
             region = full_frame_region(info.width, info.height)
+        elif len(stripes) > 1:
+            # несколько полос: строки от верхней до нижней читаются построчно, полосы
+            # суммируются программно (как в SpectraSP — там всегда читался полный кадр)
+            region = spectrum_region(info.width, info.height, min(t for t, _ in stripes),
+                                     max(b for _, b in stripes), False)
         else:
             region = spectrum_region(info.width, info.height, s.rows_top, s.rows_bottom, s.hardware_binning)
             if region.bin_y > info.max_bin_y:
@@ -496,7 +580,27 @@ class Instrument:
                 log.exception("abort")
 
     def _bg_key(self, acq: AcqSettings) -> tuple:
-        return acq.exposure_us, acq.readout_speed, acq.regions, self.settings.flip_x
+        # полосы входят в ключ: фон снимается и вычитается для каждой полосы отдельно
+        return acq.exposure_us, acq.readout_speed, acq.regions, self.settings.flip_x, tuple(self.stripes())
+
+    def _intensity_correct(self, y: np.ndarray, x: np.ndarray, unit: str) -> Tuple[np.ndarray, str]:
+        """y × K: коррекция спектральной чувствительности по таблице из настроек."""
+        s = self.settings
+        if len(s.intensity_corr_points) < 2:
+            return y, ""
+        if s.intensity_corr_by == "wl":
+            if unit != "nm":
+                if not self._corr_warned:
+                    log.warning("Коррекция интенсивности по длинам волн не применена: шкала только в пикселях")
+                    self._corr_warned = True
+                return y, ""
+            k = P.correction_curve(x, s.intensity_corr_points)
+            how = f"по длинам волн, {len(s.intensity_corr_points)} точек"
+        else:
+            k = P.correction_curve(np.arange(y.shape[-1]), s.intensity_corr_points)
+            how = f"по пикселям, {len(s.intensity_corr_points)} точек"
+        self._corr_warned = False
+        return y * k, how
 
     def has_background(self) -> bool:
         return self.camera_connected and not self.background_problem() and \
@@ -520,12 +624,14 @@ class Instrument:
             self._backgrounds.clear()
             self._bg_images.clear()
 
-    def _frame_to_spectrum(self, frame: np.ndarray, acq: AcqSettings) -> np.ndarray:
-        s = self.settings
-        if s.acq_mode == ACQ_IMAGE:
-            top = max(0, s.rows_top)
-            return P.bin_rows(frame, top, s.rows_bottom)
-        return P.to_spectrum(frame)
+    def _frame_to_tracks(self, frame: np.ndarray, acq: AcqSettings) -> np.ndarray:
+        """Кадр → спектры полос (T×N)."""
+        stripes = self.stripes()
+        r = acq.regions[0]
+        if self.settings.acq_mode != ACQ_IMAGE and r.bin_y > 1:
+            return np.asarray(frame, dtype=np.float64)[:1]          # аппаратное объединение: одна строка
+        offset = 0 if self.settings.acq_mode == ACQ_IMAGE else r.top
+        return np.vstack([P.bin_rows(frame, t - offset, b - offset) for t, b in stripes])
 
     def acquire(self, n: Optional[int] = None, progress: Optional[ProgressFn] = None,
                 background: bool = False, label: str = "") -> Measurement:
@@ -546,19 +652,45 @@ class Instrument:
         self._abort.clear()
         acq = self.acq_settings()
         t0 = time.monotonic()
+        if not background and self.mono_connected and not self.shutter_ttl and self.shutter_state is False:
+            # закрытая шторка сохраняется между сеансами (и в SpectraSP) — сигнал тогда только темновой
+            if not self._shutter_warned:
+                log.warning("Входная шторка монохроматора закрыта — на ПЗС попадает только темновой "
+                            "сигнал. Откройте шторку на панели «Монохроматор».")
+                self._shutter_warned = True
+        elif self.shutter_state:
+            self._shutter_warned = False
         shutter_restore = None
-        if background and s.close_shutter_for_background and self.mono_connected:
+        ttl_restore = False
+        close_shutter = background and s.close_shutter_for_background and self.mono_connected
+        if background and self.mono_connected and self.shutter_ttl:
+            # по TTL шторка открылась бы на время каждого кадра фона — на фон переводим её на ручное
+            # управление (закрытой), потом возвращаем режим по экспозиции
+            try:
+                self.mono_thread.call(self.mono.set_shutter_ttl, False, 0, timeout=60)
+            except (DeviceError, FutureTimeout) as e:
+                raise DeviceError(f"Не удалось перевести шторку на ручное управление для фона: {e}") from e
+            self.shutter_ttl = False
+            ttl_restore = True
+            close_shutter = True
+        if close_shutter:
             try:
                 prev = self.mono_thread.call(self.mono.get_shutter, 0, timeout=30)
-                self.mono_thread.call(self.mono.set_shutter, False, 0, timeout=30)
-                shutter_restore = prev if prev is not None else True
-                time.sleep(0.2)
             except (DeviceError, FutureTimeout) as e:
-                log.warning("Не удалось закрыть шторку для фона: %s", e)
+                raise DeviceError(f"Не удалось прочитать состояние шторки перед съёмкой фона: {e}") from e
+            shutter_restore = prev if prev is not None else True
         spectra: List[np.ndarray] = []
         frame = None
         sat = False
         try:
+            if close_shutter:
+                try:
+                    self._shutter_to(False)
+                except (DeviceError, FutureTimeout) as e:
+                    # фон при открытой шторке испортил бы все спектры после вычитания — не снимаем
+                    raise DeviceError(f"Шторка не закрылась, фон не снят: {e}. Закройте вход вручную и "
+                                      "снимите фон без шторки (Обработка → «закрывать шторку при съёмке "
+                                      "фона»).") from e
             for i in range(n):
                 if self._abort.is_set():
                     raise DeviceError("Остановлено пользователем")
@@ -568,19 +700,29 @@ class Instrument:
                 if s.flip_x:
                     frame = frame[:, ::-1]
                 sat = sat or P.saturated(frame)
-                spectra.append(self._frame_to_spectrum(frame, acq))
+                spectra.append(self._frame_to_tracks(frame, acq))
         finally:
-            if shutter_restore is not None:
+            if ttl_restore:
                 try:
-                    self.mono_thread.call(self.mono.set_shutter, shutter_restore, 0, timeout=30)
+                    self.mono_thread.call(self.mono.set_shutter_ttl, True, 0, timeout=60)
+                    self.shutter_ttl = True
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Не удалось вернуть шторку в режим по экспозиции: %s", e)
+            elif shutter_restore is not None:
+                try:
+                    self._shutter_to(shutter_restore)
                 except Exception as e:  # noqa: BLE001
                     log.warning("Не удалось вернуть шторку: %s", e)
         if progress:
             progress(n, n, "обработка")
         mode = "average" if background else s.accumulate_mode
-        raw = P.combine_frames(spectra, mode=mode, reject_cosmics=s.remove_cosmics)
+        raw = P.combine_frames(spectra, mode=mode, reject_cosmics=s.remove_cosmics)     # T×N
         if s.remove_cosmics and n < 3:
-            raw = P.remove_spikes(raw)
+            raw = np.vstack([P.remove_spikes(t) for t in raw])
+        n_fixed = 0
+        if s.defect_correction and s.defect_pixels:
+            raw = P.fix_defects(raw, s.defect_pixels, flip=s.flip_x)
+            n_fixed = len(s.defect_pixels)
         key = self._bg_key(acq)
         y = raw
         bg_used = False
@@ -602,8 +744,13 @@ class Instrument:
             if bg is not None and bg.shape == raw.shape:
                 y = raw - bg * (n if mode == "sum" else 1)
                 bg_used = True
-        x, unit = self.wavelength_axis(raw.size)
-        m = Measurement(x=x, x_unit=unit, y=y, raw=raw,
+        x, unit = self.wavelength_axis(raw.shape[-1])
+        corrected = ""
+        if s.intensity_corr and not background:
+            y, corrected = self._intensity_correct(y, x, unit)
+        m = Measurement(x=x, x_unit=unit, y=y[0], raw=raw[0],
+                        tracks=y if y.shape[0] > 1 else None, track_rows=tuple(self.stripes()[:y.shape[0]]),
+                        defects_fixed=n_fixed, intensity_corrected=corrected, comment=s.comment.strip(),
                         image=frame if s.acq_mode == ACQ_IMAGE else None,
                         background_used=bg_used, saturated=sat,
                         exposure_ms=acq.exposure_us / 1000.0, accumulations=n, accumulate_mode=mode,
@@ -742,11 +889,70 @@ class Instrument:
 
     def set_shutter(self, is_open: bool) -> None:
         self._require_mono(control=True)
-        self.mono_thread.call(self.mono.set_shutter, bool(is_open), 0, timeout=60)
+        if self.shutter_ttl:
+            raise DeviceError("Шторка работает по экспозиции (TTL) — чтобы открыть или закрыть её вручную, "
+                              "переключите режим шторки на «вручную»")
+        self._shutter_to(is_open)
+
+    def set_shutter_ttl(self, on: bool) -> None:
+        """Шторка по экспозиции: открывается импульсом с выхода синхронизации камеры только на время
+        кадра (как кнопка «TTL» в окне DevCtrl). False — ручное управление («Internal»)."""
+        self._require_mono(control=True)
+        if not (self.mono.info.has_shutter and self.mono.info.shutter_ttl):
+            raise DeviceError("Шторка этого монохроматора не управляется по TTL (в MS*.cfg нет TTL=1)")
+        on = bool(on)
+        self.mono_thread.call(self.mono.set_shutter_ttl, on, 0, timeout=60)
+        self.shutter_ttl = on
+        self.settings.shutter_ttl = on
+        self.shutter_state = None
+        if on:
+            log.info("Шторка: по экспозиции (TTL) — открывается только на время кадра")
+            if self.camera_connected and not self.exposure_sync_output():
+                log.warning("Ни один выход синхронизации камеры не выдаёт сигнал экспозиции (режим EXP). "
+                            "Шторка по TTL откроется, только если на её вход заведён такой выход — "
+                            "в SpectraSP это выход 1 в режиме 0 «EXP».")
+        else:
+            log.info("Шторка: ручное управление")
+
+    def exposure_sync_output(self) -> int:
+        """Номер выхода синхронизации камеры, выдающего импульс экспозиции (0 — такого нет)."""
+        for n in (1, 2):
+            if self.sync_out_setting(n) in SYNC_EXPOSURE_MODES:
+                return n
+        return 0
+
+    def _shutter_to(self, is_open: bool) -> bool:
+        """Переключить шторку и дождаться, пока прибор подтвердит новое состояние.
+
+        DevCtrl лишь ставит команду в очередь, и сразу после неё прибор сообщает ещё
+        прежнее состояние (из-за этого кнопка шторки «отставала» на одно нажатие, а фон
+        мог сниматься при открытой шторке). Возвращает True, если состояние подтверждено,
+        False — если прибор состояние не сообщает (тогда выждано SHUTTER_CONFIRM_S).
+        """
+        is_open = bool(is_open)
+        self.mono_thread.call(self.mono.set_shutter, is_open, 0, timeout=60)
+        deadline = time.monotonic() + SHUTTER_CONFIRM_S
+        while True:
+            time.sleep(0.05)            # поток монохроматора тем временем обрабатывает сообщения DevCtrl
+            state = self.mono_thread.call(self.mono.get_shutter, 0, timeout=30)
+            self.shutter_state = state
+            if state is not None and state == is_open:
+                time.sleep(SHUTTER_SETTLE_S)
+                log.info("Шторка %s", "открыта" if is_open else "закрыта")
+                return True
+            if time.monotonic() > deadline:
+                break
+        if state is None:
+            log.warning("Монохроматор не сообщает состояние шторки — команда «%s» не подтверждена",
+                        "открыть" if is_open else "закрыть")
+            return False
+        raise DeviceError(f"шторка не {'открылась' if is_open else 'закрылась'} за {SHUTTER_CONFIRM_S:.0f} с "
+                          f"(прибор сообщает: {'открыта' if state else 'закрыта'})")
 
     def get_shutter(self) -> Optional[bool]:
         self._require_mono()
-        return self.mono_thread.call(self.mono.get_shutter, 0, timeout=60)
+        self.shutter_state = self.mono_thread.call(self.mono.get_shutter, 0, timeout=60)
+        return self.shutter_state
 
     # ---------------------------------------------------------------- сервис
     def service_mechanisms(self) -> List[Tuple[str, int, str]]:
@@ -837,8 +1043,9 @@ class Instrument:
             return False
 
     # ================================================================ панорама
-    def panorama_plan(self, start_nm: float, end_nm: float, overlap: float = 0.15) -> List[float]:
-        """Центральные длины волн для панорамы с заданным перекрытием."""
+    def panorama_plan(self, start_nm: float, end_nm: float, overlap: float = 0.15, trim: int = 0) -> List[float]:
+        """Центральные длины волн для панорамы с заданным перекрытием (trim — отбрасываемые
+        точки с каждого края кадра: рабочая ширина кадра меньше)."""
         if not self.camera_connected or self.mono_wl is None:
             raise DeviceError("Нужны подключённые камера и монохроматор")
         n_pix = self.camera.info.width
@@ -849,7 +1056,7 @@ class Instrument:
             x, unit = self.axis.axis(n_pix, c, self.mono_grating, None)
             if unit != "nm":
                 raise DeviceError("Для панорамы нужна калибровка шкалы длин волн")
-            width = abs(x[-1] - x[0])
+            width = abs(x[-1] - x[0]) * max(0.1, 1 - 2 * trim / max(1, n_pix))
             if not centers:
                 c = lo + width / 2
                 x, _ = self.axis.axis(n_pix, c, self.mono_grating, None)

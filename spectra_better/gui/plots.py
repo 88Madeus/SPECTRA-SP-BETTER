@@ -11,12 +11,14 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ..config import AppSettings
 from ..units import X_DECIMALS, X_NM, X_PX, X_RAMAN, X_SHORT, X_UNITS, AxisMap, axis_label, convert_range
 
 OVERLAY_COLORS = ["#1f77b4", "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f"]
+# полосы строк ПЗС: 1 — жёлтая (основная), дальше — свои цвета (и на изображении, и на графике)
+STRIPE_COLORS = ["#e6b800", "#ff7f0e", "#2ca02c", "#9467bd", "#17becf", "#e377c2", "#8c564b", "#7f7f7f"]
 
 Fn = Callable[[np.ndarray], np.ndarray]
 Mapping = Optional[Tuple[Fn, Fn]]
@@ -97,9 +99,14 @@ def _fmt_pos(v: float, unit: str) -> str:
     return f"{v:.{X_DECIMALS.get(unit, 3)}f} {X_SHORT.get(unit, unit)}"
 
 
+# участки интегрирования — цвета, не совпадающие с текущим спектром (красный) и полосами строк
+BAND_COLORS = ["#2ca02c", "#9467bd", "#17becf", "#8c564b", "#bcbd22", "#e377c2", "#7f7f7f", "#1f77b4"]
+
+
 class SpectrumPlot(QtWidgets.QWidget):
     cursor_moved = QtCore.pyqtSignal(float, float)
     units_changed = QtCore.pyqtSignal()     # сменились единицы оси X или длина волны лазера
+    band_moved = QtCore.pyqtSignal(int, float, float)    # полосу интегрирования i перетащили (в единицах оси)
 
     def __init__(self, settings: AppSettings, parent=None):
         super().__init__(parent)
@@ -146,6 +153,10 @@ class SpectrumPlot(QtWidgets.QWidget):
         self.bg_curve.setVisible(False)
         self._bg_in_legend = False
         self.overlays: Dict[str, pg.PlotDataItem] = {}
+        self.track_curves: List[pg.PlotDataItem] = []       # полосы 2…8 текущего измерения
+        self.band_items: List[pg.LinearRegionItem] = []     # полосы интегрирования
+        self.band_labels: List[pg.TextItem] = []
+        self._band_suppress = False
         self.peak_items: List[pg.GraphicsObject] = []
 
         self.vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#999", width=1))
@@ -295,7 +306,8 @@ class SpectrumPlot(QtWidgets.QWidget):
         self.show_all()
 
     def _data_x_bounds(self) -> Optional[Tuple[float, float]]:
-        arrays = [self._x] + [it.xData for it in self.overlays.values() if it.isVisible()]
+        arrays = [self._x] + [it.xData for it in self.overlays.values() if it.isVisible()] \
+            + [it.xData for it in self.track_curves]
         lo, hi = [], []
         for a in arrays:
             if a is not None and np.size(a):
@@ -439,9 +451,64 @@ class SpectrumPlot(QtWidgets.QWidget):
             self.legend.removeItem(self.bg_curve)
             self._bg_in_legend = False
 
-    def add_overlay(self, key: str, x: Optional[np.ndarray], y: np.ndarray, name: str) -> None:
+    def set_bands(self, bands: Sequence[Optional[Tuple[float, float]]]) -> None:
+        """Полосы интегрирования [(от, до) в единицах оси или None — нельзя показать], с номерами."""
+        while len(self.band_items) > len(bands):
+            self.plot.removeItem(self.band_items.pop())
+            self.plot.removeItem(self.band_labels.pop())
+        while len(self.band_items) < len(bands):
+            i = len(self.band_items)
+            color = QtGui.QColor(BAND_COLORS[i % len(BAND_COLORS)])
+            fill = QtGui.QColor(color)
+            fill.setAlpha(35)
+            reg = pg.LinearRegionItem(brush=pg.mkBrush(fill), pen=pg.mkPen(color, width=1.2))
+            reg.setZValue(-10)
+            reg.sigRegionChangeFinished.connect(lambda r, i=i: self._band_changed(i))
+            lab = pg.TextItem(f"∫{i + 1}", color=color, anchor=(0.5, 0))
+            self.plot.addItem(reg)
+            self.plot.addItem(lab)
+            self.band_items.append(reg)
+            self.band_labels.append(lab)
+        self._band_suppress = True
+        top = self.vb.viewRange()[1][1]
+        for reg, lab, b in zip(self.band_items, self.band_labels, bands):
+            reg.setVisible(b is not None)
+            lab.setVisible(b is not None)
+            if b is not None:
+                reg.setRegion(b)
+                lab.setPos((b[0] + b[1]) / 2, top)
+        self._band_suppress = False
+
+    def _band_changed(self, i: int) -> None:
+        if self._band_suppress:
+            return
+        a, b = self.band_items[i].getRegion()
+        self.band_moved.emit(i, float(min(a, b)), float(max(a, b)))
+
+    def set_tracks(self, tracks: Sequence[tuple]) -> None:
+        """Спектры дополнительных полос текущего измерения: [(x, y, название), …] (полосы 2, 3, …)."""
+        while len(self.track_curves) > len(tracks):
+            item = self.track_curves.pop()
+            self.plot.removeItem(item)
+            self.legend.removeItem(item)
+        for i, (x, y, name) in enumerate(tracks):
+            color = STRIPE_COLORS[(i + 1) % len(STRIPE_COLORS)]
+            if i >= len(self.track_curves):
+                self.track_curves.append(self.plot.plot([], [], pen=pg.mkPen(color, width=1.3), name=name))
+            item = self.track_curves[i]
+            if item.name() != name:
+                self.legend.removeItem(item)
+                item.opts["name"] = name
+                self.legend.addItem(item, name)
+            if x is None:
+                item.setData([], [])
+            else:
+                item.setData(x, y)
+
+    def add_overlay(self, key: str, x: Optional[np.ndarray], y: np.ndarray, name: str,
+                    color: Optional[str] = None) -> None:
         self.remove_overlay(key)
-        color = OVERLAY_COLORS[len(self.overlays) % len(OVERLAY_COLORS)]
+        color = color or OVERLAY_COLORS[len(self.overlays) % len(OVERLAY_COLORS)]
         self.overlays[key] = self.plot.plot([], [], pen=pg.mkPen(color, width=1.1), name=name)
         self.update_overlay(key, x, y)
 
@@ -510,8 +577,9 @@ class SpectrumPlot(QtWidgets.QWidget):
 
 
 class ImagePanel(QtWidgets.QWidget):
-    """Кадр ПЗС и выбор полосы строк для спектра."""
+    """Кадр ПЗС и выбор полос строк для спектров."""
     rows_changed = QtCore.pyqtSignal(int, int)
+    stripes_changed = QtCore.pyqtSignal(list)      # [(верх, низ), …] — после перетаскивания любой полосы
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -527,7 +595,8 @@ class ImagePanel(QtWidgets.QWidget):
         self.view.setPredefinedGradient("viridis")
         self.view.getView().setAspectLocked(False)
         lay.addWidget(self.view)
-        hint = QtWidgets.QLabel("Перетащите жёлтую полосу, чтобы выбрать строки ПЗС, по которым строится спектр.")
+        hint = QtWidgets.QLabel("Перетащите жёлтую полосу, чтобы выбрать строки ПЗС, по которым строится спектр. "
+                                "Дополнительные полосы (свой спектр с каждой) — «Полосы…» на панели «Экспозиция».")
         hint.setStyleSheet("color: #555; padding: 2px 6px;")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -536,6 +605,8 @@ class ImagePanel(QtWidgets.QWidget):
                                           pen=pg.mkPen("#e6b800", width=1.5))
         self.view.getView().addItem(self.region)
         self.region.sigRegionChangeFinished.connect(self._region_changed)
+        self.extra_regions: List[pg.LinearRegionItem] = []
+        self.labels: List[pg.TextItem] = []
         self._first = True
         self._suppress = False
         self.set_x_scale(AxisMap(None), X_PX, 0)
@@ -574,10 +645,46 @@ class ImagePanel(QtWidgets.QWidget):
         self.region.setRegion((top, bottom + 1))
         self._suppress = False
 
+    def set_stripes(self, stripes) -> None:
+        """Показать все полосы: первая — жёлтая, остальные — своими цветами, с номерами."""
+        stripes = list(stripes) or [(0, 0)]
+        self._suppress = True
+        self.region.setRegion((stripes[0][0], stripes[0][1] + 1))
+        view = self.view.getView()
+        while len(self.extra_regions) > len(stripes) - 1:
+            view.removeItem(self.extra_regions.pop())
+        while len(self.extra_regions) < len(stripes) - 1:
+            color = QtGui.QColor(STRIPE_COLORS[(len(self.extra_regions) + 1) % len(STRIPE_COLORS)])
+            fill = QtGui.QColor(color)
+            fill.setAlpha(45)
+            reg = pg.LinearRegionItem(orientation="horizontal", brush=pg.mkBrush(fill),
+                                      pen=pg.mkPen(color, width=1.5))
+            reg.sigRegionChangeFinished.connect(self._region_changed)
+            view.addItem(reg)
+            self.extra_regions.append(reg)
+        for reg, (t, b) in zip(self.extra_regions, stripes[1:]):
+            reg.setRegion((t, b + 1))
+        for lab in self.labels:
+            view.removeItem(lab)
+        self.labels = []
+        if len(stripes) > 1:
+            for i, (t, b) in enumerate(stripes):
+                lab = pg.TextItem(str(i + 1), color=STRIPE_COLORS[i % len(STRIPE_COLORS)], anchor=(0, 0.5))
+                lab.setPos(4, (t + b + 1) / 2)
+                view.addItem(lab)
+                self.labels.append(lab)
+        self._suppress = False
+
+    def stripes(self) -> List[tuple]:
+        out = []
+        for reg in [self.region] + self.extra_regions:
+            a, b = reg.getRegion()
+            top = int(round(min(a, b)))
+            bottom = int(round(max(a, b))) - 1
+            out.append((max(0, top), max(top, bottom)))
+        return out
+
     def _region_changed(self) -> None:
         if self._suppress:
             return
-        a, b = self.region.getRegion()
-        top = int(round(min(a, b)))
-        bottom = int(round(max(a, b))) - 1
-        self.rows_changed.emit(max(0, top), max(top, bottom))
+        self.stripes_changed.emit(self.stripes())

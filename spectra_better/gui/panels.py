@@ -133,10 +133,12 @@ class CameraPanel(QtWidgets.QGroupBox):
 
 class AcquisitionPanel(QtWidgets.QGroupBox):
     changed = QtCore.pyqtSignal()
+    stripes_requested = QtCore.pyqtSignal()
 
     def __init__(self, settings: AppSettings, parent=None):
         super().__init__("Экспозиция", parent)
         self.s = settings
+        self._n_stripes = 1 + len(settings.extra_stripes)
         form = QtWidgets.QFormLayout(self)
         self.exposure = QtWidgets.QDoubleSpinBox()
         self.exposure.setRange(0.01, 3_600_000)
@@ -163,6 +165,12 @@ class AcquisitionPanel(QtWidgets.QGroupBox):
             w.setRange(0, 4095)
             w.setKeyboardTracking(False)
         form.addRow("Строки ПЗС:", _row(self.top, QtWidgets.QLabel("…"), self.bottom, 1))
+        self.stripes_info = QtWidgets.QLabel("1 полоса")
+        self.btn_stripes = QtWidgets.QPushButton("Полосы…")
+        self.btn_stripes.setToolTip("Несколько полос строк — свой спектр с каждой (например, несколько волокон). "
+                                    "Как «Stripe 1…8» в SpectraSP.")
+        self.btn_stripes.clicked.connect(self.stripes_requested.emit)
+        form.addRow("Полосы:", _row(self.stripes_info, self.btn_stripes, 1))
         self.hw_bin = QtWidgets.QCheckBox("аппаратное объединение строк")
         self.hw_bin.setToolTip("Камера сама суммирует строки полосы и передаёт одну строку:\n"
                                "считывание в сотни раз быстрее, чем полный кадр.\n"
@@ -176,6 +184,12 @@ class AcquisitionPanel(QtWidgets.QGroupBox):
         self.estimate = QtWidgets.QLabel("")
         self.estimate.setStyleSheet("color: #555;")
         form.addRow(self.estimate)
+        self.comment = QtWidgets.QLineEdit()
+        self.comment.setPlaceholderText("образец, условия…")
+        self.comment.setToolTip("Комментарий записывается в каждый снимок: в файл, в название и свойства в буфере")
+        self.comment.setText(settings.comment)
+        self.comment.textChanged.connect(lambda t: setattr(self.s, "comment", t))
+        form.addRow("Комментарий:", self.comment)
         self.load_from_settings()
         for w in (self.exposure, self.accum, self.top, self.bottom):
             w.valueChanged.connect(self._store)
@@ -221,7 +235,20 @@ class AcquisitionPanel(QtWidgets.QGroupBox):
 
     def _update_enabled(self) -> None:
         spectrum = self.mode.currentData() == ACQ_SPECTRUM
-        self.hw_bin.setEnabled(spectrum)
+        self.hw_bin.setEnabled(spectrum and self._n_stripes == 1)
+
+    def set_stripes_count(self, n: int) -> None:
+        """Число полос: при нескольких камера читает строки построчно, полосы суммируются программно."""
+        self._n_stripes = max(1, int(n))
+        self.stripes_info.setText("1 полоса" if n <= 1 else f"{n} полос{'ы' if n < 5 else ''}")
+        self.stripes_info.setToolTip("" if n <= 1 else "С каждой полосы строится свой спектр")
+        self.hw_bin.setToolTip(
+            "Камера сама суммирует строки полосы и передаёт одну строку:\n"
+            "считывание в сотни раз быстрее, чем полный кадр.\n"
+            "Если в ярких линиях появляется насыщение — уменьшите полосу или экспозицию."
+            + ("\n\nПри нескольких полосах строки читаются построчно (от верхней полосы до нижней) "
+               "и суммируются программно — аппаратное объединение не используется." if n > 1 else ""))
+        self._update_enabled()
 
     def _store(self) -> None:
         s = self.s
@@ -259,6 +286,7 @@ class MonoPanel(QtWidgets.QGroupBox):
     slit = QtCore.pyqtSignal(int, float)
     mirror = QtCore.pyqtSignal(int)
     shutter = QtCore.pyqtSignal(bool)
+    shutter_ttl = QtCore.pyqtSignal(bool)
     service = QtCore.pyqtSignal()
 
     def __init__(self, settings: AppSettings, parent=None):
@@ -307,7 +335,16 @@ class MonoPanel(QtWidgets.QGroupBox):
         form.addRow("Выход:", self.mirror_box)
         self.btn_shutter = QtWidgets.QPushButton("Шторка: ?")
         self.btn_shutter.setCheckable(True)
-        form.addRow("Шторка:", self.btn_shutter)
+        self.shutter_mode = QtWidgets.QComboBox()
+        self.shutter_mode.addItem("вручную", False)
+        self.shutter_mode.addItem("по экспозиции", True)
+        self.shutter_mode.setToolTip(
+            "«по экспозиции» — шторку открывает импульс экспозиции с выхода синхронизации камеры только на "
+            "время кадра и закрывает после него (режим TTL штатного окна DevCtrl). Фон снимается при "
+            "закрытой шторке автоматически.")
+        self._ttl = False
+        self._ttl_available = False
+        form.addRow("Шторка:", _row(self.shutter_mode, self.btn_shutter, 1))
         self._fill_presets(settings.wl_presets)
         self.btn_go.clicked.connect(lambda: self.goto.emit(self.target.value()))
         self.target.lineEdit().returnPressed.connect(lambda: self.goto.emit(self.target.value()))
@@ -318,6 +355,7 @@ class MonoPanel(QtWidgets.QGroupBox):
         self.slit_idx.currentIndexChanged.connect(self._slit_range)
         self.mirror_box.activated.connect(lambda i: self.mirror.emit(self.mirror_box.itemData(i)))
         self.btn_shutter.clicked.connect(lambda checked: self.shutter.emit(checked))
+        self.shutter_mode.activated.connect(lambda i: self.shutter_ttl.emit(bool(self.shutter_mode.itemData(i))))
         self.set_connected(False)
 
     def _fill_presets(self, presets: Sequence[float]) -> None:
@@ -360,8 +398,10 @@ class MonoPanel(QtWidgets.QGroupBox):
 
     def set_connected(self, on: bool) -> None:
         for w in (self.target, self.btn_go, self.presets, self.gratings, self.btn_grating, self.slit_idx,
-                  self.slit_w, self.btn_slit, self.mirror_box, self.btn_shutter):
+                  self.slit_w, self.btn_slit, self.mirror_box):
             w.setEnabled(on)
+        self.btn_shutter.setEnabled(on and not self._ttl)
+        self.shutter_mode.setEnabled(on and self._ttl_available)
 
     def set_service_enabled(self, on: bool) -> None:
         self.btn_service.setEnabled(on)
@@ -389,7 +429,24 @@ class MonoPanel(QtWidgets.QGroupBox):
         if idx >= 0:
             self.mirror_box.setCurrentIndex(idx)
 
+    def set_shutter_mode(self, ttl: Optional[bool], available: bool) -> None:
+        """Режим шторки: True — по экспозиции (TTL), False — вручную, None — неизвестен."""
+        self._ttl_available = available
+        self._ttl = bool(ttl)
+        self.shutter_mode.blockSignals(True)
+        self.shutter_mode.setCurrentIndex(1 if ttl else 0)
+        self.shutter_mode.blockSignals(False)
+        self.shutter_mode.setEnabled(available and self.btn_go.isEnabled())
+        self.btn_shutter.setEnabled(not self._ttl and self.btn_go.isEnabled())
+        if self._ttl:
+            self.btn_shutter.blockSignals(True)
+            self.btn_shutter.setChecked(False)
+            self.btn_shutter.setText("открывается на время кадра")
+            self.btn_shutter.blockSignals(False)
+
     def set_shutter_value(self, is_open: Optional[bool]) -> None:
+        if self._ttl:
+            return                       # по TTL состояние меняется само на каждом кадре
         self.btn_shutter.blockSignals(True)
         self.btn_shutter.setChecked(bool(is_open))
         self.btn_shutter.setText("Шторка: ?" if is_open is None else
@@ -401,6 +458,8 @@ class ProcessingPanel(QtWidgets.QGroupBox):
     changed = QtCore.pyqtSignal()
     take_background = QtCore.pyqtSignal()
     reset_background = QtCore.pyqtSignal()
+    defects_requested = QtCore.pyqtSignal()
+    intensity_requested = QtCore.pyqtSignal()
 
     def __init__(self, settings: AppSettings, parent=None):
         super().__init__("Обработка", parent)
@@ -420,6 +479,20 @@ class ProcessingPanel(QtWidgets.QGroupBox):
         self.cosmics = QtWidgets.QCheckBox("удалять космические частицы")
         self.cosmics.setToolTip("При накоплении ≥3 кадров — отбраковка по медиане, иначе — удаление одиночных выбросов")
         form.addRow(self.cosmics)
+        self.defects = QtWidgets.QCheckBox("исправлять дефектные пиксели")
+        self.defects.setToolTip("«Горячие» и «мёртвые» столбцы ПЗС заменяются соседними значениями "
+                                "(как «Defect Pixel Correction» в SpectraSP)")
+        self.btn_defects = QtWidgets.QToolButton()
+        self.btn_defects.setText("…")
+        self.btn_defects.setToolTip("Список дефектных пикселей, поиск по фону")
+        form.addRow(_row(self.defects, self.btn_defects, 1))
+        self.intensity = QtWidgets.QCheckBox("коррекция интенсивности")
+        self.intensity.setToolTip("Учёт спектральной чувствительности: спектр умножается на поправку K "
+                                  "по длине волны или пикселю (как «Intensity Correction» в SpectraSP)")
+        self.btn_intensity = QtWidgets.QToolButton()
+        self.btn_intensity.setText("…")
+        self.btn_intensity.setToolTip("Таблица поправок, расчёт по эталонной лампе")
+        form.addRow(_row(self.intensity, self.btn_intensity, 1))
         self.peaks = QtWidgets.QCheckBox("искать пики")
         form.addRow(self.peaks)
         note = QtWidgets.QLabel("Единицы и диапазон осей — на панели над графиком.")
@@ -430,16 +503,42 @@ class ProcessingPanel(QtWidgets.QGroupBox):
         self.close_shutter.setChecked(settings.close_shutter_for_background)
         self.cosmics.setChecked(settings.remove_cosmics)
         self.peaks.setChecked(True)
-        for w in (self.subtract, self.close_shutter, self.cosmics, self.show_bg, self.peaks):
+        self.load_corrections()
+        for w in (self.subtract, self.close_shutter, self.cosmics, self.show_bg, self.peaks, self.defects,
+                  self.intensity):
             w.toggled.connect(self._store)
         self.btn_bg.clicked.connect(self.take_background.emit)
         self.btn_bg_reset.clicked.connect(self.reset_background.emit)
+        self.btn_defects.clicked.connect(self.defects_requested.emit)
+        self.btn_intensity.clicked.connect(self.intensity_requested.emit)
+
+    def load_corrections(self) -> None:
+        """Флажки и подписи коррекций — по настройкам (после изменения в окнах настройки)."""
+        s = self.s
+        for w in (self.defects, self.intensity):
+            w.blockSignals(True)
+        n = len(s.defect_pixels)
+        self.defects.setChecked(s.defect_correction and n > 0)
+        self.defects.setEnabled(n > 0)
+        self.defects.setText(f"исправлять дефектные пиксели ({n})" if n else "дефектные пиксели: список пуст")
+        k = len(s.intensity_corr_points)
+        self.intensity.setChecked(s.intensity_corr and k >= 2)
+        self.intensity.setEnabled(k >= 2)
+        by = "по длинам волн" if s.intensity_corr_by == "wl" else "по пикселям"
+        self.intensity.setText(f"коррекция интенсивности ({by}, {k} точ.)" if k >= 2
+                               else "коррекция интенсивности: таблица пуста")
+        for w in (self.defects, self.intensity):
+            w.blockSignals(False)
 
     def _store(self) -> None:
         s = self.s
         s.subtract_background = self.subtract.isChecked()
         s.close_shutter_for_background = self.close_shutter.isChecked()
         s.remove_cosmics = self.cosmics.isChecked()
+        if self.defects.isEnabled():
+            s.defect_correction = self.defects.isChecked()
+        if self.intensity.isEnabled():
+            s.intensity_corr = self.intensity.isChecked()
         self.changed.emit()
 
     def set_background_status(self, has: bool, text: str = "") -> None:

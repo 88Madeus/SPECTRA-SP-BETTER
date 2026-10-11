@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -43,6 +44,22 @@ class SeriesParams:
     directory: str
     prefix: str
     ext: str
+    wavelengths: List[float] = field(default_factory=list)   # пусто — на текущей длине волны
+    start_at: Optional[_dt.datetime] = None                  # None — сразу
+    beep: bool = True
+
+
+def parse_wavelengths(text: str) -> List[float]:
+    """«546.07; 585,25 640.2» → [546.07, 585.25, 640.2] (разделители — ; пробел, запятая между числами)."""
+    import re
+    vals = []
+    for tok in re.split(r"[;\s]+", text.strip()):
+        if not tok:
+            continue
+        for part in re.split(r",(?=\s|$)", tok):
+            if part:
+                vals.append(float(part.replace(",", ".")))
+    return vals
 
 
 class SeriesDialog(QtWidgets.QDialog):
@@ -60,6 +77,27 @@ class SeriesDialog(QtWidgets.QDialog):
         self.interval.setSuffix(" с")
         self.interval.setToolTip("Пауза между началами спектров (0 — без пауз)")
         form.addRow("Интервал:", self.interval)
+        self.wls = QtWidgets.QLineEdit()
+        self.wls.setPlaceholderText("пусто — на текущей длине волны")
+        self.wls.setToolTip("Список длин волн через пробел или «;» (например: 546.07; 585.25; 640.2). "
+                            "На каждой снимается серия из указанного количества спектров.")
+        form.addRow("Длины волн, нм:", self.wls)
+        start_row = QtWidgets.QHBoxLayout()
+        self.delayed = QtWidgets.QCheckBox("начать в")
+        self.start_time = QtWidgets.QTimeEdit(QtCore.QTime.currentTime().addSecs(600))
+        self.start_time.setDisplayFormat("HH:mm")
+        self.start_time.setEnabled(False)
+        self.delayed.toggled.connect(self.start_time.setEnabled)
+        start_row.addWidget(self.delayed)
+        start_row.addWidget(self.start_time)
+        start_row.addStretch(1)
+        w = QtWidgets.QWidget()
+        w.setLayout(start_row)
+        start_row.setContentsMargins(0, 0, 0, 0)
+        form.addRow("Старт:", w)
+        self.beep = QtWidgets.QCheckBox("звуковой сигнал по окончании")
+        self.beep.setChecked(True)
+        form.addRow(self.beep)
         self.save = QtWidgets.QCheckBox("сохранять каждый спектр")
         self.save.setChecked(settings.autosave_series)
         form.addRow(self.save)
@@ -81,11 +119,28 @@ class SeriesDialog(QtWidgets.QDialog):
         if self.save.isChecked() and not self.dir.text().strip():
             QtWidgets.QMessageBox.warning(self, "Серия", "Укажите папку для сохранения")
             return
+        try:
+            wls = parse_wavelengths(self.wls.text())
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "Серия", "Не удалось прочитать список длин волн")
+            return
+        if any(not (0 < w < 3000) for w in wls):
+            QtWidgets.QMessageBox.warning(self, "Серия", "Длины волн должны быть в пределах 0…3000 нм")
+            return
         self.accept()
+
+    def start_at(self) -> Optional[_dt.datetime]:
+        if not self.delayed.isChecked():
+            return None
+        t = self.start_time.time()
+        now = _dt.datetime.now()
+        when = now.replace(hour=t.hour(), minute=t.minute(), second=0, microsecond=0)
+        return when if when > now else when + _dt.timedelta(days=1)
 
     def params(self) -> SeriesParams:
         return SeriesParams(self.count.value(), self.interval.value(), self.save.isChecked(),
-                            self.dir.text().strip(), self.prefix.text().strip() or "series", self.ext.currentData())
+                            self.dir.text().strip(), self.prefix.text().strip() or "series", self.ext.currentData(),
+                            parse_wavelengths(self.wls.text()), self.start_at(), self.beep.isChecked())
 
 
 # ----------------------------------------------------------------- панорама
@@ -96,10 +151,12 @@ class PanoramaParams:
     end: float
     overlap: float
     return_back: bool
+    trim: int = 0
+    equalize: bool = False
 
 
 class PanoramaDialog(QtWidgets.QDialog):
-    def __init__(self, start: float, end: float, plan_fn: Callable[[float, float, float], List[float]], parent=None):
+    def __init__(self, start: float, end: float, plan_fn: Callable[..., List[float]], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Панорамный спектр")
         self.plan_fn = plan_fn
@@ -120,6 +177,16 @@ class PanoramaDialog(QtWidgets.QDialog):
         self.overlap.setValue(15)
         self.overlap.setSuffix(" %")
         form.addRow("Перекрытие:", self.overlap)
+        self.trim = QtWidgets.QSpinBox()
+        self.trim.setRange(0, 400)
+        self.trim.setSuffix(" пикс.")
+        self.trim.setToolTip("Не использовать столько пикселей с каждого края кадра (там хуже фокусировка "
+                             "и меньше света) — как «Used range» в SpectraSP")
+        form.addRow("Обрезать края:", self.trim)
+        self.equalize = QtWidgets.QCheckBox("выравнивать уровни в перекрытиях")
+        self.equalize.setToolTip("Каждый следующий участок умножается на множитель, при котором совпадают "
+                                 "суммы в общей области (как «Equalization» в SpectraSP)")
+        form.addRow(self.equalize)
         self.back = QtWidgets.QCheckBox("после съёмки вернуть исходную длину волны")
         self.back.setChecked(True)
         form.addRow(self.back)
@@ -130,20 +197,21 @@ class PanoramaDialog(QtWidgets.QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         form.addRow(bb)
-        for w in (self.start, self.end, self.overlap):
+        for w in (self.start, self.end, self.overlap, self.trim):
             w.valueChanged.connect(self._update_plan)
         self._update_plan()
 
     def _update_plan(self) -> None:
         try:
-            plan = self.plan_fn(self.start.value(), self.end.value(), self.overlap.value() / 100)
+            plan = self.plan_fn(self.start.value(), self.end.value(), self.overlap.value() / 100, self.trim.value())
             self.plan.setText(f"Положений: {len(plan)}: " + ", ".join(f"{c:.1f}" for c in plan[:12]) +
                               (" …" if len(plan) > 12 else "") + " нм")
         except Exception as e:  # noqa: BLE001
             self.plan.setText(f"Нельзя рассчитать: {e}")
 
     def params(self) -> PanoramaParams:
-        return PanoramaParams(self.start.value(), self.end.value(), self.overlap.value() / 100, self.back.isChecked())
+        return PanoramaParams(self.start.value(), self.end.value(), self.overlap.value() / 100, self.back.isChecked(),
+                              self.trim.value(), self.equalize.isChecked())
 
 
 # ----------------------------------------------------------------- калибровка

@@ -3,10 +3,12 @@ import os
 import threading
 import time
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 QtWidgets = pytest.importorskip("PyQt5.QtWidgets")
+from PyQt5 import QtCore  # noqa: E402
 
 from spectra_better.config import AppSettings  # noqa: E402
 from spectra_better.hw.base import CameraState  # noqa: E402
@@ -212,3 +214,258 @@ def test_setpoint_change_stops_live_and_blocks_until_reached(win, app):
     win.inst.camera_state()
     win._update_actions()
     assert win.act_snap.isEnabled()
+
+
+def test_shutter_button_shows_confirmed_state(win, app):
+    btn = win.mono_panel.btn_shutter
+    win._refresh_mono_misc()
+    pump(app, 0.5)
+    assert btn.text().startswith("открыта")
+    btn.click()                                              # закрыть
+    t0 = time.monotonic()
+    while win._shutter_task and time.monotonic() - t0 < 10:
+        pump(app, 0.05)
+    assert btn.text().startswith("закрыта") and not btn.isChecked()
+    # шторку открыли в штатном окне DevCtrl — опрос показывает это на кнопке
+    win.inst.mono.shutter_open = True
+    for _ in range(2):
+        win._poll()
+        pump(app, 0.3)
+    assert btn.text().startswith("открыта") and btn.isChecked()
+
+
+def test_shutter_mode_selector(win, app):
+    panel = win.mono_panel
+    assert panel.shutter_mode.isEnabled() and panel.shutter_mode.currentData() is False
+    panel.shutter_mode.setCurrentIndex(1)
+    panel.shutter_mode.activated.emit(1)                     # «по экспозиции»
+    t0 = time.monotonic()
+    while (win._shutter_task or not win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
+        pump(app, 0.05)
+    assert win.inst.shutter_ttl and not panel.btn_shutter.isEnabled()
+    assert "время кадра" in panel.btn_shutter.text()
+    win._update_actions()                                    # общая разблокировка панели не включает кнопку
+    assert not panel.btn_shutter.isEnabled()
+    panel.shutter_mode.setCurrentIndex(0)
+    panel.shutter_mode.activated.emit(0)
+    t0 = time.monotonic()
+    while (win._shutter_task or win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
+        pump(app, 0.05)
+    pump(app, 0.5)
+    assert not win.inst.shutter_ttl and panel.btn_shutter.isEnabled()
+
+
+def _snap(win, app):
+    win.snap()
+    t0 = time.monotonic()
+    while win._acquiring() and time.monotonic() - t0 < 20:
+        pump(app, 0.05)
+    pump(app, 0.2)
+
+
+def test_spectrum_buffer_in_window(win, app):
+    bp = win.buffer_panel
+    win.clear_overlays()
+    _snap(win, app)
+    win.act_pin.trigger()                                    # «В буфер»
+    assert len(win.buffer) == 1 and bp.list.count() == 1
+    key = win.buffer.entries[0].key
+    assert key in win.plot.overlays and win.plot.overlays[key].isVisible()
+    bp.list.item(0).setCheckState(QtCore.Qt.Unchecked)       # снять отметку — спектр уходит с графика
+    assert key not in win.plot.overlays
+    bp.list.item(0).setText("эталон")                        # переименование
+    assert win.buffer.entries[0].name == "эталон"
+    bp.auto.setChecked(True)                                 # каждый снимок — в буфер
+    _snap(win, app)
+    assert len(win.buffer) == 2 and win.s.buffer_auto
+    win.live()                                               # кадры непрерывной съёмки — нет
+    pump(app, 0.8)
+    win.stop()
+    t0 = time.monotonic()
+    while win._acquiring() and time.monotonic() - t0 < 20:
+        pump(app, 0.05)
+    assert len(win.buffer) == 2
+    win.buffer_to_current(key)                               # «сделать текущим»
+    assert win.current is win.buffer.get(key).m
+    win.buffer.save_state(win._buffer_path())                # переживает перезапуск
+    from spectra_better.buffer import SpectrumBuffer
+    again = SpectrumBuffer()
+    assert again.load_state(win._buffer_path()) == 2 and again.entries[0].name == "эталон"
+
+
+def test_stripes_in_window(win, app, monkeypatch):
+    from spectra_better.gui import main_window as mw
+    win.inst.camera.fibers = [(150, 3, 1.0), (350, 3, 0.4)]
+    win.inst.camera._update_temp = lambda: None
+    win.s.warm_up_on_close = False
+
+    class FakeDlg:
+        def __init__(self, stripes, height, img, estimate, parent):
+            self.est = estimate([(140, 160), (340, 360)])
+
+        def exec_(self):
+            return QtWidgets.QDialog.Accepted
+
+        def stripes(self):
+            return [(140, 160), (340, 360)]
+    monkeypatch.setattr(mw, "StripesDialog", FakeDlg)
+    win.edit_stripes()
+    assert win.inst.stripes() == [(140, 160), (340, 360)]
+    assert not win.acq_panel.hw_bin.isEnabled() and "2 полосы" in win.acq_panel.stripes_info.text()
+    assert len(win.image.extra_regions) == 1                  # вторая полоса нарисована на кадре
+    _snap(win, app)
+    assert win.current.n_tracks == 2 and len(win.plot.track_curves) == 1
+    win.clear_overlays()
+    win.pin_current()                                        # в буфер — обе полосы
+    assert [e.name.split("·")[-1].strip() for e in win.buffer.entries] == ["полоса 1 (140–160)",
+                                                                            "полоса 2 (340–360)"]
+    win.image.extra_regions[0].setRegion((300, 321))          # перетащили вторую полосу
+    win.image._region_changed()
+    assert win.inst.stripes()[1] == (300, 320)
+    win.inst.set_stripes([(140, 160)])
+    win._acq_settings_changed()
+    assert win.image.extra_regions == [] and win.acq_panel.hw_bin.isEnabled()
+
+
+def test_corrections_panel_reflects_settings(win, app):
+    p = win.proc_panel
+    assert not p.defects.isEnabled() and not p.intensity.isEnabled()      # пустые списки — выключено
+    win.s.defect_pixels = [10, 20]
+    win.s.intensity_corr_points = [[400, 1.0], [800, 2.0]]
+    win.s.intensity_corr = True
+    p.load_corrections()
+    assert p.defects.isChecked() and "(2)" in p.defects.text()
+    assert p.intensity.isChecked() and "2 точ." in p.intensity.text()
+    p.intensity.setChecked(False)
+    assert not win.s.intensity_corr
+
+
+def test_band_integration_and_history(win, app, tmp_path):
+    win.inst.camera._update_temp = lambda: None
+    win.s.warm_up_on_close = False
+    win.s.bands = []
+    win.goto_wavelength(546.0)
+    pump(app, 1.0)
+    _snap(win, app)
+    win.add_band()
+    assert len(win.s.bands) == 1 and win.s.bands[0]["unit"] == "nm"
+    win.s.bands[0].update(lo=545.5, hi=546.6)                 # вокруг линии ртути 546.07 нм
+    win._redraw()
+    res = win._band_results(win.current)[0]
+    assert res is not None and res.net > 1000 and abs(res.centroid - 546.07) < 0.15
+    assert win.plot.band_items[0].isVisible()
+    assert win.bands_panel.table.item(0, 3).text() not in ("", "—")
+    win.plot.band_items[0].setRegion((545.0, 547.0))          # перетащили на графике
+    win.plot._band_changed(0)
+    assert win.s.bands[0]["lo"] == pytest.approx(545.0) and win.s.bands[0]["hi"] == pytest.approx(547.0)
+    win.band_history.clear()
+    for _ in range(3):
+        _snap(win, app)
+    t, v = win.band_history.series(0, "net")
+    assert len(v) == 3 and np.all(v > 0)
+    path = tmp_path / "h.csv"
+    win.band_history.save_csv(str(path), "nm")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("time;seconds;band1_net") and len(lines) == 4
+    win.show_band_history()
+    assert "снимков: 3" in win._hist_win.info.text()
+    win._hist_win.close()
+
+
+def test_calculator_difference_into_buffer(win, app):
+    win.inst.camera._update_temp = lambda: None
+    win.s.warm_up_on_close = False
+    win.clear_overlays()
+    win.goto_wavelength(546.0)                                # линии ртути — есть пики
+    pump(app, 1.0)
+    _snap(win, app)
+    win.pin_current()
+    win.calculator()
+    c = win._calc
+    c.a.setCurrentIndex(0)                                    # текущий
+    c.b.setCurrentIndex(1)                                    # он же из буфера
+    c.op.setCurrentIndex(c.op.findData("sub"))
+    m = c.calculate()
+    assert m is not None and np.nanmax(np.abs(m.y)) < 1e-9     # разность с самим собой — ноль
+    assert len(win.buffer) == 2 and "−" in win.buffer.entries[-1].name
+    assert win.buffer.entries[-1].props["formula"].startswith("[Текущий спектр] −")
+    c.op.setCurrentIndex(c.op.findData("norm_max"))
+    m = c.calculate()
+    assert np.nanmax(m.y) == pytest.approx(1.0)
+    win.bands_from_peaks()
+    assert 1 <= len(win.s.bands) <= win.MAX_BANDS
+    c.close()
+
+
+def test_export_plot_png_svg(win, app, tmp_path, monkeypatch):
+    _snap(win, app)
+    QFD = QtWidgets.QFileDialog
+    for name in ("g.png", "g.svg"):
+        target = str(tmp_path / name)
+        monkeypatch.setattr(QFD, "getSaveFileName", staticmethod(lambda *a, **k: (target, "")))
+        win.export_plot()
+        assert os.path.getsize(target) > 1000
+    assert (tmp_path / "g.png").read_bytes()[:4] == b"\x89PNG"
+    assert b"<svg" in (tmp_path / "g.svg").read_bytes()[:2000]
+
+
+def test_series_over_wavelength_list(win, app, monkeypatch, tmp_path):
+    from spectra_better.gui import dialogs as dl
+    from spectra_better.gui import main_window as mw
+    assert dl.parse_wavelengths("546.07; 585,25 640.2") == [546.07, 585.25, 640.2]
+    assert dl.parse_wavelengths("") == []
+    win.inst.camera._update_temp = lambda: None
+    win.s.warm_up_on_close = False
+
+    class FakeDlg:
+        def __init__(self, s, parent):
+            pass
+
+        def exec_(self):
+            return QtWidgets.QDialog.Accepted
+
+        def params(self):
+            return dl.SeriesParams(2, 0.0, True, str(tmp_path), "ser", ".txt", [550.0, 560.0], None, True)
+    monkeypatch.setattr(mw, "SeriesDialog", FakeDlg)
+    beeps = []
+    monkeypatch.setattr(QtWidgets.QApplication, "beep", staticmethod(lambda: beeps.append(1)))
+    win.series()
+    t0 = time.monotonic()
+    while (win._acquiring() or not beeps) and time.monotonic() - t0 < 30:
+        pump(app, 0.05)
+    names = sorted(p.name for p in tmp_path.glob("ser_*.txt"))
+    assert len(names) == 4 and sum("550nm" in n for n in names) == 2 and sum("560nm" in n for n in names) == 2
+    assert win.inst.mono_wl == pytest.approx(560.0) and beeps
+
+
+def test_open_frame_and_restripe(win, app, tmp_path):
+    from spectra_better.storage import save_image
+    rows = np.arange(506)[:, None]
+    img = 300 + 1000 * np.exp(-0.5 * ((rows - 100) / 3) ** 2) + np.zeros((1, 2048))
+    p = str(tmp_path / "frame.npy")
+    save_image(p, img)
+    win.inst.set_stripes([(90, 110)])
+    win.open_frame(p)
+    m = win.current
+    assert m.source_file == p and m.image.shape == (506, 2048)
+    assert m.y.max() == pytest.approx(img[90:111].sum(axis=0).max())
+    win.inst.set_stripes([(90, 110), (300, 320)])            # добавили полосу — спектры пересчитаны
+    win._refresh_file_frame()
+    assert win.current.n_tracks == 2 and win.current.track(1).max() < 21 * 400
+
+
+def test_buffer_waterfall_offset(win, app):
+    win.clear_overlays()
+    _snap(win, app)
+    win.pin_current()
+    win.pin_current()
+    k1, k2 = (e.key for e in win.buffer.entries)
+    win.buffer_panel.offset.setValue(1000)
+    assert win.s.buffer_offset == 1000
+    y0 = win.buffer.get(k1).m.y
+    assert np.allclose(win.plot.overlays[k1].yData, y0 + 1000)
+    assert np.allclose(win.plot.overlays[k2].yData, y0 + 2000)
+    win.buffer_panel._auto_offset()
+    assert win.buffer_panel.offset.value() > 0
+    win.buffer_panel.offset.setValue(0)
+    assert np.allclose(win.plot.overlays[k2].yData, y0)

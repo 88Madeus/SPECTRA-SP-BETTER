@@ -179,6 +179,7 @@ SYNC_OUT_SPECTRASP = {0: "EXP polar negative", 1: "EXP polar positive", 2: "PRED
                       3: "POST DELAY polar negative", 4: "EXTERNAL SYNCH 0", 5: "LOGICAL 1", 6: "LOGICAL 0",
                       7: "SOFT START SCAN"}
 SYNC_LOGICAL_1, SYNC_LOGICAL_0 = 5, 6
+SYNC_EXPOSURE_MODES = (0, 1)      # выход выдаёт импульс на время экспозиции (им можно открывать шторку)
 
 
 class Camera(abc.ABC):
@@ -244,6 +245,7 @@ class MonoInfo:
     slits: List[str] = field(default_factory=list)          # названия, индекс = номер щели SSPL
     mirror_positions: List[str] = field(default_factory=list)
     has_shutter: bool = True
+    shutter_ttl: bool = False      # шторку можно перевести на внешний TTL (сигнал экспозиции камеры)
     wl_range: Tuple[float, float] = (0.0, 0.0)
     # предельные положения шаговых двигателей (MaxMayStepCount из MSxxxx.cfg): (механизм, номер) -> шаги
     step_limits: Dict[Tuple[str, int], int] = field(default_factory=dict)
@@ -308,6 +310,11 @@ class Monochromator(abc.ABC):
 
     @abc.abstractmethod
     def set_shutter(self, is_open: bool, index: int = 0) -> None: ...
+
+    def set_shutter_ttl(self, on: bool, index: int = 0) -> None:
+        """Шторка по экспозиции: True — её открывает внешний TTL-сигнал (выход синхронизации
+        камеры), False — ручное управление (кнопки «Internal»/«TTL» штатного окна DevCtrl)."""
+        raise DeviceError("Управление шторкой по TTL не поддерживается")
 
     @abc.abstractmethod
     def pixel_wavelengths(self, center_wl: float, center_pixel: float,
