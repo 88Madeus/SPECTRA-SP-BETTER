@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from PyQt5 import QtCore, QtWidgets
 
@@ -21,11 +21,15 @@ log = logging.getLogger(__name__)
 
 
 class MonoServiceDialog(QtWidgets.QDialog):
-    def __init__(self, inst, tasks: TaskRunner, on_changed: Callable[[], None], parent=None):
+    def __init__(self, inst, tasks: TaskRunner, on_changed: Callable[[], None], parent=None,
+                 on_command: Optional[Callable[[bool], None]] = None):
         super().__init__(parent)
         self.inst = inst
+        self.mono = inst.mono                  # для какого прибора построено окно (щели, зеркало, механизмы)
         self.tasks = tasks
         self.on_changed = on_changed
+        self.on_command = on_command or (lambda running: None)   # команда началась/закончилась — для главного окна
+        self.command_running = False
         self._busy = False
         self._lock_reason = ""
         self.setWindowTitle("Сервис монохроматора")
@@ -199,10 +203,13 @@ class MonoServiceDialog(QtWidgets.QDialog):
         self.info.setText(f"<b>{mi.model or 'Монохроматор'}</b> № {mi.serial or '—'} (тип {mi.device_type}), "
                           f"{self.inst.mono_address() or 'адрес —'}")
 
+    def _lock_text(self) -> str:
+        return f"Управление заблокировано: {self._lock_reason}" if self._lock_reason else ""
+
     def _set_busy(self, busy: bool, text: str = "") -> None:
         self._busy = busy
         self._apply_enabled()
-        self.status.setText(text if busy else (self._lock_reason and f"Управление заблокировано: {self._lock_reason}"))
+        self.status.setText(text if busy else self._lock_text())
 
     def _apply_enabled(self) -> None:
         on = not self._busy and not self._lock_reason
@@ -220,7 +227,7 @@ class MonoServiceDialog(QtWidgets.QDialog):
         self._lock_reason = reason
         self._apply_enabled()
         if not self._busy:
-            self.status.setText(f"Управление заблокировано: {reason}" if reason else "")
+            self.status.setText(self._lock_text())
 
     def _relative(self, mech: str, index: int, name: str, delta: int, limit: int) -> None:
         if delta == 0:
@@ -237,20 +244,28 @@ class MonoServiceDialog(QtWidgets.QDialog):
         if self._busy or self._lock_reason:
             return
         self._set_busy(True, "Выполняется: " + text)
+        self._command(True)
 
         def done(_):
+            self._command(False)
             self._set_busy(False)
             if refresh:
                 self.refresh()
             self.on_changed()
 
         def fail(e):
+            self._command(False)
             self._set_busy(False)
             log.error("Сервис монохроматора: %s", e)
             QtWidgets.QMessageBox.warning(self, "Сервис монохроматора", str(e))
             if refresh:
                 self.refresh()
         self.tasks.run(fn, done, fail, "mono-service")
+
+    def _command(self, running: bool) -> None:
+        """Пока отсюда выполняется команда, панель «Монохроматор» главного окна заблокирована (и наоборот)."""
+        self.command_running = running
+        self.on_command(running)
 
     def _confirm_run(self, question: str, text: str, fn) -> None:
         r = QtWidgets.QMessageBox.question(self, "Сервис монохроматора", question)
@@ -325,7 +340,8 @@ class MonoServiceDialog(QtWidgets.QDialog):
             lbl.setText("—" if value is None else f"{value}")
             if value is not None:
                 abs_sp.setValue(value)
-        self.status.setText("Идёт движение" if snap.get("busy") else "")
+        # причину блокировки (например, команда с панели «Монохроматор») не затираем
+        self.status.setText("\n".join(t for t in ("Идёт движение" if snap.get("busy") else "", self._lock_text()) if t))
 
     def closeEvent(self, event) -> None:
         self.on_changed()

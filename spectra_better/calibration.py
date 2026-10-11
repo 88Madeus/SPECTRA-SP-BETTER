@@ -143,13 +143,19 @@ class WavelengthAxis:
             return self._cache, ("px" if s.mode == MODE_PIXELS or center_wl is None else "nm")
         pixels = np.arange(n_pixels, dtype=float)
         wl = None
+        # шкалу по запасной модели, посчитанную потому, что прибор был занят или не ответил, не
+        # запоминаем: иначе она осталась бы вместо модели прибора до следующего перехода
+        cacheable = True
         if s.mode != MODE_PIXELS and center_wl:
+            if s.mode == MODE_DEVICE:
+                cacheable = device_model is not None
             if s.mode == MODE_DEVICE and device_model is not None:
                 try:
                     wl = device_model(center_wl, s.center_pixel, s.device_pixel_width, n_pixels)
                     self.source = "модель прибора" if wl is not None else ""
                 except Exception:  # noqa: BLE001 — переходим к запасной модели
                     wl = None
+                    cacheable = False
             if wl is None and s.mode in (MODE_DEVICE, MODE_MODEL) and grating in self.geometries:
                 try:
                     wl = self.geometries[grating].wavelengths(center_wl, s.center_pixel, s.pixel_um, n_pixels)
@@ -167,7 +173,8 @@ class WavelengthAxis:
             self.source = "пиксели"
         else:
             x, unit = np.asarray(wl, dtype=float), "nm"
-        self._cache_key, self._cache = key, x
+        if cacheable:
+            self._cache_key, self._cache = key, x
         return x, unit
 
 

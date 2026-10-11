@@ -44,6 +44,7 @@ def win(app, spectrasp_dir, monkeypatch, tmp_path):
     w._closing = True
     w.poll_timer.stop()
     w.inst.shutdown()
+    w.release_graphics()
     w.deleteLater()
 
 
@@ -223,7 +224,7 @@ def test_shutter_button_shows_confirmed_state(win, app):
     assert btn.text().startswith("открыта")
     btn.click()                                              # закрыть
     t0 = time.monotonic()
-    while win._shutter_task and time.monotonic() - t0 < 10:
+    while win._mono_moving and time.monotonic() - t0 < 10:
         pump(app, 0.05)
     assert btn.text().startswith("закрыта") and not btn.isChecked()
     # шторку открыли в штатном окне DevCtrl — опрос показывает это на кнопке
@@ -240,7 +241,7 @@ def test_shutter_mode_selector(win, app):
     panel.shutter_mode.setCurrentIndex(1)
     panel.shutter_mode.activated.emit(1)                     # «по экспозиции»
     t0 = time.monotonic()
-    while (win._shutter_task or not win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
+    while (win._mono_moving or not win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
         pump(app, 0.05)
     assert win.inst.shutter_ttl and not panel.btn_shutter.isEnabled()
     assert "время кадра" in panel.btn_shutter.text()
@@ -249,7 +250,7 @@ def test_shutter_mode_selector(win, app):
     panel.shutter_mode.setCurrentIndex(0)
     panel.shutter_mode.activated.emit(0)
     t0 = time.monotonic()
-    while (win._shutter_task or win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
+    while (win._mono_moving or win.inst.shutter_ttl) and time.monotonic() - t0 < 10:
         pump(app, 0.05)
     pump(app, 0.5)
     assert not win.inst.shutter_ttl and panel.btn_shutter.isEnabled()
@@ -485,6 +486,7 @@ def test_corrupt_buffer_file_does_not_block_start(app, spectrasp_dir, tmp_path):
         w._closing = True
         w.poll_timer.stop()
         w.inst.shutdown()
+        w.release_graphics()
         w.deleteLater()
 
 

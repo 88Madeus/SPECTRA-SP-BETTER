@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as _dt
 import logging
 import math
@@ -148,6 +149,13 @@ class Instrument:
         self._shutter_warned = False
         self.cooling_target: Optional[int] = None    # уставка, заданная в этом сеансе (None — выкл./неизвестна)
         self._temp_hist: deque = deque(maxlen=400)   # (время, температура ПЗС) — для «уставка недостижима»
+        # команды, меняющие свет на ПЗС (движение монохроматора, шторка, лазер и выходы синхронизации):
+        # кадр не снимается, пока такая команда выполняется, а кадр, во время которого она началась,
+        # снимается заново — иначе в спектре смесь двух состояний под подписью одного из них
+        self._light = threading.Condition()
+        self._light_busy: Dict[int, str] = {}        # выполняющиеся команды: номер → что делается
+        self._light_gen = 0                          # растёт при начале и конце каждой такой команды
+        self._light_seq = 0
         self._state_time = 0.0
         self._bg_temps: Dict[tuple, float] = {}      # температура ПЗС при съёмке фона
         self.axis = WavelengthAxis(settings.calibration, {})
@@ -211,6 +219,50 @@ class Instrument:
             dc = self.setup.devctrl
             return f"{dc.address} ({dc.interface_text})" if dc.address else ""
         return ""
+
+    # ================================================================ свет на ПЗС
+    @contextmanager
+    def changing_light(self, what: str):
+        """Отметить команду, меняющую свет на ПЗС (см. _wait_light_steady)."""
+        with self._light:
+            self._light_seq += 1
+            key = self._light_seq
+            self._light_busy[key] = what
+            self._light_gen += 1
+        try:
+            yield
+        finally:
+            with self._light:
+                del self._light_busy[key]
+                self._light_gen += 1
+                self._light.notify_all()
+
+    def light_changing(self) -> str:
+        """Что сейчас меняет свет на ПЗС ("" — ничего)."""
+        with self._light:
+            return next(iter(self._light_busy.values()), "")
+
+    def _wait_light_steady(self, progress: Optional[ProgressFn] = None) -> int:
+        """Дождаться конца команд, меняющих свет на ПЗС; вернуть номер установившегося состояния."""
+        limit = self.settings.mono_timeout_s + 60
+        t0 = time.monotonic()
+        told = False
+        with self._light:
+            while self._light_busy:
+                if self._abort.is_set():
+                    raise DeviceError("Остановлено пользователем")
+                if time.monotonic() - t0 > limit:
+                    raise DeviceError(f"Не дождались окончания команды монохроматора ({self.light_changing()}) "
+                                      f"за {limit:.0f} с — съёмка не начата")
+                if progress and not told:
+                    progress(0, 0, f"ожидание: {next(iter(self._light_busy.values()))}")
+                    told = True
+                self._light.wait(0.2)
+            return self._light_gen
+
+    def _light_changed_since(self, gen: int) -> bool:
+        with self._light:
+            return bool(self._light_busy) or self._light_gen != gen
 
     # ================================================================ подключение
     def _make_devices(self) -> None:
@@ -501,10 +553,14 @@ class Instrument:
             if region.bin_y > info.max_bin_y:
                 region = spectrum_region(info.width, info.height, s.rows_top, s.rows_bottom, False)
         speed = s.readout_speed or (info.readout_speeds[0] if info.readout_speeds else 0)
-        sync = tuple(m if m in SYNC_OUT_MODES else -1 for m in (s.sync_out1, s.sync_out2))
+        sync = self._sync_modes()
         # в камеру уходит не любое число: не меньше её минимума и с точностью формата PSI
         exposure = camera_exposure_us(s.exposure_ms * 1000, info.min_exposure)
         return AcqSettings(exposure_us=exposure, readout_speed=speed, regions=(region,), sync_out=sync)
+
+    def _sync_modes(self) -> Tuple[int, int]:
+        s = self.settings
+        return tuple(m if m in SYNC_OUT_MODES else -1 for m in (s.sync_out1, s.sync_out2))
 
     # ---------------------------------------------------------------- выходы синхронизации, лазер
     def laser_modes(self) -> Tuple[int, int]:
@@ -523,9 +579,11 @@ class Instrument:
         if mode not in SYNC_OUT_MODES:
             raise DeviceError(f"Недопустимый режим выхода синхронизации: {mode}")
         self._require_camera()
-        setattr(self.settings, f"sync_out{n}", int(mode))
-        log.info("Камера: выход синхронизации %d — %s", n, SYNC_OUT_MODES[mode])
-        self.cam_thread.call(self.camera.configure, self.acq_settings(), timeout=self.settings.frame_timeout_s + 60)
+        with self.changing_light(f"выход синхронизации {n}"):
+            setattr(self.settings, f"sync_out{n}", int(mode))
+            log.info("Камера: выход синхронизации %d — %s", n, SYNC_OUT_MODES[mode])
+            self.cam_thread.call(self.camera.configure, self.acq_settings(),
+                                 timeout=self.settings.frame_timeout_s + 60)
 
     @property
     def laser_on(self) -> bool:
@@ -549,6 +607,9 @@ class Instrument:
 
     def _frame(self, acq: AcqSettings) -> np.ndarray:
         """Один кадр с контролем времени: при зависании — прерывание."""
+        # выходы синхронизации — текущие, а не на момент начала съёмки: иначе лазер, включённый или
+        # выключенный между кадрами накопления, следующий кадр вернул бы в прежнее состояние
+        acq = dataclasses.replace(acq, sync_out=self._sync_modes())
         self.cam_thread.call(self.camera.configure, acq, timeout=60)
         limit = self.expected_frame_time(acq) + self.settings.frame_timeout_s
         fut = self.cam_thread.submit(self.camera.acquire, label="acquire")
@@ -651,6 +712,8 @@ class Instrument:
             raise DeviceError(f"Идёт изменение температуры камеры ({why}). Съёмка будет доступна, "
                               "когда температура установится.")
         self._abort.clear()
+        # шторку для фона трогаем и состояние прибора читаем, только когда закончились команды монохроматора
+        self._wait_light_steady(progress)
         # всё, что можно поменять в интерфейсе во время непрерывной съёмки (перетащить полосу,
         # сменить режим, развернуть спектр), фиксируется на всю съёмку: кадр, полосы и фон
         # должны соответствовать друг другу
@@ -699,16 +762,29 @@ class Instrument:
                     raise DeviceError(f"Шторка не закрылась, фон не снят: {e}. Закройте вход вручную и "
                                       "снимите фон без шторки (Обработка → «закрывать шторку при съёмке "
                                       "фона»).") from e
-            for i in range(n):
+            gen = None
+            while len(spectra) < n:
                 if self._abort.is_set():
                     raise DeviceError("Остановлено пользователем")
+                g = self._wait_light_steady(progress)
+                if g != gen:
+                    if spectra:
+                        log.info("Во время накопления менялись монохроматор, шторка или лазер — "
+                                 "накопление начато заново")
+                        spectra, sat = [], False
+                    gen = g
                 if progress:
-                    progress(i, n, "фон" if background else "экспозиция")
-                frame = self._frame(acq)
-                if flip:
-                    frame = frame[:, ::-1]
+                    progress(len(spectra), n, "фон" if background else "экспозиция")
+                f = self._frame(acq)
+                if self._light_changed_since(gen):
+                    log.info("Во время кадра менялись монохроматор, шторка или лазер — кадр снимается заново")
+                    continue
+                frame = f[:, ::-1] if flip else f
                 sat = sat or P.saturated(frame)
                 spectra.append(self._frame_to_tracks(frame, acq, stripes, image_mode))
+            # состояние монохроматора — то, при котором сняты кадры (а не после следующей команды)
+            with self._lock:
+                wl, gr, slit = self.mono_wl, self.mono_grating, self.mono_slit
         finally:
             if ttl_restore:
                 try:
@@ -751,7 +827,7 @@ class Instrument:
             if bg is not None and bg.shape == raw.shape:
                 y = raw - bg * (n if mode == "sum" else 1)
                 bg_used = True
-        x, unit = self.wavelength_axis(raw.shape[-1])
+        x, unit = self.wavelength_axis(raw.shape[-1], (wl, gr))
         corrected = ""
         if s.intensity_corr and not background:
             y, corrected = self._intensity_correct(y, x, unit)
@@ -763,9 +839,7 @@ class Instrument:
                         exposure_ms=acq.exposure_us / 1000.0, accumulations=n, accumulate_mode=mode,
                         acq_mode=ACQ_IMAGE if image_mode else s.acq_mode, rows=stripes[0],
                         hardware_binning=acq.regions[0].bin_y > 1,
-                        center_wl=self.mono_wl, grating=self.mono_grating,
-                        grating_title=self.grating_title(self.mono_grating),
-                        slit_um=self.mono_slit,
+                        center_wl=wl, grating=gr, grating_title=self.grating_title(gr), slit_um=slit,
                         temperature=self.last_state.temperature if self.last_state else None,
                         duration_s=time.monotonic() - t0, calibration_source=self.axis.source,
                         is_background=background, label=label)
@@ -778,10 +852,16 @@ class Instrument:
             return self._bg_images.get(self._bg_key(self.acq_settings()))
 
     # ================================================================ шкала
-    def wavelength_axis(self, n_pixels: int) -> Tuple[np.ndarray, str]:
-        with self._lock:
-            wl, gr = self.mono_wl, self.mono_grating
-        use_device = self.mono_connected and self.mono_thread.busy_for == 0
+    def wavelength_axis(self, n_pixels: int, state: Optional[Tuple[Optional[float], Optional[int]]] = None
+                        ) -> Tuple[np.ndarray, str]:
+        """Шкала для (длина волны, решётка) — по умолчанию для текущего состояния монохроматора."""
+        if state is None:
+            with self._lock:
+                state = (self.mono_wl, self.mono_grating)
+        wl, gr = state
+        # модель прибора считается в его потоке; пока монохроматор выполняет долгую команду, ждать её
+        # нельзя — тогда запасная модель (WavelengthAxis не запоминает её вместо модели прибора)
+        use_device = self.mono_connected and not self.light_changing()
         return self.axis.axis(n_pixels, wl, gr, self.device_model if use_device else None)
 
     def device_model(self, center: float, center_px: float, px_width: float, n: int):
@@ -861,16 +941,18 @@ class Instrument:
         self._require_mono(control=True)
         self._check_wavelength(float(wl))
         t = self.settings.mono_timeout_s
-        self.mono_thread.call(self.mono.set_wavelength, float(wl), True, t, timeout=t + 30)
-        self.refresh_mono()
+        with self.changing_light(f"переход на {float(wl):g} нм"):
+            self.mono_thread.call(self.mono.set_wavelength, float(wl), True, t, timeout=t + 30)
+            self.refresh_mono()
         return self.mono_wl
 
     def set_grating(self, index: int) -> None:
         self._require_mono(control=True)
         self._check_grating(int(index))
         t = self.settings.mono_timeout_s
-        self.mono_thread.call(self.mono.set_grating, int(index), True, t, timeout=t + 30)
-        self.refresh_mono()
+        with self.changing_light("смена решётки"):
+            self.mono_thread.call(self.mono.set_grating, int(index), True, t, timeout=t + 30)
+            self.refresh_mono()
 
     def set_slit(self, index: int, width_um: float) -> float:
         """Установить ширину щели и дождаться окончания движения (DevCtrl выполняет команду
@@ -883,11 +965,13 @@ class Instrument:
             self.mono.set_slit(int(index), float(width_um))
             self.mono.wait_idle(t)
             return self.mono.get_slit(int(index))
-        w = self.mono_thread.call(work, timeout=t + 30)
+        with self.changing_light(f"щель {int(index) + 1}"):
+            w = self.mono_thread.call(work, timeout=t + 30)
+            if index == 0:
+                with self._lock:
+                    self.mono_slit = w
         if abs(w - float(width_um)) > max(1.0, 0.01 * float(width_um)):
             log.warning("Щель %d: запрошено %.1f мкм, прибор сообщает %.1f мкм", index + 1, width_um, w)
-        if index == 0:
-            self.mono_slit = w
         return w
 
     def get_slit(self, index: int) -> float:
@@ -904,7 +988,8 @@ class Instrument:
             self.mono.set_mirror(index, int(position))
             self.mono.wait_idle(t)
             return self.mono.get_mirror(index)
-        got = self.mono_thread.call(work, timeout=t + 30)
+        with self.changing_light("выходное зеркало"):
+            got = self.mono_thread.call(work, timeout=t + 30)
         if got != int(position):
             raise DeviceError(f"Зеркало не переключилось: прибор сообщает положение {got} вместо {position}")
 
@@ -917,7 +1002,8 @@ class Instrument:
         if self.shutter_ttl:
             raise DeviceError("Шторка работает по экспозиции (TTL) — чтобы открыть или закрыть её вручную, "
                               "переключите режим шторки на «вручную»")
-        self._shutter_to(is_open)
+        with self.changing_light("шторка"):
+            self._shutter_to(is_open)
 
     def set_shutter_ttl(self, on: bool) -> None:
         """Шторка по экспозиции: открывается импульсом с выхода синхронизации камеры только на время
@@ -926,7 +1012,8 @@ class Instrument:
         if not (self.mono.info.has_shutter and self.mono.info.shutter_ttl):
             raise DeviceError("Шторка этого монохроматора не управляется по TTL (в MS*.cfg нет TTL=1)")
         on = bool(on)
-        self.mono_thread.call(self.mono.set_shutter_ttl, on, 0, timeout=60)
+        with self.changing_light("режим шторки"):
+            self.mono_thread.call(self.mono.set_shutter_ttl, on, 0, timeout=60)
         self.shutter_ttl = on
         self.settings.shutter_ttl = on
         self.shutter_state = None
@@ -1035,7 +1122,9 @@ class Instrument:
         self._require_mono(control=True)
         self._check_steps(mech, int(index), int(position))
         t = self.settings.mono_timeout_s
-        self.mono_thread.call(self.mono.set_steps, mech, int(index), int(position), t, timeout=t + 30)
+        with self.changing_light(f"{MECH_TITLES.get(mech, mech)}: перемещение"):
+            self.mono_thread.call(self.mono.set_steps, mech, int(index), int(position), t, timeout=t + 30)
+            self._refresh_after_service()
 
     def service_move_steps(self, mech: str, index: int, delta: int) -> None:
         self._require_mono(control=True)
@@ -1044,12 +1133,23 @@ class Instrument:
         def work():          # положение читается и проверяется в потоке прибора непосредственно перед движением
             self._check_steps(mech, int(index), self.mono.get_steps(mech, int(index)) + int(delta))
             self.mono.move_steps(mech, int(index), int(delta), t)
-        self.mono_thread.call(work, timeout=t + 30)
+        with self.changing_light(f"{MECH_TITLES.get(mech, mech)}: сдвиг"):
+            self.mono_thread.call(work, timeout=t + 30)
+            self._refresh_after_service()
 
     def service_reset(self, mech: str, index: int) -> None:
         self._require_mono(control=True)
         t = self.settings.mono_timeout_s
-        self.mono_thread.call(self.mono.reset, mech, int(index), t, timeout=t + 30)
+        with self.changing_light(f"{MECH_TITLES.get(mech, mech)}: сброс"):
+            self.mono_thread.call(self.mono.reset, mech, int(index), t, timeout=t + 30)
+            self._refresh_after_service()
+
+    def _refresh_after_service(self) -> None:
+        """После сервисной команды длина волны и щель могли измениться — перечитать до следующего кадра."""
+        try:
+            self.refresh_mono()
+        except DeviceError as e:
+            log.warning("Состояние монохроматора после сервисной команды не прочитано: %s", e)
 
     def show_native_window(self) -> None:
         """Штатное окно DevCtrl (выполняется в потоке монохроматора — там живут окна драйвера)."""
