@@ -21,6 +21,19 @@ from .instrument import Measurement
 log = logging.getLogger(__name__)
 
 MAX_ENTRIES = 300          # спектр — десятки килобайт; ограничение защищает от «забытой» непрерывной съёмки
+# кадр ПЗС (режим «Изображение») — 2 МБ, поэтому кадры хранятся только у последних MAX_FRAMES снимков,
+# у более старых остаётся спектр
+MAX_FRAMES = 20
+
+
+def _compact(img: np.ndarray) -> np.ndarray:
+    """Кадр — в uint16 (как его отдаёт камера), если значения это позволяют; иначе float32."""
+    a = np.asarray(img)
+    if a.dtype == np.uint16:
+        return np.ascontiguousarray(a)
+    if a.size and np.all(np.isfinite(a)) and a.min() >= 0 and a.max() <= 65535 and np.all(a == np.round(a)):
+        return a.astype(np.uint16)
+    return np.ascontiguousarray(a, dtype=np.float32)
 
 
 @dataclass
@@ -56,6 +69,8 @@ class SpectrumBuffer:
     def __init__(self) -> None:
         self.entries: List[BufferEntry] = []
         self._seq = 0
+        self._img_src = None          # последний добавленный кадр и его компактная копия: у полос одного
+        self._img = None              # снимка кадр общий — храним его один раз
 
     # ---------------------------------------------------------------- состав
     def __len__(self) -> int:
@@ -63,9 +78,14 @@ class SpectrumBuffer:
 
     def add(self, m: Measurement, name: Optional[str] = None, visible: bool = True,
             props: Optional[Dict[str, str]] = None) -> BufferEntry:
-        """Положить спектр в буфер. Кадр изображения не хранится (он большой) — только спектр."""
+        """Положить спектр в буфер (с кадром ПЗС, если он есть — см. MAX_FRAMES)."""
         self._seq += 1
-        m = dataclasses.replace(m, image=None)
+        img = None
+        if m.image is not None:
+            if m.image is not self._img_src:
+                self._img_src, self._img = m.image, _compact(m.image)
+            img = self._img
+        m = dataclasses.replace(m, image=img)
         if props is None:
             props = {k: str(v) for k, v in m.meta().items()}
         e = BufferEntry(f"b{self._seq}", name or self.default_name(m), m, visible, props)
@@ -73,7 +93,20 @@ class SpectrumBuffer:
         while len(self.entries) > MAX_ENTRIES:
             old = self.entries.pop(0)
             log.warning("Буфер спектров полон (%d) — удалён самый старый спектр «%s»", MAX_ENTRIES, old.name)
+        self._trim_frames()
         return e
+
+    def _trim_frames(self) -> None:
+        """Оставить кадры ПЗС только у последних MAX_FRAMES снимков (полосы одного снимка — один кадр)."""
+        seen = []
+        for e in reversed(self.entries):
+            img = e.m.image
+            if img is None:
+                continue
+            if not any(img is k for k in seen):
+                seen.append(img)
+            if len(seen) > MAX_FRAMES:
+                e.m.image = None
 
     @staticmethod
     def default_name(m: Measurement) -> str:
@@ -119,7 +152,8 @@ class SpectrumBuffer:
         if e is None:
             return []
         rows = [("Название", e.name), ("Точек", str(e.m.y.size)),
-                ("Ось X", "длина волны, нм" if e.m.x_unit == "nm" else "пиксели")]
+                ("Ось X", "длина волны, нм" if e.m.x_unit == "nm" else "пиксели"),
+                ("Кадр ПЗС", "есть — двойной щелчок покажет его" if e.m.image is not None else "нет")]
         for k, title in PROP_TITLES.items():
             if k in e.props and e.props[k] not in ("", "None"):
                 v = e.props[k]
@@ -143,11 +177,20 @@ class SpectrumBuffer:
             return
         arrays: Dict[str, np.ndarray] = {}
         index = []
+        images: List[np.ndarray] = []                 # общий кадр полос одного снимка — один раз
         for i, e in enumerate(self.entries):
             arrays[f"x{i}"] = np.asarray(e.m.x, dtype=float)
             arrays[f"y{i}"] = np.asarray(e.m.y, dtype=float)
             arrays[f"raw{i}"] = np.asarray(e.m.raw, dtype=float)
+            img_ref = -1
+            if e.m.image is not None:
+                img_ref = next((j for j, a in enumerate(images) if a is e.m.image), -1)
+                if img_ref < 0:
+                    images.append(e.m.image)
+                    img_ref = len(images) - 1
+                    arrays[f"img{img_ref}"] = e.m.image
             index.append({
+                "image": img_ref,
                 "name": e.name, "visible": e.visible, "props": e.props, "x_unit": e.m.x_unit,
                 "stitched": e.m.stitched, "center_wl": e.m.center_wl, "exposure_ms": e.m.exposure_ms,
                 "accumulations": e.m.accumulations, "background_used": e.m.background_used,
@@ -164,7 +207,11 @@ class SpectrumBuffer:
             return 0
         with np.load(path, allow_pickle=False) as z:
             index = json.loads(str(z["index"]))
+            images: Dict[int, np.ndarray] = {}
             for i, d in enumerate(index):
+                ref = int(d.get("image", -1) if isinstance(d.get("image", -1), (int, float)) else -1)
+                if ref >= 0 and ref not in images and f"img{ref}" in z.files:
+                    images[ref] = z[f"img{ref}"]
                 try:
                     ts = _dt.datetime.fromisoformat(d.get("timestamp", ""))
                 except ValueError:
@@ -173,6 +220,7 @@ class SpectrumBuffer:
                                 exposure_ms=float(d.get("exposure_ms") or 0), center_wl=d.get("center_wl"),
                                 accumulations=int(d.get("accumulations") or 1),
                                 background_used=bool(d.get("background_used")), timestamp=ts,
-                                label=d.get("label", ""), stitched=bool(d.get("stitched")))
+                                label=d.get("label", ""), stitched=bool(d.get("stitched")),
+                                image=images.get(ref), acq_mode="image" if ref in images else "spectrum")
                 self.add(m, d.get("name"), bool(d.get("visible", True)), dict(d.get("props") or {}))
         return len(index)

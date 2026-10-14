@@ -288,22 +288,41 @@ class LinearityResult:
     t0_ms: float                 # «лишнее» время: сигнал ≈ rate·(t + t0); < 0 — шторка открывается с опозданием
     deviation: List[float]       # S/(rate·(t + t0)) − 1 по каждой точке (NaN — не использована)
     min_ok_ms: float             # наименьшая экспозиция, с которой отклонение от пропорциональности ≤ tol
+    t0_err_ms: float = float("nan")   # погрешность t0 (1σ) — по шуму точек
 
 
 def linearity_fit(exposures_ms: Sequence[float], signals: Sequence[float], fit_from_ms: float = 20.0,
-                  tol: float = 0.05) -> LinearityResult:
+                  tol: float = 0.05, sigmas: Optional[Sequence[float]] = None) -> LinearityResult:
     """Подогнать S = rate·(t + t0) по экспозициям ≥ fit_from_ms и найти, с какой экспозиции сигнал
-    пропорционален t (без поправки t0) с точностью tol. Нужны хотя бы две точки для подгонки."""
+    пропорционален t (без поправки t0) с точностью tol. Нужны хотя бы две точки для подгонки.
+    sigmas — шум каждой точки (из разброса кадров); без них веса — по дробовому шуму."""
     t = np.asarray(exposures_ms, dtype=np.float64)
     sig = np.asarray(signals, dtype=np.float64)
     use = (t >= fit_from_ms) & np.isfinite(sig)
     if use.sum() < 2:
         raise ValueError("Мало точек для подгонки (нужны экспозиции от 20 мс и без насыщения)")
-    # дробовой шум ∝ √S: без весов длинные экспозиции «перетягивают» подгонку и t0 выходит шумным
-    a, b = np.polyfit(t[use], sig[use], 1, w=1.0 / np.sqrt(np.maximum(sig[use], 1.0)))
+    if sigmas is not None:
+        err = np.asarray(sigmas, dtype=np.float64)[use]
+        floor = np.nanmedian(err) if np.isfinite(err).any() else 1.0
+        err = np.where(np.isfinite(err) & (err > 0), err, max(floor, 1e-9))
+        err = np.maximum(err, 0.1 * max(floor, 1e-9))      # три кадра могут случайно совпасть
+    else:
+        # дробовой шум ∝ √S: без весов длинные экспозиции «перетягивают» подгонку и t0 выходит шумным
+        err = np.sqrt(np.maximum(sig[use], 1.0))
+    a, b = np.polyfit(t[use], sig[use], 1, w=1.0 / err)
     if a <= 0:
         raise ValueError("Сигнал не растёт с экспозицией — свет не попадает на ПЗС?")
     t0 = b / a
+    t0_err = float("nan")
+    if sigmas is not None:
+        # ковариация коэффициентов взвешенного МНК с абсолютными погрешностями точек
+        A = np.vstack([t[use], np.ones(int(use.sum()))]).T / err[:, None]
+        try:
+            C = np.linalg.inv(A.T @ A)
+            g = np.array([-b / a ** 2, 1.0 / a])           # ∂t0/∂a, ∂t0/∂b
+            t0_err = float(np.sqrt(max(0.0, g @ C @ g)))
+        except np.linalg.LinAlgError:
+            pass
     with np.errstate(divide="ignore", invalid="ignore"):
         dev_prop = sig / (a * t) - 1                        # насколько S отличается от пропорционального rate·t
     dev = [float(d) if np.isfinite(d) else float("nan") for d in sig / (a * (t + t0)) - 1]
@@ -315,7 +334,7 @@ def linearity_fit(exposures_ms: Sequence[float], signals: Sequence[float], fit_f
             good_from = ti
         else:
             break
-    return LinearityResult(float(a), float(t0), dev, good_from)
+    return LinearityResult(float(a), float(t0), dev, good_from, t0_err)
 
 
 # ---------------------------------------------------------------- интегрирование в полосе

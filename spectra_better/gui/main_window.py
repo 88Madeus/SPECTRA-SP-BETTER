@@ -10,6 +10,7 @@ import time
 from typing import Callable, Optional
 
 import numpy as np
+import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .. import APP_NAME, __version__
@@ -1190,7 +1191,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_mono_view()   # серия и панорама сами переставляют монохроматор
         if m.is_background:
             self.background = m
-            log.info("Фон снят: %d кадр(ов) по %.0f мс, среднее %.1f отсч.", m.accumulations, m.exposure_ms,
+            log.info("Фон снят: %d кадр(ов) по %g мс, среднее %.1f отсч.", m.accumulations, m.exposure_ms,
                      float(np.mean(m.raw)))
             self._update_bg_status()
             self._redraw()
@@ -1208,6 +1209,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if m.image is not None:
             self._image_meas = m
             self.image.set_image(m.image)
+            self.image.set_note("")
+        elif self._image_meas is not None:
+            self.image.set_note(f"Кадр ПЗС от {self._image_meas.timestamp:%H:%M:%S}: в режиме «Спектр» кадр "
+                                "не снимается (камера передаёт только строки полосы)")
         self._redraw()
         if m.saturated:
             self.lbl_meas.setText("<b style='color:#b00020'>НАСЫЩЕНИЕ!</b> уменьшите экспозицию")
@@ -1524,6 +1529,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Во время съёмки текущим остаётся снятый спектр — остановите съёмку", 5000)
             return
         self.current = e.m
+        if e.m.image is not None:
+            self._image_meas = e.m
+            self.image._first = True
+            self.image.set_image(e.m.image)
+            self.image.set_note(f"Кадр из буфера: {e.name}")
+        elif self._image_meas is not None:
+            self.image.set_note(f"У спектра «{e.name}» нет кадра ПЗС (снят в режиме «Спектр» или кадр уже "
+                                f"вытеснен из буфера) — показан кадр от {self._image_meas.timestamp:%H:%M:%S}")
         self._redraw()
         self.lbl_meas.setText(f"Из буфера: {e.name}")
         self._update_actions()
@@ -1619,6 +1632,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._image_meas = m
         self.image._first = True
         self.image.set_image(img)
+        self.image.set_note(f"Кадр из файла: {os.path.basename(path)}")
         self.tabs.setCurrentIndex(1)
         self._redraw()
         self._update_actions()
@@ -1877,13 +1891,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ================================================================ закрытие
     def release_graphics(self) -> None:
-        """Закрыть графики pyqtgraph: он держит их в общем списке, и окно, созданное следом в том же
-        процессе (так бывает в тестах), обращалось бы к меню графиков уже удалённого окна."""
-        for close in (self.image.view.close, self.plot.plot.close):
-            try:
-                close()
-            except Exception as e:  # noqa: BLE001 — при выходе не мешаем закрытию
-                log.debug("Закрытие графика: %s", e)
+        """Убрать графики окна из общих списков pyqtgraph: он помнит все ViewBox процесса, и окно,
+        созданное следом (так бывает в тестах), обращалось бы к меню графиков уже удалённого окна.
+        Сами графики не закрываем: ImageView.close() очищает сцену, и pyqtgraph посреди этого
+        обращается к уже удалённому изображению (ошибка при выходе, замеченная в лаборатории)."""
+        for gv in self.findChildren(pg.GraphicsView):
+            scene = gv.scene()
+            for item in scene.items() if scene is not None else []:
+                if isinstance(item, pg.ViewBox):
+                    pg.ViewBox.AllViews.pop(item, None)
+                    if item.name is not None and pg.ViewBox.NamedViews.get(item.name) is item:
+                        pg.ViewBox.NamedViews.pop(item.name, None)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self._closing:
@@ -1911,9 +1929,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._closing = True
             self.poll_timer.stop()
             self._stop_warm_up()
+            log.info("Выход: отключение приборов")
             dlg, cancel = self._shutdown_dialog()
             self.tasks.run(lambda: self.inst.shutdown(say=dlg.text_changed.emit, cancel_warm_up=cancel),
-                           lambda _: (dlg.finish(), self.close()),
+                           lambda _: (log.info("Приборы отключены, программа закрывается"), dlg.finish(),
+                                      self.close()),
                            lambda e: (dlg.finish(), self.close()), "shutdown")
             event.ignore()
             return

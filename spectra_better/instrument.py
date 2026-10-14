@@ -40,6 +40,10 @@ ProgressFn = Callable[[int, int, str], None]
 # или если она не меняется TEMP_STALL_S секунд (уставка недостижима — не блокировать навсегда).
 TEMP_TOLERANCE_C = 1.0
 TEMP_STALL_S = 120.0
+# После выхода на уставку регулятор камеры «гуляет» на 1–2 °C (так на приборе: съёмка то запрещалась,
+# то разрешалась несколько раз в минуту). Поэтому, однажды установившись, температура снова считается
+# «меняющейся», только если ушла от уставки дальше TEMP_LOST_C — регулирование действительно потеряно.
+TEMP_LOST_C = 3.0
 # фон, снятый при другой температуре, не вычитается (темновой ток ~×2 на каждые 6–7 °C)
 BG_TEMP_TOLERANCE_C = 2.0
 # DevCtrl выполняет OpenShutter/CloseShutter асинхронно: команда уходит в очередь, а состояние
@@ -153,6 +157,7 @@ class Instrument:
         self._shutter_warned = False
         self.cooling_target: Optional[int] = None    # уставка, заданная в этом сеансе (None — выкл./неизвестна)
         self._temp_hist: deque = deque(maxlen=400)   # (время, температура ПЗС) — для «уставка недостижима»
+        self._temp_settled = False                   # ПЗС уже выходила на текущую уставку (см. TEMP_LOST_C)
         # команды, меняющие свет на ПЗС (движение монохроматора, шторка, лазер и выходы синхронизации):
         # кадр не снимается, пока такая команда выполняется, а кадр, во время которого она началась,
         # снимается заново — иначе в спектре смесь двух состояний под подписью одного из них
@@ -193,13 +198,8 @@ class Instrument:
             s.save_dir = st.main.last_dir
         if s.rows_top < 0 and st.stripe:
             s.rows_top, s.rows_bottom = st.stripe
-        if st.sensor and not s.calibration_imported and not self.simulate:
-            c = s.calibration
-            if st.sensor.calib_center_pixel > 0:
-                c.center_pixel = st.sensor.calib_center_pixel
-            if st.sensor.calib_pixel_width > 0:
-                c.device_pixel_width = st.sensor.calib_pixel_width
-            s.calibration_imported = True
+        if st.sensor and not self.simulate:
+            self._follow_spectrasp_calibration(st.sensor)
         if st.sensor and st.sensor.readout_speed > 0 and not s.readout_speed:
             s.readout_speed = st.sensor.readout_speed
         if st.sensor and st.sensor.exposure_us > 0 and s.exposure_ms <= 0:
@@ -210,6 +210,38 @@ class Instrument:
             for n, mode in enumerate(st.sensor.sync_out, start=1):
                 if getattr(s, f"sync_out{n}") < 0 and mode in SYNC_OUT_MODES:
                     setattr(s, f"sync_out{n}", mode)
+
+    def _follow_spectrasp_calibration(self, sensor) -> None:
+        """Центральный пиксель и ширина пикселя модели прибора — как в SpectraSP.
+
+        Раньше они переносились один раз, при первом запуске; если калибровку потом меняли в SpectraSP,
+        программа рисовала шкалу по старой (так было на приборе: 469 / 8 мкм в программе при 1071 / 12 мкм
+        в SpectraSP). Теперь изменения в SpectraSP подхватываются, если в программе калибровку не меняли
+        вручную; если меняли — остаётся заданная в программе, а в журнал пишется предупреждение."""
+        s, c = self.settings, self.settings.calibration
+        cur = [float(sensor.calib_center_pixel), float(sensor.calib_pixel_width)]
+        if cur[0] <= 0 or cur[1] <= 0:
+            return
+        mine = [float(c.center_pixel), float(c.device_pixel_width)]
+        if not s.calibration_imported:
+            prev = None
+        else:
+            # в настройках прежних версий не записано, что было взято из SpectraSP: считаем, что текущее
+            prev = list(s.calibration_spectrasp) if len(s.calibration_spectrasp) == 2 else mine
+        if prev is None or (cur != prev and mine == prev):
+            if prev is not None:
+                log.warning("Калибровка в SpectraSP изменилась: центральный пиксель %g → %g, ширина пикселя "
+                            "%g → %g мкм — шкала программы обновлена", prev[0], cur[0], prev[1], cur[1])
+            else:
+                log.info("Калибровка шкалы из SpectraSP: центральный пиксель %g, ширина пикселя %g мкм", *cur)
+            c.center_pixel, c.device_pixel_width = cur
+            self.axis.invalidate()
+        elif cur != prev:
+            log.warning("Калибровка в SpectraSP (центральный пиксель %g, ширина %g мкм) отличается от заданной "
+                        "в программе (%g, %g мкм) — оставлена заданная в программе («Настройка → Калибровка "
+                        "шкалы»)", cur[0], cur[1], mine[0], mine[1])
+        s.calibration_imported = True
+        s.calibration_spectrasp = cur
 
     def camera_ip(self) -> str:
         if self.settings.camera_ip_override:
@@ -487,6 +519,7 @@ class Instrument:
         self.cam_thread.call(self.camera.set_cooling, enabled, int(target_c))
         self.cooling_target = int(target_c) if enabled else None
         self._temp_hist.clear()                    # отсчёт «температура не меняется» — с новой уставки
+        self._temp_settled = False
 
     def temperature_changing(self) -> str:
         """Почему сейчас нельзя снимать из-за температуры ПЗС ("" — можно)."""
@@ -494,7 +527,15 @@ class Instrument:
         if not self.camera_connected or target is None or st is None or st.temperature is None:
             return ""
         t = float(st.temperature)
-        if abs(t - target) <= TEMP_TOLERANCE_C:
+        dev = abs(t - target)
+        if self._temp_settled:
+            if dev <= TEMP_LOST_C:
+                return ""
+            self._temp_settled = False
+            log.warning("Температура ПЗС ушла от уставки: %+.0f °C при уставке %+d °C — съёмка приостановлена",
+                        t, target)
+        if dev <= TEMP_TOLERANCE_C:
+            self._temp_settled = True
             return ""
         now = time.monotonic()
         recent = [T for ts, T in self._temp_hist if now - ts <= TEMP_STALL_S]
@@ -506,8 +547,11 @@ class Instrument:
     def temperature_stalled(self) -> bool:
         """Уставка задана, но недостижима (температура стоит, а до уставки далеко)."""
         st, target = self.last_state, self.cooling_target
-        return (self.camera_connected and target is not None and st is not None and st.temperature is not None
-                and abs(float(st.temperature) - target) > TEMP_TOLERANCE_C and not self.temperature_changing())
+        if not (self.camera_connected and target is not None and st is not None and st.temperature is not None):
+            return False
+        if self.temperature_changing() or self._temp_settled:     # уставка достигнута — колебания не в счёт
+            return False
+        return abs(float(st.temperature) - target) > TEMP_TOLERANCE_C
 
     def _require_camera(self) -> None:
         if not self.camera_connected:
