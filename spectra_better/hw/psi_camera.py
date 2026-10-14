@@ -219,6 +219,10 @@ class PsiCamera(Camera):
 
     def set_cooling(self, enabled: bool, target_c: int) -> None:
         self._require_open()
+        # после SetCoolingOn/Off драйвер сбрасывает настройку съёмки: следующий StartWaitMeasure
+        # отвечал «DLL not inited» (код −3900), пока параметры не переданы заново (так было на приборе;
+        # SpectraSP передавала их перед каждым кадром и этого не замечала)
+        self._applied = None
         if enabled:
             t = int(max(self.info.temp_min, min(self.info.temp_max, target_c)))
             self._check(self._f["psiccd2_SetCoolingOn"](self._h, t), "включения охлаждения")
@@ -278,8 +282,10 @@ class PsiCamera(Camera):
         n_pixels = rows * cols
         frames = ctypes.c_int32(1)
         frame_size = ctypes.c_int32(n_pixels)
-        self._check(self._f["psiccd2_StartWaitMeasure"](self._h, ctypes.byref(frames), ctypes.byref(frame_size)),
-                    "экспозиции")
+        rc = self._f["psiccd2_StartWaitMeasure"](self._h, ctypes.byref(frames), ctypes.byref(frame_size))
+        if rc != 0:
+            self._applied = None           # что бы ни сбросил драйвер, к следующему кадру параметры уйдут заново
+            self._check(rc, "экспозиции")
         # Драйвер сообщает размер кадра в байтах (16 бит на пиксель) и копирует
         # в буфер ровно столько. Буфер берём с запасом, чтобы при расхождении
         # областей не испортить память, а само расхождение считаем ошибкой.

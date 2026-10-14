@@ -208,6 +208,9 @@ class Camera(abc.ABC):
     def configure(self, settings: AcqSettings) -> None:
         """Передать параметры в камеру (только если они изменились)."""
 
+    def invalidate(self) -> None:
+        """Забыть переданные параметры: следующий configure() передаст их заново."""
+
     @property
     def sync_out(self) -> Tuple[int, int]:
         """Текущие режимы выходов синхронизации 1 и 2 (−1 — неизвестно)."""

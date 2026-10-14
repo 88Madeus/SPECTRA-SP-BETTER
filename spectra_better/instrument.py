@@ -49,6 +49,10 @@ SHUTTER_CONFIRM_S = 6.0
 SHUTTER_SETTLE_S = 0.3
 
 
+class FrameTimeout(DeviceError):
+    """Кадр не пришёл в срок и был прерван (такой кадр не повторяется автоматически)."""
+
+
 @dataclass
 class Measurement:
     x: np.ndarray
@@ -610,6 +614,19 @@ class Instrument:
         # выходы синхронизации — текущие, а не на момент начала съёмки: иначе лазер, включённый или
         # выключенный между кадрами накопления, следующий кадр вернул бы в прежнее состояние
         acq = dataclasses.replace(acq, sync_out=self._sync_modes())
+        try:
+            return self._frame_once(acq)
+        except DeviceError as e:
+            if self._abort.is_set() or self.camera_stuck or isinstance(e, FrameTimeout):
+                raise
+            # камера отказалась снимать (например, «DLL not inited» после смены уставки охлаждения):
+            # передаём параметры заново и пробуем ещё раз — один раз
+            log.warning("Кадр не снят (%s) — параметры переданы в камеру заново, повтор", e)
+            self.cam_thread.call(self.camera.invalidate, timeout=10)
+            return self._frame_once(acq)
+
+    def _frame_once(self, acq: AcqSettings) -> np.ndarray:
+        """Передать параметры (если изменились) и снять кадр; зависший кадр прерывается."""
         self.cam_thread.call(self.camera.configure, acq, timeout=60)
         limit = self.expected_frame_time(acq) + self.settings.frame_timeout_s
         fut = self.cam_thread.submit(self.camera.acquire, label="acquire")
@@ -628,7 +645,7 @@ class Instrument:
                 raise DeviceError("Камера не отвечает (экспозиция не завершилась). "
                                   "Проверьте питание и сеть камеры, затем переподключитесь.") from None
             except DeviceError:
-                raise DeviceError(f"Кадр не получен за {limit:.0f} с, экспозиция прервана") from None
+                raise FrameTimeout(f"Кадр не получен за {limit:.0f} с, экспозиция прервана") from None
 
     def abort(self) -> None:
         """Прервать текущую экспозицию и серию."""
