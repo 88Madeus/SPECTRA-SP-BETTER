@@ -190,7 +190,7 @@ class SpectrumBuffer:
                     img_ref = len(images) - 1
                     arrays[f"img{img_ref}"] = e.m.image
             index.append({
-                "image": img_ref,
+                "image": img_ref, "image_top": int(e.m.image_top), "acq_mode": e.m.acq_mode,
                 "name": e.name, "visible": e.visible, "props": e.props, "x_unit": e.m.x_unit,
                 "stitched": e.m.stitched, "center_wl": e.m.center_wl, "exposure_ms": e.m.exposure_ms,
                 "accumulations": e.m.accumulations, "background_used": e.m.background_used,
@@ -221,6 +221,7 @@ class SpectrumBuffer:
                                 accumulations=int(d.get("accumulations") or 1),
                                 background_used=bool(d.get("background_used")), timestamp=ts,
                                 label=d.get("label", ""), stitched=bool(d.get("stitched")),
-                                image=images.get(ref), acq_mode="image" if ref in images else "spectrum")
+                                image=images.get(ref), image_top=int(d.get("image_top") or 0),
+                                acq_mode=str(d.get("acq_mode") or ("image" if ref in images else "spectrum")))
                 self.add(m, d.get("name"), bool(d.get("visible", True)), dict(d.get("props") or {}))
         return len(index)

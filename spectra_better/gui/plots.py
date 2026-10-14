@@ -633,6 +633,7 @@ class ImagePanel(QtWidgets.QWidget):
         self.labels: List[pg.TextItem] = []
         self._movable = True
         self._first = True
+        self._top, self._shape = 0, None
         self._suppress = False
         self.set_x_scale(AxisMap(None), X_PX, 0)
 
@@ -653,17 +654,33 @@ class ImagePanel(QtWidgets.QWidget):
             self.top_axis.set_mapping(None)
             self.plot_item.showAxis("top", False)
 
-    def set_image(self, image: np.ndarray) -> None:
+    def set_image(self, image: np.ndarray, top: int = 0) -> None:
+        """Кадр (строки × столбцы); top — строка ПЗС первой строки кадра (изображение полосы — не с 0)."""
         # ImageView ожидает (x, y): транспонируем, чтобы столбцы ПЗС шли по горизонтали
         img = np.asarray(image, dtype=np.float32).T
-        if self._first:
+        top = int(top)
+        first = self._first or top != self._top or img.shape != self._shape
+        if first:
             # уровни по процентилям, а не по мин./макс.: одна космическая частица
             # иначе «растягивает» шкалу, и весь кадр выглядит чёрным
             lo, hi = (float(v) for v in np.percentile(img, (0.5, 99.95)))
-            self.view.setImage(img, autoLevels=False, levels=(lo, max(hi, lo + 1)), autoRange=True)
+            self.view.setImage(img, autoLevels=False, levels=(lo, max(hi, lo + 1)), autoRange=True, pos=(0, top))
         else:
-            self.view.setImage(img, autoLevels=False, autoRange=False)
+            self.view.setImage(img, autoLevels=False, autoRange=False, pos=(0, top))
         self._first = False
+        self._top, self._shape = top, img.shape
+
+    def render_rgb(self) -> Optional[np.ndarray]:
+        """Показанный кадр «как на экране»: палитра и уровни из окна, пиксель в пиксель
+        (строки × столбцы × 3, uint8; строка 0 — сверху, как на экране)."""
+        item = self.view.getImageItem()
+        data = item.image
+        if data is None:
+            return None
+        lo, hi = (float(v) for v in item.getLevels())
+        lut = np.asarray(self.view.ui.histogram.gradient.getLookupTable(256, alpha=False), dtype=np.uint8)[:, :3]
+        idx = np.clip((np.asarray(data, dtype=np.float64).T - lo) / max(hi - lo, 1e-12) * 255.0, 0, 255)
+        return lut[idx.astype(np.uint8)]
 
     def set_note(self, text: str) -> None:
         """Пометка над кадром — например, что кадр относится не к текущему спектру ("" — убрать)."""

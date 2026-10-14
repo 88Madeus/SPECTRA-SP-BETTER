@@ -23,8 +23,8 @@ from ..buffer import SpectrumBuffer
 from ..instrument import Instrument, Measurement
 from ..reference_lines import nearest_line
 from ..storage import load_image, load_spectrum, save_image, save_spectrum, unique_path
-from ..units import (X_DECIMALS, X_EV, X_NM, X_PX, X_RAMAN, X_SHORT, X_UNITS, X_WAVENUMBER, AxisMap, from_nm,
-                     is_spectral)
+from ..units import (X_DECIMALS, X_EV, X_NM, X_PX, X_RAMAN, X_SHORT, X_UNITS, X_WAVENUMBER, AxisMap, axis_label,
+                     from_nm, is_spectral)
 from .bands import BandHistory, BandsHistoryWindow, BandsPanel
 from .calculator import CalculatorDialog
 from .buffer_panel import BufferPanel, entry_color
@@ -34,6 +34,7 @@ from .icons import gear_icon
 from .log_widget import LogView, QtLogHandler
 from .panels import AcquisitionPanel, CameraPanel, MonoPanel, ProcessingPanel
 from .plots import ImagePanel, SpectrumPlot
+from .rows_panel import RowsPanel
 from .tasks import Emitter, TaskRunner
 
 log = logging.getLogger(__name__)
@@ -92,6 +93,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._temp_block = ""             # почему съёмка недоступна из-за температуры ПЗС ("" — доступна)
         self._poll_ticks = 0
         self._image_meas: Optional[Measurement] = None   # измерение, из которого показан кадр ПЗС
+        self._rows_unit = X_PX                            # единицы оси на вкладке «Строки ПЗС»
 
         title = f"{APP_NAME} {__version__}" + ("  [ИМИТАЦИЯ]" if simulate else "")
         self.setWindowTitle(title)
@@ -206,8 +208,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs = QtWidgets.QTabWidget()
         self.plot = SpectrumPlot(self.s)
         self.image = ImagePanel()
+        self.rows_panel = RowsPanel()
         self.tabs.addTab(self.plot, "Спектр")
         self.tabs.addTab(self.image, "Изображение ПЗС")
+        self.tabs.addTab(self.rows_panel, "Строки ПЗС")
+        self.tabs.setTabToolTip(2, "Спектр каждой строки кадра и их среднее (режим «Изображение» или полоса "
+                                   "без аппаратного объединения строк)")
         self.setCentralWidget(self.tabs)
 
         # слева — управление
@@ -334,6 +340,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cam_panel.sync_out.connect(self.set_sync_out)
         self.acq_panel.changed.connect(self._acq_settings_changed)
         self.image.stripes_changed.connect(self._stripes_dragged)
+        self.tabs.currentChanged.connect(lambda _: self._update_rows_tab())
+        self.rows_panel.save_requested.connect(self.save_rows)
         self.acq_panel.stripes_requested.connect(self.edit_stripes)
         self.act_stripes.triggered.connect(self.edit_stripes)
         self.proc_panel.defects_requested.connect(self.edit_defects)
@@ -1208,11 +1216,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.buffer_panel.select(added[-1].key)
         if m.image is not None:
             self._image_meas = m
-            self.image.set_image(m.image)
-            self.image.set_note("")
+            self.image.set_image(m.image, m.image_top)
+            self.image.set_note(self._frame_note(m))
         elif self._image_meas is not None:
-            self.image.set_note(f"Кадр ПЗС от {self._image_meas.timestamp:%H:%M:%S}: в режиме «Спектр» кадр "
-                                "не снимается (камера передаёт только строки полосы)")
+            self.image.set_note(f"Показан кадр ПЗС от {self._image_meas.timestamp:%H:%M:%S}. "
+                                + self.NO_ROWS_HW_BIN)
         self._redraw()
         if m.saturated:
             self.lbl_meas.setText("<b style='color:#b00020'>НАСЫЩЕНИЕ!</b> уменьшите экспозицию")
@@ -1254,6 +1262,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plot.set_info(*self._coverage_text(ref, amap, unit))
         self.plot.refresh_view()
         self._update_image_scale()
+        self._update_rows_tab()
 
     def _update_peaks(self, x: np.ndarray, y: np.ndarray, amap: AxisMap, unit: str) -> None:
         self.peaks_table.setRowCount(0)
@@ -1413,7 +1422,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         cam = self.inst.camera
         height = cam.info.height if cam is not None and cam.info.height else 506
-        img = self._image_meas.image if self._image_meas is not None else None
+        img = None
+        im = self._image_meas
+        if im is not None and im.image is not None:
+            img = np.asarray(im.image, dtype=float)
+            top = int(im.image_top)
+            if top or img.shape[0] != height:              # изображение полосы — на своих строках ПЗС
+                full = np.full((height, img.shape[1]), float(np.median(img)))
+                part = img[:max(0, height - top)]
+                full[top:top + part.shape[0]] = part
+                img = full
 
         def estimate(stripes):
             if not self.inst.camera_connected:
@@ -1532,8 +1550,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if e.m.image is not None:
             self._image_meas = e.m
             self.image._first = True
-            self.image.set_image(e.m.image)
-            self.image.set_note(f"Кадр из буфера: {e.name}")
+            self.image.set_image(e.m.image, e.m.image_top)
+            self.image.set_note(f"Кадр из буфера: {e.name}. {self._frame_note(e.m)}".strip())
         elif self._image_meas is not None:
             self.image.set_note(f"У спектра «{e.name}» нет кадра ПЗС (снят в режиме «Спектр» или кадр уже "
                                 f"вытеснен из буфера) — показан кадр от {self._image_meas.timestamp:%H:%M:%S}")
@@ -1616,7 +1634,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
                 self, "Открыть кадр ПЗС", self.s.save_dir or "",
-                "Кадры (*.npy *.txt *.csv *.tif *.tiff);;Все файлы (*)")
+                "Кадры (*.npy *.tif *.tiff *.png *.txt *.csv);;Все файлы (*)")
             if not path:
                 return
         try:
@@ -1624,14 +1642,18 @@ class MainWindow(QtWidgets.QMainWindow):
         except (OSError, ValueError) as e:
             self._error("Открытие кадра", e)
             return
+        try:
+            first_row = max(0, int(float(meta.get("first_row", 0))))
+        except ValueError:
+            first_row = 0
         m = Measurement(x=np.arange(img.shape[1], dtype=float), x_unit=X_PX, y=np.zeros(img.shape[1]),
                         raw=np.zeros(img.shape[1]), image=img, acq_mode="image", label=os.path.basename(path),
-                        comment=meta.get("comment", ""), source_file=path)
+                        comment=meta.get("comment", ""), source_file=path, image_top=first_row)
         self._frame_tracks(m)
         self.current = m
         self._image_meas = m
         self.image._first = True
-        self.image.set_image(img)
+        self.image.set_image(img, first_row)
         self.image.set_note(f"Кадр из файла: {os.path.basename(path)}")
         self.tabs.setCurrentIndex(1)
         self._redraw()
@@ -1640,9 +1662,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _frame_tracks(self, m: Measurement) -> None:
         """Спектры полос по кадру из файла (программное суммирование строк, без фона)."""
-        h = m.image.shape[0]
-        stripes = [(min(t, h - 1), min(b, h - 1)) for t, b in self.inst.stripes()]
-        tracks = np.vstack([P.bin_rows(m.image, t, b) for t, b in stripes])
+        top, h = int(m.image_top), m.image.shape[0]
+        clip = lambda r: min(max(r, top), top + h - 1)                          # noqa: E731
+        stripes = [(clip(t), clip(b)) for t, b in self.inst.stripes()]
+        tracks = np.vstack([P.bin_rows(m.image, t - top, b - top) for t, b in stripes])
         m.y, m.raw = tracks[0], tracks[0]
         m.tracks = tracks if tracks.shape[0] > 1 else None
         m.track_rows = tuple(stripes)
@@ -1657,8 +1680,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def export_plot(self) -> None:
         """Картинка графика (PNG — растровая, SVG — векторная, для статей и отчётов)."""
         import pyqtgraph.exporters as pex
-        image_tab = self.tabs.currentIndex() == 1
-        item = self.image.plot_item if image_tab else self.plot.plot.getPlotItem()
+        tab = self.tabs.currentWidget()
+        image_tab = tab is self.image
+        item = (self.image.plot_item if image_tab else
+                self.rows_panel.plot.getPlotItem() if tab is self.rows_panel else self.plot.plot.getPlotItem())
         m = self.current
         stem = ("ccd_" if image_tab else "spectrum_") + (f"{m.timestamp:%Y%m%d_%H%M%S}" if m is not None else "plot")
         start = os.path.join(self.s.save_dir or os.path.expanduser("~"), stem + ".png")
@@ -1704,21 +1729,119 @@ class MainWindow(QtWidgets.QMainWindow):
         self.s.save_dir = os.path.dirname(path)
         log.info("Спектр сохранён: %s", path)
 
+    # форматы «Сохранить кадр»: (фильтр диалога, расширение, что пишется)
+    FRAME_FORMATS = [
+        ("TIFF, 16 бит — отсчёты камеры, пиксель в пиксель (*.tif)", ".tif", "data"),
+        ("PNG, 16 бит — отсчёты камеры, пиксель в пиксель (*.png)", ".png", "data"),
+        ("PNG — как на экране: палитра и уровни, пиксель в пиксель (*.png)", ".png", "screen"),
+        ("TIFF — как на экране: палитра и уровни, пиксель в пиксель (*.tif)", ".tif", "screen"),
+        ("NumPy (*.npy)", ".npy", "data"),
+        ("Текст (*.txt)", ".txt", "data"),
+        ("CSV (*.csv)", ".csv", "data"),
+    ]
+    NO_ROWS_HW_BIN = ("Снимок сделан с аппаратным объединением строк: камера складывает строки полосы ещё до "
+                      "оцифровки, поэтому ни изображения полосы, ни спектров отдельных строк нет. Чтобы они были, "
+                      "снимите флажок «аппаратное объединение строк» (считывание медленнее) или снимайте в режиме "
+                      "«Изображение».")
+
+    @staticmethod
+    def _frame_note(m: Measurement) -> str:
+        """Пометка над кадром: изображение полосы — не весь кадр."""
+        if m.image is None or m.acq_mode == "image":
+            return ""
+        top = int(m.image_top)
+        return (f"Изображение полосы: строки ПЗС {top}–{top + np.asarray(m.image).shape[0] - 1} (в режиме «Спектр» "
+                "без аппаратного объединения камера считывает только строки полос)")
+
     def save_frame(self) -> None:
         m = self.current
         if m is None or m.image is None:
             return
-        start = os.path.join(self.s.save_dir or os.path.expanduser("~"), f"{m.timestamp:%Y%m%d_%H%M%S}_frame.npy")
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Сохранить кадр", start, "NumPy (*.npy);;Текст (*.txt);;CSV (*.csv)")
+        img = np.asarray(m.image)
+        top, h = int(m.image_top), img.shape[0]
+        rows = "" if m.acq_mode == "image" and top == 0 else f"_rows{top}-{top + h - 1}"
+        start = os.path.join(self.s.save_dir or os.path.expanduser("~"), f"{m.timestamp:%Y%m%d_%H%M%S}_frame{rows}.tif")
+        path, flt = QtWidgets.QFileDialog.getSaveFileName(self, "Сохранить кадр", start,
+                                                          ";;".join(f for f, _, _ in self.FRAME_FORMATS))
         if not path:
             return
+        ext, kind = next(((e, k) for f, e, k in self.FRAME_FORMATS if f == flt), (".tif", "data"))
+        if not os.path.splitext(path)[1]:
+            path += ext
+        meta = m.meta()
+        meta["first_row"] = top
+        meta["frame_size"] = f"{img.shape[1]}x{h}"
         try:
-            save_image(path, m.image, m.meta())
-        except OSError as e:
-            self._error("Сохранение", e)
+            if kind == "screen":
+                if self._image_meas is not m:              # на экране — кадр этого спектра
+                    self._image_meas = m
+                    self.image.set_image(m.image, top)
+                data = self.image.render_rgb()
+                if data is None:
+                    raise ValueError("Кадр не показан на экране")
+                meta["view"] = "как на экране: палитра и уровни окна программы (не отсчёты камеры)"
+            else:
+                data = img
+            save_image(path, data, meta)
+        except (OSError, ValueError) as e:
+            self._error("Сохранение кадра", e)
             return
-        log.info("Кадр сохранён: %s", path)
+        self.s.save_dir = os.path.dirname(path)
+        log.info("Кадр сохранён: %s (%d×%d%s)", path, img.shape[1], h, ", как на экране" if kind == "screen" else "")
+
+    # ================================================================ строки ПЗС
+    def _update_rows_tab(self) -> None:
+        """Вкладка «Строки ПЗС» — только когда она открыта (в непрерывной съёмке лишнего не считаем)."""
+        if self.tabs.currentWidget() is not self.rows_panel:
+            return
+        m, note = self.current, ""
+        if m is None or m.image is None:
+            why = (self.NO_ROWS_HW_BIN if m is not None and m.hardware_binning and m.acq_mode != "image"
+                   else "У текущего спектра нет кадра с отдельными строками.")
+            if self._image_meas is None:
+                self.rows_panel.set_frame(None, why=why)
+                return
+            m = self._image_meas
+            note = f"У текущего спектра отдельных строк нет — показаны строки кадра от {m.timestamp:%H:%M:%S}. {why}"
+        amap, unit = self._scale_for(m)
+        x = self._x_in(m, unit, self.s.laser_nm)
+        rows = list(m.track_rows) or self.inst.stripes()
+        stripes = (min(a for a, _ in rows), max(b for _, b in rows))
+        self.rows_panel.set_frame(m, x, axis_label(unit, self.s.laser_nm) if x is not None else "", stripes,
+                                  note=note)
+        self._rows_unit = unit if x is not None else X_PX
+
+    def save_rows(self) -> None:
+        rp = self.rows_panel
+        m = rp._m
+        if m is None:
+            return
+        x, rows, mean, (a, b) = rp.selected()
+        start = os.path.join(self.s.save_dir or os.path.expanduser("~"),
+                             f"{m.timestamp:%Y%m%d_%H%M%S}_rows{a}-{b}{self.s.save_format}")
+        path, flt = QtWidgets.QFileDialog.getSaveFileName(self, "Сохранить спектры строк", start,
+                                                          "Текст, табуляция (*.txt);;CSV для Excel (*.csv)")
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".csv" if "csv" in flt.lower() else ".txt"
+        names = {X_NM: "wavelength_nm", X_WAVENUMBER: "wavenumber_cm-1", X_RAMAN: "raman_shift_cm-1",
+                 X_EV: "photon_energy_eV", X_PX: "pixel"}
+        unit = getattr(self, "_rows_unit", X_PX)
+        meta = m.meta()
+        meta["ccd_rows"] = f"{a}-{b}"
+        dark = rp.dark.isChecked() and rp.dark.isEnabled()
+        meta["values"] = "отсчёты одной строки" + (" за вычетом темнового фона" if dark else "")
+        if unit == X_RAMAN:
+            meta["laser_nm"] = self.s.laser_nm
+        try:
+            save_spectrum(path, x, mean, meta, x_name=names.get(unit, "x"), y_name=f"mean_rows_{a}-{b}",
+                          extra={f"row_{a + i}": rows[i] for i in range(rows.shape[0])})
+        except OSError as e:
+            self._error("Сохранение строк", e)
+            return
+        self.s.save_dir = os.path.dirname(path)
+        log.info("Спектры строк %d–%d сохранены: %s", a, b, path)
 
     # ================================================================ монохроматор
     def _mono_task(self, text: str, fn, after=None, on_fail=None) -> None:

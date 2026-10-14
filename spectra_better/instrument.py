@@ -90,6 +90,10 @@ class Measurement:
     intensity_corrected: str = ""         # как скорректирована интенсивность ("" — нет)
     comment: str = ""                     # комментарий пользователя (образец, условия)
     source_file: str = ""                 # кадр открыт из файла (не снят сейчас)
+    # строки кадра в image — с какой строки ПЗС (0 — полный кадр; в режиме «Спектр» без аппаратного
+    # объединения — верх полосы: считываются только строки полос)
+    image_top: int = 0
+    image_dark: Optional[np.ndarray] = None   # темновой кадр тех же строк, если фон вычитался
 
     def meta(self) -> Dict[str, object]:
         m: Dict[str, object] = {
@@ -823,6 +827,10 @@ class Instrument:
                     raise DeviceError(f"Шторка не закрылась, фон не снят: {e}. Закройте вход вручную и "
                                       "снимите фон без шторки (Обработка → «закрывать шторку при съёмке "
                                       "фона»).") from e
+            # кадр с отдельными строками есть, если камера их не суммировала: «Изображение» или полоса
+            # без аппаратного объединения (тогда по нему — изображение полосы и спектры строк)
+            rows_frame = image_mode or acq.regions[0].bin_y == 1
+            img_acc = None
             gen = None
             while len(spectra) < n:
                 if self._abort.is_set():
@@ -832,7 +840,7 @@ class Instrument:
                     if spectra:
                         log.info("Во время накопления менялись монохроматор, шторка или лазер — "
                                  "накопление начато заново")
-                        spectra, sat = [], False
+                        spectra, sat, img_acc = [], False, None
                     gen = g
                 if progress:
                     progress(len(spectra), n, "фон" if background else "экспозиция")
@@ -843,6 +851,8 @@ class Instrument:
                 frame = f[:, ::-1] if flip else f
                 sat = sat or P.saturated(frame)
                 spectra.append(self._frame_to_tracks(frame, acq, stripes, image_mode))
+                if rows_frame and n > 1:
+                    img_acc = frame.astype(np.float64) if img_acc is None else img_acc + frame
             # состояние монохроматора — то, при котором сняты кадры (а не после следующей команды)
             with self._lock:
                 wl, gr, slit = self.mono_wl, self.mono_grating, self.mono_slit
@@ -868,6 +878,12 @@ class Instrument:
             raw = P.fix_defects(raw, s.defect_pixels, flip=flip)
             n_fixed = len(s.defect_pixels)
         key = self._bg_key(acq, flip, stripes)
+        image = None
+        if rows_frame and frame is not None:
+            # кадр — как спектр: среднее или сумма накоплений (один кадр — как пришёл, uint16)
+            image = frame if n == 1 else (img_acc if mode == "sum" else img_acc / n)
+        image_top = 0 if image_mode else acq.regions[0].top
+        image_dark = None
         y = raw
         bg_used = False
         t_now = self.last_state.temperature if self.last_state else None
@@ -876,8 +892,8 @@ class Instrument:
                 self._backgrounds[key] = raw.copy()
                 if t_now is not None:
                     self._bg_temps[key] = float(t_now)
-                if frame is not None and image_mode:
-                    self._bg_images[key] = frame.astype(np.float64)
+                if image is not None:
+                    self._bg_images[key] = np.asarray(image, dtype=np.float64)
         elif s.subtract_background:
             with self._lock:
                 bg = self._backgrounds.get(key)
@@ -888,6 +904,10 @@ class Instrument:
             if bg is not None and bg.shape == raw.shape:
                 y = raw - bg * (n if mode == "sum" else 1)
                 bg_used = True
+                with self._lock:
+                    dark = self._bg_images.get(key)
+                if image is not None and dark is not None and dark.shape == image.shape:
+                    image_dark = dark                       # общий массив, без копии
         x, unit = self.wavelength_axis(raw.shape[-1], (wl, gr))
         corrected = ""
         if s.intensity_corr and not background:
@@ -895,7 +915,7 @@ class Instrument:
         m = Measurement(x=x, x_unit=unit, y=y[0], raw=raw[0],
                         tracks=y if y.shape[0] > 1 else None, track_rows=tuple(stripes[:y.shape[0]]),
                         defects_fixed=n_fixed, intensity_corrected=corrected, comment=s.comment.strip(),
-                        image=frame if image_mode else None,
+                        image=image, image_top=image_top, image_dark=image_dark,
                         background_used=bg_used, saturated=sat,
                         exposure_ms=acq.exposure_us / 1000.0, accumulations=n, accumulate_mode=mode,
                         acq_mode=ACQ_IMAGE if image_mode else s.acq_mode, rows=stripes[0],

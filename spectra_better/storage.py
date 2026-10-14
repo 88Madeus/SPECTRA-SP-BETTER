@@ -10,6 +10,7 @@ import datetime as _dt
 import io
 import os
 import re
+from struct import error as struct_error
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -107,8 +108,21 @@ def load_spectrum(path: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, str], Li
 
 
 def save_image(path: str, image: np.ndarray, meta: Optional[Dict[str, object]] = None) -> None:
-    """Кадр ПЗС: .npy (без потерь, быстро) или .csv/.txt (матрица чисел)."""
+    """Кадр ПЗС: .npy (без потерь, быстро), .csv/.txt (матрица чисел) или .tif/.png — пиксель в пиксель:
+    16-битный серый (отсчёты как есть; TIFF — 32-битный, если сумма накоплений больше 65535). Цветное
+    изображение (строки × столбцы × 3, «как на экране») — 8-битный цветной TIFF/PNG."""
+    from . import imagefiles as F
     ext = os.path.splitext(path)[1].lower()
+    a = np.asarray(image)
+    if ext in (".tif", ".tiff"):
+        F.write_tiff(path, a if a.ndim == 3 else (F.as_uint16(a) if F.fits_uint16(a) else a), meta)
+        return
+    if ext == ".png":
+        if a.ndim == 2 and not F.fits_uint16(a):
+            raise ValueError("Значения кадра больше 65535 (сумма накоплений) — в 16-битный PNG они не "
+                             "помещаются. Сохраните в TIFF (32 бита) или NPY.")
+        F.write_png(path, a if a.ndim == 3 else F.as_uint16(a), meta)
+        return
     if ext == ".npy":
         np.save(path, np.asarray(image))
         if meta:
@@ -124,9 +138,33 @@ def save_image(path: str, image: np.ndarray, meta: Optional[Dict[str, object]] =
             f.write(sep.join(str(int(v)) for v in row) + "\n")
 
 
+def _qt_gray16(path: str) -> np.ndarray:
+    """Серое изображение через Qt (сжатые TIFF, PNG); цветное — (строки × столбцы × 3)."""
+    from PyQt5 import QtGui
+    q = QtGui.QImage(path)
+    if q.isNull():
+        raise ValueError("Не удалось прочитать изображение")
+    F = QtGui.QImage
+    gray = q.format() in (F.Format_Grayscale8, F.Format_Grayscale16) or \
+        (q.format() in (F.Format_Indexed8, F.Format_Mono, F.Format_MonoLSB) and q.isGrayscale())
+    if not gray:                                   # по формату файла, а не по содержимому
+        q = q.convertToFormat(QtGui.QImage.Format_RGB888)
+        ptr = q.constBits()
+        ptr.setsize(q.bytesPerLine() * q.height())
+        rows = np.frombuffer(ptr, dtype=np.uint8).reshape(q.height(), q.bytesPerLine())
+        return rows[:, :q.width() * 3].reshape(q.height(), q.width(), 3).copy()
+    if q.format() != QtGui.QImage.Format_Grayscale16:
+        q = q.convertToFormat(QtGui.QImage.Format_Grayscale16)
+    ptr = q.constBits()
+    ptr.setsize(q.bytesPerLine() * q.height())
+    rows = np.frombuffer(ptr, dtype=np.uint16).reshape(q.height(), q.bytesPerLine() // 2)
+    return rows[:, :q.width()].copy()
+
+
 def load_image(path: str) -> Tuple[np.ndarray, Dict[str, str]]:
-    """Кадр ПЗС из файла: .npy (+ _info.txt), .txt/.csv (матрица, «# ключ: значение» в начале)
-    или 16-битный TIFF (как сохраняет SpectraSP). Возвращает (кадр float64, сведения)."""
+    """Кадр ПЗС из файла: .npy (+ _info.txt), .txt/.csv (матрица, «# ключ: значение» в начале),
+    TIFF (16-битный, как сохраняет SpectraSP, или свой 32-битный) или 16-битный PNG.
+    Возвращает (кадр float64, сведения; «first_row» — с какой строки ПЗС начинается кадр)."""
     ext = os.path.splitext(path)[1].lower()
     meta: Dict[str, str] = {}
     if ext == ".npy":
@@ -138,17 +176,21 @@ def load_image(path: str) -> Tuple[np.ndarray, Dict[str, str]]:
                     if ":" in line:
                         k, v = line.split(":", 1)
                         meta[k.strip()] = v.strip()
-    elif ext in (".tif", ".tiff"):
-        from PyQt5 import QtGui
-        q = QtGui.QImage(path)
-        if q.isNull():
-            raise ValueError("Не удалось прочитать TIFF")
-        if q.format() != QtGui.QImage.Format_Grayscale16:
-            q = q.convertToFormat(QtGui.QImage.Format_Grayscale16)
-        ptr = q.constBits()
-        ptr.setsize(q.bytesPerLine() * q.height())
-        rows = np.frombuffer(ptr, dtype=np.uint16).reshape(q.height(), q.bytesPerLine() // 2)
-        img = rows[:, :q.width()].copy()
+    elif ext in (".tif", ".tiff", ".png"):
+        from . import imagefiles as F
+        img = None
+        if ext != ".png":
+            try:
+                img, meta = F.read_tiff(path)          # свои файлы и любые несжатые (в т. ч. 32-битные)
+            except (ValueError, KeyError, IndexError, struct_error):
+                img = None
+        if img is None:
+            img = _qt_gray16(path)                      # сжатые TIFF, PNG — через Qt
+            if ext == ".png":
+                meta = F.read_png_text(path)
+        if img.ndim == 3:
+            raise ValueError("Это цветная картинка («как на экране»), а не отсчёты камеры — для обработки "
+                             "откройте кадр, сохранённый как данные (TIFF/PNG 16 бит, NPY, TXT)")
     else:
         data = []
         with open(path, encoding="utf-8", errors="replace") as f:
