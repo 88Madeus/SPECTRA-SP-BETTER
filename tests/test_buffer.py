@@ -13,10 +13,10 @@ def meas(k=1.0, wl=546.0, label=""):
                        center_wl=wl, grating_title="№2, 600 штр/мм", slit_um=50, label=label)
 
 
-def test_add_strips_image_and_names():
+def test_add_keeps_compact_image_and_names():
     b = SpectrumBuffer()
     e = b.add(meas())
-    assert e.m.image is None                       # кадр (8 МБ) в буфере не хранится
+    assert e.m.image is not None and e.m.image.dtype == np.uint16   # кадр хранится, компактно (2 МБ, не 8)
     assert "546.0 нм" in e.name and "200 мс" in e.name
     assert b.add(meas(label="Hg лампа")).name == "Hg лампа"
     props = dict(b.properties(e.key))

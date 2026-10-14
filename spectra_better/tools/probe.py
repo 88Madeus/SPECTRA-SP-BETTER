@@ -56,7 +56,8 @@ def linearity_sweep(R, cam, info, region, speed: int, ttl: bool, out_path: str) 
     """Снимки линии при экспозициях LINEARITY_MS (по LINEARITY_FRAMES кадров) и разбор пропорциональности.
 
     Сигнал — сумма отсчётов в окне вокруг самой яркой линии за вычетом медианы спектра (темновой ток,
-    смещение, фон): какая доля линии попала в окно, неважно — она одна и та же при всех экспозициях."""
+    смещение, фон): какая доля линии попала в окно, неважно — она одна и та же при всех экспозициях.
+    Шум точки — по разбросу между кадрами; по нему же — погрешность «лишнего времени»."""
     sync = (0, -1) if ttl else (-1, -1)        # TTL: выход 1 камеры — импульс экспозиции («EXP», как в SpectraSP)
     rows = []
     for e in LINEARITY_MS:
@@ -68,35 +69,87 @@ def linearity_sweep(R, cam, info, region, speed: int, ttl: bool, out_path: str) 
             frames.append(cam.acquire()[0].astype(float))
             times.append(time.monotonic() - t0)
         sat = max(float(f.max()) for f in frames) >= 65535
-        # медиана по кадрам: космическая частица в окне линии не испортит точку
-        rows.append((us / 1000.0, np.median(frames, axis=0), sat, float(np.mean(times))))
-    ref = next((y for _, y, sat, _ in reversed(rows) if not sat), rows[-1][1])
+        rows.append((us / 1000.0, frames, sat, float(np.mean(times))))
+    # медиана по кадрам: космическая частица в окне линии не испортит точку
+    ref = next((np.median(fr, axis=0) for _, fr, sat, _ in reversed(rows) if not sat), np.median(rows[-1][1], axis=0))
     i = int(np.argmax(ref))
     w = slice(max(0, i - LINE_HALF_WIDTH), i + LINE_HALF_WIDTH + 1)
-    sig = [float("nan") if sat else float(np.sum(y[w] - np.median(y))) for _, y, sat, _ in rows]
+
+    def window_sum(y):
+        return float(np.sum(y[w] - np.median(y)))
+    sig, err = [], []
+    for _, frames, sat, _ in rows:
+        if sat:
+            sig.append(float("nan"))
+            err.append(float("nan"))
+            continue
+        sig.append(window_sum(np.median(frames, axis=0)))
+        sums = [window_sum(f) for f in frames]
+        err.append(float(np.std(sums, ddof=1) / np.sqrt(len(sums))) if len(sums) > 1 else float("nan"))
     exps = [r[0] for r in rows]
-    R(f"    линия: пиксель {i}; шторка {'по экспозиции (TTL)' if ttl else 'открыта вручную'}")
-    R("    экспозиция, мс | сигнал, отсч. | отсч./мс | время кадра, с")
-    for (e, _, sat, t), s_ in zip(rows, sig):
-        R(f"    {e:>12g} | {('НАСЫЩЕНИЕ' if sat else f'{s_:.0f}'):>12} | "
+    R(f"    строки {region.top}…{region.bottom}; линия: пиксель {i}; "
+      f"шторка {'по экспозиции (TTL)' if ttl else 'открыта вручную'}")
+    R("    экспозиция, мс | сигнал, отсч. | шум, отсч. | отсч./мс | время кадра, с")
+    for (e, _, sat, t), s_, n_ in zip(rows, sig, err):
+        R(f"    {e:>12g} | {('НАСЫЩЕНИЕ' if sat else f'{s_:.0f}'):>12} | {n_:>10.0f} | "
           f"{(s_ / e if np.isfinite(s_) else float('nan')):>8.1f} | {t:.3f}")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("exposure_ms;signal;noise;saturated;frame_time_s\n")
+        for (e, _, sat, t), s_, n_ in zip(rows, sig, err):
+            f.write(f"{e:g};{s_:.1f};{n_:.1f};{int(sat)};{t:.4f}\n")
+    noise = float(np.nanmedian(err)) if np.isfinite(err).any() else float("nan")
+    top = max((s_ for s_ in sig if np.isfinite(s_)), default=float("nan"))
+    hint = ("Поставьте полосу строк на свет (--rows ВЕРХ НИЗ, как в программе на изображении ПЗС), "
+            "откройте щель или усильте свет и повторите.")
     try:
-        res = P.linearity_fit(exps, sig)
+        res = P.linearity_fit(exps, sig, sigmas=err)
     except ValueError as e:
         R(f"    не удалось оценить: {e}")
+        R(f"    СИГНАЛ СЛАБЫЙ или его нет. {hint}")
+        R(f"    таблица: {out_path}")
         return
     R(f"    подгонка по экспозициям ≥ 20 мс: сигнал ≈ {res.rate:.1f} отсч./мс × (t {res.t0_ms:+.2f} мс)")
-    if ttl and res.t0_ms < 0:
+    if np.isfinite(res.t0_err_ms):
+        R(f"    погрешность «лишнего времени»: ±{res.t0_err_ms:.1f} мс")
+    weak = not (np.isfinite(noise) and noise > 0 and top / noise >= 100) or \
+        (np.isfinite(res.t0_err_ms) and res.t0_err_ms > 3)
+    if weak:
+        R(f"    СИГНАЛ СЛАБЫЙ: при самой длинной экспозиции он лишь в {top / noise if noise else 0:.0f} раз выше "
+          f"шума — оценке «лишнего времени» верить нельзя. {hint}")
+    significant = np.isfinite(res.t0_err_ms) and abs(res.t0_ms) > 2 * res.t0_err_ms
+    if weak:
+        pass
+    elif not significant:
+        R("    «лишнего времени» не обнаружено (в пределах погрешности)")
+    elif ttl and res.t0_ms < 0:
         R(f"    шторка «съедает» ≈ {-res.t0_ms:.1f} мс каждой экспозиции (открывается позже/закрывается раньше)")
     elif res.t0_ms > 0:
         R(f"    свет добавляется ≈ {res.t0_ms:.1f} мс сверх экспозиции (пока идёт сдвиг строк при считывании)")
-    if np.isfinite(res.min_ok_ms):
+    if np.isfinite(res.min_ok_ms) and not weak:
         R(f"    сигнал пропорционален экспозиции с точностью 5 % начиная с {res.min_ok_ms:g} мс")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("exposure_ms;signal;saturated;frame_time_s\n")
-        for (e, _, sat, t), s_ in zip(rows, sig):
-            f.write(f"{e:g};{s_:.1f};{int(sat)};{t:.4f}\n")
     R(f"    таблица: {out_path}")
+
+
+def default_rows(args, inst, height: int):
+    """Полоса строк для пробных снимков: --rows, иначе — как в программе (где пользователь поставил её
+    на свет), иначе — из SpectraSP, иначе — середина ПЗС. Возвращает ((верх, низ), откуда)."""
+    if args.rows:
+        rows, src = tuple(args.rows), "--rows"
+    else:
+        rows, src = None, ""
+        try:
+            from ..config import AppSettings
+            s = AppSettings.load()
+            if 0 <= s.rows_top < s.rows_bottom:
+                rows, src = (s.rows_top, s.rows_bottom), "настройки SpectraSP Better"
+        except Exception:  # noqa: BLE001 — нет файла настроек: берём дальше
+            pass
+        if rows is None and inst.stripe:
+            rows, src = tuple(inst.stripe), "настройки SpectraSP"
+        if rows is None:
+            rows, src = (height // 2 - 15, height // 2 + 14), "середина ПЗС"
+    top, bottom = sorted(int(v) for v in rows)
+    return (max(0, top), min(height - 1, bottom)), src
 
 
 class Report:
@@ -244,8 +297,10 @@ def main(argv=None) -> int:
                 R.step("Области", lambda: R(f"    {cam.read_regions()}"))
                 if args.cooling is not None:
                     R.step(f"Охлаждение до {args.cooling} °C", lambda: cam.set_cooling(True, args.cooling))
+                if args.expose or args.linearity:
+                    (top, bottom), rows_src = default_rows(args, inst, info.height)
+                    R(f"    полоса строк {top}…{bottom} ({rows_src})")
                 if args.expose:
-                    top, bottom = args.rows or (inst.stripe or (info.height // 2 - 15, info.height // 2 + 14))
                     speed = args.speed or (inst.sensor.readout_speed or cam.current_readout_speed)
                     acq = AcqSettings(int(args.expose * 1000), speed,
                                       (spectrum_region(info.width, info.height, top, bottom, True),))
@@ -277,7 +332,6 @@ def main(argv=None) -> int:
                             R(f"    кадр сохранён: {path}")
                         R.step("Полный кадр", full)
                 if args.linearity:
-                    top, bottom = args.rows or (inst.stripe or (info.height // 2 - 15, info.height // 2 + 14))
                     speed = args.speed or (inst.sensor.readout_speed or cam.current_readout_speed)
                     region = spectrum_region(info.width, info.height, top, bottom, True)
                     ttl_on = False

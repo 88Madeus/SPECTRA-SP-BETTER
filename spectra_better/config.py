@@ -128,6 +128,8 @@ class AppSettings:
 
     calibration: CalibrationSettings = field(default_factory=CalibrationSettings)
     calibration_imported: bool = False
+    # [центральный пиксель, ширина пикселя] — последние, взятые из калибровки SpectraSP (Sensor_*.xml)
+    calibration_spectrasp: List[float] = field(default_factory=list)
     window_state: str = ""
 
     # -------------------------------------------------------------- файлы

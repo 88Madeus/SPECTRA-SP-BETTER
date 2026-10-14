@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import logging
 from math import ceil, log10
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -23,9 +24,12 @@ STRIPE_COLORS = ["#e6b800", "#ff7f0e", "#2ca02c", "#9467bd", "#17becf", "#e377c2
 Fn = Callable[[np.ndarray], np.ndarray]
 Mapping = Optional[Tuple[Fn, Fn]]
 
+log = logging.getLogger(__name__)
 
-def format_ticks(values: Sequence[float], spacing: float) -> List[str]:
+
+def format_ticks(values: Sequence[float], spacing: Optional[float]) -> List[str]:
     """Подписи делений целиком (19500, а не 1.95e+04) с числом знаков по шагу."""
+    spacing = float(spacing) if spacing else 0.0
     places = min(6, max(0, int(ceil(-log10(spacing))))) if spacing > 0 else 0
     out = []
     for v in values:
@@ -55,7 +59,7 @@ class LinkedAxis(pg.AxisItem):
         self.update()
 
     def tickValues(self, minVal, maxVal, size):
-        if self._map is None:
+        if self._map is None or self.logMode:
             return super().tickValues(minVal, maxVal, size)
         fwd, inv = self._map
         try:
@@ -75,10 +79,23 @@ class LinkedAxis(pg.AxisItem):
         return out
 
     def tickStrings(self, values, scale, spacing):
+        # в логарифмическом режиме pyqtgraph передаёт шаг None — подписи делает он сам
+        # (иначе — ошибка при каждой перерисовке, так было в лаборатории)
+        if spacing is None or self.logMode:
+            return super().tickStrings(values, scale, spacing)
         if self._map is not None and len(values):
             with np.errstate(all="ignore"):
                 values = np.asarray(self._map[0](np.asarray(values, dtype=float)), dtype=float)
         return format_ticks(values, spacing * scale)
+
+
+def hide_transforms(item: pg.PlotItem) -> None:
+    """Убрать из контекстного меню графика «Transforms» (логарифм, FFT, производная): с осью в
+    единицах спектра, пиками и участками интегрирования они не работают."""
+    try:
+        item.setContextMenuActionVisible("Transforms", False)
+    except Exception:  # noqa: BLE001 — другая версия pyqtgraph: меню остаётся, ось всё равно выдержит
+        log.debug("Не удалось скрыть Transforms в меню графика", exc_info=True)
 
 
 def _range_spin() -> QtWidgets.QDoubleSpinBox:
@@ -136,6 +153,7 @@ class SpectrumPlot(QtWidgets.QWidget):
         self.top_axis = LinkedAxis("top")
         self.plot = pg.PlotWidget(axisItems={"bottom": self.bottom_axis, "top": self.top_axis})
         self.plot.hideButtons()                 # вместо кнопки «A» — «Весь спектр» (Ctrl+A)
+        hide_transforms(self.plot.getPlotItem())
         self.plot.showAxis("top", False)
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("left", "Интенсивность, отсч.")
@@ -589,11 +607,17 @@ class ImagePanel(QtWidgets.QWidget):
         self.top_axis = LinkedAxis("top")
         self.plot_item = pg.PlotItem(axisItems={"bottom": self.x_axis, "top": self.top_axis})
         self.plot_item.setLabel("left", "Строка ПЗС")
+        hide_transforms(self.plot_item)
         self.view = pg.ImageView(view=self.plot_item)
         self.view.ui.roiBtn.hide()
         self.view.ui.menuBtn.hide()
         self.view.setPredefinedGradient("viridis")
         self.view.getView().setAspectLocked(False)
+        self.note = QtWidgets.QLabel("")
+        self.note.setWordWrap(True)
+        self.note.setStyleSheet("color: #a15c00; padding: 2px 6px;")
+        self.note.setVisible(False)
+        lay.addWidget(self.note)
         lay.addWidget(self.view)
         hint = QtWidgets.QLabel("Перетащите жёлтую полосу, чтобы выбрать строки ПЗС, по которым строится спектр. "
                                 "Дополнительные полосы (свой спектр с каждой) — «Полосы…» на панели «Экспозиция».")
@@ -609,6 +633,7 @@ class ImagePanel(QtWidgets.QWidget):
         self.labels: List[pg.TextItem] = []
         self._movable = True
         self._first = True
+        self._top, self._shape = 0, None
         self._suppress = False
         self.set_x_scale(AxisMap(None), X_PX, 0)
 
@@ -629,17 +654,38 @@ class ImagePanel(QtWidgets.QWidget):
             self.top_axis.set_mapping(None)
             self.plot_item.showAxis("top", False)
 
-    def set_image(self, image: np.ndarray) -> None:
+    def set_image(self, image: np.ndarray, top: int = 0) -> None:
+        """Кадр (строки × столбцы); top — строка ПЗС первой строки кадра (изображение полосы — не с 0)."""
         # ImageView ожидает (x, y): транспонируем, чтобы столбцы ПЗС шли по горизонтали
         img = np.asarray(image, dtype=np.float32).T
-        if self._first:
+        top = int(top)
+        first = self._first or top != self._top or img.shape != self._shape
+        if first:
             # уровни по процентилям, а не по мин./макс.: одна космическая частица
             # иначе «растягивает» шкалу, и весь кадр выглядит чёрным
             lo, hi = (float(v) for v in np.percentile(img, (0.5, 99.95)))
-            self.view.setImage(img, autoLevels=False, levels=(lo, max(hi, lo + 1)), autoRange=True)
+            self.view.setImage(img, autoLevels=False, levels=(lo, max(hi, lo + 1)), autoRange=True, pos=(0, top))
         else:
-            self.view.setImage(img, autoLevels=False, autoRange=False)
+            self.view.setImage(img, autoLevels=False, autoRange=False, pos=(0, top))
         self._first = False
+        self._top, self._shape = top, img.shape
+
+    def render_rgb(self) -> Optional[np.ndarray]:
+        """Показанный кадр «как на экране»: палитра и уровни из окна, пиксель в пиксель
+        (строки × столбцы × 3, uint8; строка 0 — сверху, как на экране)."""
+        item = self.view.getImageItem()
+        data = item.image
+        if data is None:
+            return None
+        lo, hi = (float(v) for v in item.getLevels())
+        lut = np.asarray(self.view.ui.histogram.gradient.getLookupTable(256, alpha=False), dtype=np.uint8)[:, :3]
+        idx = np.clip((np.asarray(data, dtype=np.float64).T - lo) / max(hi - lo, 1e-12) * 255.0, 0, 255)
+        return lut[idx.astype(np.uint8)]
+
+    def set_note(self, text: str) -> None:
+        """Пометка над кадром — например, что кадр относится не к текущему спектру ("" — убрать)."""
+        self.note.setText(text)
+        self.note.setVisible(bool(text))
 
     def set_rows(self, top: int, bottom: int) -> None:
         self._suppress = True

@@ -8,8 +8,47 @@ import os
 import sys
 import traceback
 
+from typing import Callable, Optional, Set, Tuple
+
 from .. import APP_NAME, __version__
 from ..config import AppSettings, settings_dir
+
+
+class ErrorReporter:
+    """Необработанные ошибки: всегда в журнал, окно — без лавины.
+
+    Ошибка при перерисовке графика повторяется на каждой перерисовке, а окно о ней само вызывает
+    перерисовку — так программа «парализовалась» окнами в лаборатории. Поэтому: одна и та же ошибка
+    (тип + место) показывается один раз за сеанс, и пока открыто одно окно, новые только пишутся в журнал.
+    """
+
+    def __init__(self, show: Optional[Callable[[str], None]] = None):
+        self._show = show or self._message_box
+        self._shown: Set[Tuple[str, str, int]] = set()
+        self._showing = False
+
+    @staticmethod
+    def _message_box(text: str) -> None:
+        from PyQt5 import QtWidgets
+        QtWidgets.QMessageBox.critical(None, APP_NAME, text)
+
+    def __call__(self, exc_type, exc, tb) -> None:
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        logging.getLogger("spectra_better").error("Необработанная ошибка:\n%s", text)
+        frames = traceback.extract_tb(tb)
+        where = (frames[-1].filename, frames[-1].lineno) if frames else ("", 0)
+        key = (getattr(exc_type, "__name__", str(exc_type)), *where)
+        if self._showing or key in self._shown:
+            return
+        self._shown.add(key)
+        self._showing = True
+        try:
+            self._show(f"Внутренняя ошибка программы:\n{exc}\n\nПодробности записаны в журнал. "
+                       "Если она повторится, окно больше не появится — только запись в журнал.")
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self._showing = False
 
 
 def setup_logging(level: int = logging.INFO):
@@ -64,15 +103,7 @@ def main(argv=None) -> int:
     if args.spectrasp_dir:
         settings.spectrasp_dir = args.spectrasp_dir
 
-    def excepthook(exc_type, exc, tb):
-        text = "".join(traceback.format_exception(exc_type, exc, tb))
-        logging.getLogger("spectra_better").error("Необработанная ошибка:\n%s", text)
-        try:
-            QtWidgets.QMessageBox.critical(None, APP_NAME, f"Внутренняя ошибка программы:\n{exc}\n\n"
-                                           "Подробности записаны в журнал.")
-        except Exception:  # noqa: BLE001
-            pass
-    sys.excepthook = excepthook
+    sys.excepthook = ErrorReporter()
 
     from .main_window import MainWindow
     win = MainWindow(settings, simulate=args.simulate, log_handler=handler)

@@ -131,6 +131,13 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.btn_laser.setEnabled(on and self._laser_output in (1, 2))
 
 
+HW_BIN_TIP = ("Камера сама суммирует строки полосы и передаёт одну строку:\n"
+              "считывание в сотни раз быстрее, чем полный кадр, и шум считывания — как у одной строки.\n"
+              "Если в ярких линиях появляется насыщение — уменьшите полосу или экспозицию.\n\n"
+              "Без объединения строки полосы читаются по отдельности (медленнее): тогда видно изображение\n"
+              "полосы на вкладке «Изображение ПЗС» и спектр каждой строки на вкладке «Строки ПЗС».")
+
+
 class AcquisitionPanel(QtWidgets.QGroupBox):
     changed = QtCore.pyqtSignal()
     stripes_requested = QtCore.pyqtSignal()
@@ -172,9 +179,7 @@ class AcquisitionPanel(QtWidgets.QGroupBox):
         self.btn_stripes.clicked.connect(self.stripes_requested.emit)
         form.addRow("Полосы:", _row(self.stripes_info, self.btn_stripes, 1))
         self.hw_bin = QtWidgets.QCheckBox("аппаратное объединение строк")
-        self.hw_bin.setToolTip("Камера сама суммирует строки полосы и передаёт одну строку:\n"
-                               "считывание в сотни раз быстрее, чем полный кадр.\n"
-                               "Если в ярких линиях появляется насыщение — уменьшите полосу или экспозицию.")
+        self.hw_bin.setToolTip(HW_BIN_TIP)
         form.addRow(self.hw_bin)
         self.speed = QtWidgets.QComboBox()
         self.speed.setToolTip("Скорость оцифровки: ниже — меньше шум считывания, выше — быстрее")
@@ -268,9 +273,7 @@ class AcquisitionPanel(QtWidgets.QGroupBox):
         self.stripes_info.setText("1 полоса" if n <= 1 else f"{n} полос{'ы' if n < 5 else ''}")
         self.stripes_info.setToolTip("" if n <= 1 else "С каждой полосы строится свой спектр")
         self.hw_bin.setToolTip(
-            "Камера сама суммирует строки полосы и передаёт одну строку:\n"
-            "считывание в сотни раз быстрее, чем полный кадр.\n"
-            "Если в ярких линиях появляется насыщение — уменьшите полосу или экспозицию."
+            HW_BIN_TIP
             + ("\n\nПри нескольких полосах строки читаются построчно (от верхней полосы до нижней) "
                "и суммируются программно — аппаратное объединение не используется." if n > 1 else ""))
         self._update_enabled()
