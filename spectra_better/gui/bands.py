@@ -14,7 +14,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ..config import AppSettings
 from ..processing import BandResult
-from .plots import BAND_COLORS
+from .plots import BAND_COLORS, curve_pen
 
 UNIT_TITLES = {"nm": "нм", "px": "пикс."}
 # величины для истории: (ключ BandResult, подпись)
@@ -240,7 +240,7 @@ class BandsHistoryWindow(QtWidgets.QDialog):
             self.plot.removeItem(self.curves.pop())
         while len(self.curves) < n:
             i = len(self.curves)
-            self.curves.append(self.plot.plot([], [], pen=pg.mkPen(BAND_COLORS[i % len(BAND_COLORS)], width=1.4),
+            self.curves.append(self.plot.plot([], [], pen=curve_pen(BAND_COLORS[i % len(BAND_COLORS)]),
                                               symbol="o", symbolSize=4, name=f"∫{i + 1}"))
         for i, c in enumerate(self.curves):
             t, v = self.history.series(i, key)

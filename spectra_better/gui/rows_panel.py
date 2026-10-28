@@ -13,7 +13,7 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtWidgets
 
-from .plots import hide_transforms
+from .plots import curve_pen, hide_transforms
 
 MAX_CURVES = 100          # больше кривых на графике не различить — показывается каждая k-я строка
 
@@ -189,13 +189,13 @@ class RowsPanel(QtWidgets.QWidget):
             idx = list(range(0, rows.shape[0], step))
             for k, i in enumerate(idx):
                 color = cmap.map(k / max(1, len(idx) - 1), mode="qcolor")
-                c = self.plot.plot(x, rows[i], pen=pg.mkPen(color, width=1))
+                c = self.plot.plot(x, rows[i], pen=curve_pen(color))
                 self._curves.append(c)
             label = f"строки {a}–{b}" + (f" (каждая {step}-я)" if step > 1 else "")
-            self._curves.append(self.plot.plot([], [], pen=pg.mkPen("#3b528b", width=1), name=label))
+            self._curves.append(self.plot.plot([], [], pen=curve_pen("#3b528b"), name=label))
         else:
             r = self.row.value()
-            self._curves.append(self.plot.plot(x, rows[r - a], pen=pg.mkPen("#d62728", width=1.2),
-                                               name=f"строка {r}"))
-        self._curves.append(self.plot.plot(x, mean, pen=pg.mkPen("k", width=2),
-                                           name=f"среднее по строкам {a}–{b}"))
+            self._curves.append(self.plot.plot(x, rows[r - a], pen=curve_pen("#d62728"), name=f"строка {r}"))
+        mean_curve = self.plot.plot(x, mean, pen=curve_pen("k"), name=f"среднее по строкам {a}–{b}")
+        mean_curve.setZValue(5)                      # среднее — поверх строк
+        self._curves.append(mean_curve)

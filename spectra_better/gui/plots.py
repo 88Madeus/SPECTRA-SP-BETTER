@@ -27,6 +27,13 @@ Mapping = Optional[Tuple[Fn, Fn]]
 log = logging.getLogger(__name__)
 
 
+def curve_pen(color, **kw) -> QtGui.QPen:
+    """Перо кривой спектра — толщиной 1 пиксель. Сглаженную линию толще 1 пикселя Qt рисует в десятки
+    раз медленнее: у шумного спектра (2048 точек «пилой» во всю высоту графика) одна перерисовка
+    занимала до 0,7 с, и график еле перетаскивался. Линия в 1 пиксель — около 0,01 с."""
+    return pg.mkPen(color, width=1, **kw)
+
+
 def format_ticks(values: Sequence[float], spacing: Optional[float]) -> List[str]:
     """Подписи делений целиком (19500, а не 1.95e+04) с числом знаков по шагу."""
     spacing = float(spacing) if spacing else 0.0
@@ -166,8 +173,9 @@ class SpectrumPlot(QtWidgets.QWidget):
         self.readout.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         lay.addWidget(self.readout)
 
-        self.curve = self.plot.plot([], [], pen=pg.mkPen("#d62728", width=1.4), name="Текущий")
-        self.bg_curve = self.plot.plot([], [], pen=pg.mkPen("#888888", width=1, style=QtCore.Qt.DashLine))
+        self.curve = self.plot.plot([], [], pen=curve_pen("#d62728"), name="Текущий")
+        self.curve.setZValue(5)                 # текущий спектр — поверх наложенных из буфера
+        self.bg_curve = self.plot.plot([], [], pen=curve_pen("#888888", style=QtCore.Qt.DashLine))
         self.bg_curve.setVisible(False)
         self._bg_in_legend = False
         self.overlays: Dict[str, pg.PlotDataItem] = {}
@@ -512,7 +520,7 @@ class SpectrumPlot(QtWidgets.QWidget):
         for i, (x, y, name) in enumerate(tracks):
             color = STRIPE_COLORS[(i + 1) % len(STRIPE_COLORS)]
             if i >= len(self.track_curves):
-                self.track_curves.append(self.plot.plot([], [], pen=pg.mkPen(color, width=1.3), name=name))
+                self.track_curves.append(self.plot.plot([], [], pen=curve_pen(color), name=name))
             item = self.track_curves[i]
             if item.name() != name:
                 self.legend.removeItem(item)
@@ -527,7 +535,7 @@ class SpectrumPlot(QtWidgets.QWidget):
                     color: Optional[str] = None) -> None:
         self.remove_overlay(key)
         color = color or OVERLAY_COLORS[len(self.overlays) % len(OVERLAY_COLORS)]
-        self.overlays[key] = self.plot.plot([], [], pen=pg.mkPen(color, width=1.1), name=name)
+        self.overlays[key] = self.plot.plot([], [], pen=curve_pen(color), name=name)
         self.update_overlay(key, x, y)
 
     def update_overlay(self, key: str, x: Optional[np.ndarray], y: np.ndarray) -> None:

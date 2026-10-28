@@ -241,3 +241,19 @@ def test_buffer_keeps_frame_rows(tmp_path):
     b2 = SpectrumBuffer()
     b2.load_state(p)
     assert b2.entries[0].m.image_top == 280 and b2.entries[0].m.image.shape == (3, 8)
+
+
+def test_curves_are_thin_for_fast_redraw(win, app):
+    """Сглаженную линию толще 1 пикселя Qt рисует в десятки раз медленнее: у шумного спектра график
+    еле перетаскивался (лаборатория, 10.2026). Все кривые спектров — толщиной 1 пиксель."""
+    snap(win, app, mode=ACQ_IMAGE)
+    win.buffer.add(win.current)                      # наложение из буфера
+    win._redraw()
+    win.tabs.setCurrentWidget(win.rows_panel)
+    pump(app)
+    for mode in ("one", "all"):
+        win.rows_panel.mode.setCurrentIndex(win.rows_panel.mode.findData(mode))
+        pump(app, 0.05)
+        items = win.plot.plot.getPlotItem().listDataItems() + win.rows_panel.plot.getPlotItem().listDataItems()
+        assert len(items) > 3
+        assert all(it.opts["pen"].widthF() <= 1 for it in items), mode
