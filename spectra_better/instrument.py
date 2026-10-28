@@ -787,6 +787,10 @@ class Instrument:
         mode = "average" if background else s.accumulate_mode
         stripes = self.stripes()
         acq = self.acq_settings()
+        if not background:
+            why = self.ttl_exposure_problem(acq.exposure_us)
+            if why:
+                raise DeviceError(f"Снимок не сделан: {why}.")
         t0 = time.monotonic()
         if not background and self.mono_connected and not self.shutter_ttl and self.shutter_state is False:
             # закрытая шторка сохраняется между сеансами (и в SpectraSP) — сигнал тогда только темновой
@@ -1106,6 +1110,25 @@ class Instrument:
                             "в SpectraSP это выход 1 в режиме 0 «EXP».")
         else:
             log.info("Шторка: ручное управление")
+
+    def ttl_exposure_problem(self, exposure_us: Optional[float] = None) -> str:
+        """Почему с шторкой «по экспозиции» эту экспозицию снимать нельзя ("" — можно).
+
+        Шторка механическая: импульс короче её времени срабатывания она не отрабатывает — на приборе
+        при экспозиции короче 12 мс она оставалась открытой (кадр засвечен дольше экспозиции), при
+        12–25 мс раскрывалась не полностью. Порог — settings.shutter_ttl_min_ms (0 — без ограничения)."""
+        lim = float(self.settings.shutter_ttl_min_ms or 0)
+        if lim <= 0 or not self.mono_connected or not self.shutter_ttl:
+            return ""
+        if exposure_us is None:
+            exposure_us = self.settings.exposure_ms * 1000.0
+            if self.camera_connected:
+                exposure_us = self.acq_settings().exposure_us     # то, что реально уйдёт в камеру
+        if exposure_us / 1000.0 >= lim:
+            return ""
+        return (f"шторка «по экспозиции» правильно срабатывает только при экспозиции от {lim:g} мс — при более "
+                "короткой она не успевает раскрыться или остаётся открытой. Увеличьте экспозицию или "
+                "переключите шторку на «вручную»")
 
     def exposure_sync_output(self) -> int:
         """Номер выхода синхронизации камеры, выдающего импульс экспозиции (0 — такого нет)."""

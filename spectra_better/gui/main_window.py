@@ -552,6 +552,7 @@ class MainWindow(QtWidgets.QMainWindow):
         m = self.inst.mono
         available = bool(m is not None and m.info.has_shutter and m.info.shutter_ttl)
         self.mono_panel.set_shutter_mode(self.inst.shutter_ttl, available)
+        self._acq_settings_changed()          # пометка о минимальной экспозиции для шторки «по экспозиции»
 
     def _refresh_mono_misc(self) -> None:
         """Прочитать положение зеркала, шторки и ширину щели для панели монохроматора."""
@@ -916,6 +917,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     shown = f"{real / 1e6:g} с" if real >= 1e6 else (f"{real / 1e3:g} мс" if real >= 1e3
                                                                        else f"{real:g} мкс")
                     note = f"камера снимет {shown} (её точность/минимум)"
+                ttl = self.inst.ttl_exposure_problem(acq.exposure_us)
+                if ttl:
+                    note = (note + "<br>" if note else "") + "Снимать нельзя: " + ttl
                 self.acq_panel.set_estimate(t, note)
             except (DeviceError, ValueError) as e:
                 self.acq_panel.set_estimate(None)
@@ -931,6 +935,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Съёмка недоступна: {block}. Дождитесь, пока температура установится.",
                                          8000)
             return
+        if kind != "background":
+            why = self.inst.ttl_exposure_problem()
+            if why:
+                self._error("Съёмка", DeviceError(f"Съёмка не начата: {why}."))
+                return
         self._acq_stop.clear()
         self._acq_kind = kind
         self.progress.setVisible(True)
@@ -1975,6 +1984,7 @@ class MainWindow(QtWidgets.QMainWindow):
                              laser_on=self.inst.laser_on and self.inst.camera_connected)
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
+        self._acq_settings_changed()          # мог измениться порог экспозиции для шторки «по экспозиции»
         if (self.s.laser_output, self.s.laser_active_high) != old_laser and self.s.laser_output in (1, 2) \
                 and self.inst.camera_connected:
             # лазер перенесён на другой выход или сменилась полярность: прежний уровень на выходе может

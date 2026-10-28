@@ -480,6 +480,17 @@ class SettingsDialog(QtWidgets.QDialog):
         self.mono_to.setSuffix(" с")
         self.mono_to.setValue(settings.mono_timeout_s)
         form.addRow("Таймаут движения монохроматора:", self.mono_to)
+        self.ttl_min = QtWidgets.QDoubleSpinBox()
+        self.ttl_min.setRange(0, 1000)
+        self.ttl_min.setDecimals(0)
+        self.ttl_min.setSuffix(" мс")
+        self.ttl_min.setSpecialValueText("без ограничения")
+        self.ttl_min.setValue(settings.shutter_ttl_min_ms)
+        self.ttl_min.setToolTip("Шторка механическая и короткий импульс отработать не успевает: на приборе при "
+                                "экспозиции короче 12 мс она оставалась открытой, 12–25 мс — раскрывалась не "
+                                "полностью, от 30 мс — работала нормально. Короче этого времени программа "
+                                "не снимает в режиме «по экспозиции». 0 — без ограничения.")
+        form.addRow("Шторка «по экспозиции»: не короче", self.ttl_min)
         self.warm = QtWidgets.QCheckBox("отогревать ПЗС до +2 °C при отключении (как SpectraSP)")
         self.warm.setChecked(settings.warm_up_on_close)
         self.warm.setToolTip("Защита матрицы от конденсата и термоудара. Выключать не рекомендуется.")
@@ -516,6 +527,7 @@ class SettingsDialog(QtWidgets.QDialog):
         s.camera_dll = self.dll.currentData()
         s.frame_timeout_s = self.frame_to.value()
         s.mono_timeout_s = self.mono_to.value()
+        s.shutter_ttl_min_ms = self.ttl_min.value()
         s.warm_up_on_close = self.warm.isChecked()
         s.laser_output = int(self.laser_out.currentData())
         s.laser_active_high = bool(self.laser_level.currentData())
